@@ -10,5 +10,6 @@ pub mod vocab;
 pub mod masking;
 pub mod model;
 pub mod corpus;
+pub mod sense_head;
 pub mod senses;
 pub mod morph;

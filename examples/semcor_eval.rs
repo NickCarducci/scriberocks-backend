@@ -12,6 +12,7 @@
 use scribe::engine::choose_sense;
 use scribe::kgram::{self, Example, KgramSenses};
 use scribe::semcor::{self, TaggedSentence};
+use scribe::usage::sense_head::{self, Candidate, SenseHead};
 use scribe::usage::senses::SenseIndex;
 use scribe::{Engine, Lexicon, Pos};
 use std::collections::{BTreeSet, HashMap};
@@ -101,6 +102,25 @@ fn report_kgram(label: &str, cases: &[Case], head: &KgramSenses, index: &SenseIn
     }
 }
 
+fn candidates(c: &Case, lex: &Lexicon) -> Vec<Candidate> {
+    c.senses.iter().enumerate().map(|(rank, &s)| Candidate { synset: s, category: lex.synsets[s as usize].category, rank }).collect()
+}
+
+fn report_head(label: &str, cases: &[Case], head: &SenseHead, lex: &Lexicon) {
+    let n = cases.len().max(1) as f64;
+    let scores: Vec<Vec<f32>> = cases.iter().map(|c| head.scores(&c.vector, &candidates(c, lex)).unwrap()).collect();
+    for m in [0.0f32, 2.0, 3.0, 4.0, 5.0, 6.0, 8.0] {
+        let (mut right, mut overrides) = (0, 0);
+        for (c, s) in cases.iter().zip(&scores) {
+            let best = (0..s.len()).max_by(|&a, &b| s[a].total_cmp(&s[b])).unwrap_or(0);
+            let k = if s[best] - s[0] > m { best } else { 0 };
+            right += c.gold.contains(&c.senses[k]) as usize;
+            overrides += (k != 0) as usize;
+        }
+        println!("{label} margin {m:<3}: {:.1}% (overrides first-listed {:.1}%)", 100.0 * right as f64 / n, 100.0 * overrides as f64 / n);
+    }
+}
+
 fn main() {
     let arg = |i: usize, d: usize| std::env::args().nth(i).and_then(|a| a.parse().ok()).unwrap_or(d);
     let (eval_cap, train_cap) = (arg(1, 2000), arg(2, 8000));
@@ -143,4 +163,15 @@ fn main() {
     report("ALL, + SemCor examples", &all_cases, &index, &e.lexicon);
     report_kgram("SemCor held-out", &held_cases, &head, &index, &e.lexicon);
     report_kgram("ALL", &all_cases, &head, &index, &e.lexicon);
+
+    for epochs in [8usize] {
+        let examples: Vec<sense_head::Example> = train_cases
+            .iter()
+            .map(|c| sense_head::Example { vector: c.vector.clone(), candidates: candidates(c, &e.lexicon), gold: c.senses.iter().position(|s| *s == c.gold[0]).unwrap() })
+            .collect();
+        let opts = sense_head::TrainOptions { epochs, ..Default::default() };
+        let head = SenseHead::train(&examples, e.lexicon.categories.len(), &opts, scribe::usage::model::Device::Cpu).unwrap();
+        report_head(&format!("SemCor held-out, sense head {epochs} epochs"), &held_cases, &head, &e.lexicon);
+        report_head(&format!("ALL, sense head {epochs} epochs"), &all_cases, &head, &e.lexicon);
+    }
 }
