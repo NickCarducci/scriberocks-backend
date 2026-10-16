@@ -11,8 +11,8 @@ let package = Package(
     targets: [
         .binaryTarget(
             name: "ScribeFFI",
-            url: "https://github.com/NickCarducci/scriberocks-backend/releases/download/v0.1.1/ScribeFFI.xcframework.zip",
-            checksum: "18ee8b58f754830724784d65cb04e6ef2f47ee17cee468a66970b71c0e637f24"
+            url: "https://github.com/NickCarducci/scriberocks-backend/releases/download/v0.1.2/ScribeFFI.xcframework.zip",
+            checksum: "bc2cb447d64884e9468995c25cdaee311bfad1c1dffc6042824625e25b2dfa80"
         ),
         .target(
             name: "ScribeCore",
