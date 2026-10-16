@@ -1,5 +1,6 @@
 //! A small pre-LayerNorm transformer encoder with a tied output layer,
-//! trained to fill in masked words.
+//! trained to fill in masked words — and, optionally, to name each masked
+//! word's supersense (sense modeling, after SenseBERT; Levine et al. 2020).
 
 use crate::usage::masking::{mask, Rng};
 use crate::usage::morph::Morphology;
@@ -147,6 +148,8 @@ pub struct UsageModel {
     device: Device,
     /// When set, words are split into base + ending pieces before encoding.
     morph: Option<Morphology>,
+    /// Supersense table [categories, dim], when sense modeling is on.
+    supersense: Option<Tensor>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -155,6 +158,22 @@ struct Meta {
     config: Config,
     #[serde(default)]
     morph: Option<Morphology>,
+    #[serde(default)]
+    supersenses: usize,
+}
+
+/// Supersense targets for sense modeling. A masked word's target is its gold
+/// supersense when the corpus has one (SemCor), else the set the dictionary
+/// allows for that word; the loss rewards probability on any allowed one
+/// (SenseBERT's weak supervision), so context decides between them.
+pub struct SenseTargets {
+    /// Allowed supersenses per vocabulary id (empty = no target).
+    pub by_id: Vec<Vec<u16>>,
+    /// Per sentence (same order as the training sentences), gold supersense
+    /// per position; an empty Vec means none for that sentence.
+    pub gold: Vec<Vec<Option<u16>>>,
+    /// Weight of the supersense loss next to the masked-word loss.
+    pub weight: f32,
 }
 
 impl UsageModel {
@@ -164,7 +183,32 @@ impl UsageModel {
         let varmap = VarMap::new();
         let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
         let encoder = Encoder::new(config, vb)?;
-        Ok(UsageModel { vocab, config, varmap, encoder, device, morph: None })
+        Ok(UsageModel { vocab, config, varmap, encoder, device, morph: None, supersense: None })
+    }
+
+    /// Adds a supersense table (sense modeling) with `n` categories.
+    pub fn with_supersenses(mut self, n: usize) -> Result<UsageModel> {
+        let vb = VarBuilder::from_varmap(&self.varmap, DType::F32, &self.device);
+        let small = candle_nn::Init::Randn { mean: 0.0, stdev: 0.02 };
+        self.supersense = Some(vb.pp("supersense").get_with_hints((n, self.config.dim), "weight", small)?);
+        Ok(self)
+    }
+
+    /// Number of supersense categories (0 when sense modeling is off).
+    pub fn supersenses(&self) -> usize {
+        self.supersense.as_ref().map_or(0, |t| t.dims()[0])
+    }
+
+    /// Log-probability of each supersense at every word (truncated to
+    /// max_len); None without a supersense table. Pass "[MASK]" at a word
+    /// to ask what its context alone says.
+    pub fn supersense_log_probs(&self, words: &[String]) -> Result<Option<Vec<Vec<f32>>>> {
+        let Some(table) = &self.supersense else { return Ok(None) };
+        let (ids, base) = self.encode_window(words);
+        let n = ids.len();
+        let hidden = self.encoder.hidden(&Tensor::from_vec(ids, (1, n), &self.device)?)?.squeeze(0)?;
+        let lp = candle_nn::ops::log_softmax(&hidden.matmul(&table.t()?)?, D::Minus1)?.to_vec2::<f32>()?;
+        Ok(Some(base.into_iter().map(|b| lp[b].clone()).collect()))
     }
 
     pub fn with_morphology(mut self, morph: Morphology) -> UsageModel {
@@ -190,7 +234,14 @@ impl UsageModel {
 
     /// Masked-word training. `log(step, loss)` is called every step.
     pub fn train(&mut self, sentences: &[Vec<u32>], opts: &TrainOptions, mut log: impl FnMut(usize, f32)) -> Result<()> {
-        let usable: Vec<&Vec<u32>> = sentences.iter().filter(|s| s.len() >= 2).collect();
+        self.train_with_senses(sentences, opts, None, |step, loss, _| log(step, loss))
+    }
+
+    /// Masked-word training plus, with `senses` (and a supersense table),
+    /// the supersense loss at masked positions. `log(step, word_loss,
+    /// supersense_loss)` is called every step.
+    pub fn train_with_senses(&mut self, sentences: &[Vec<u32>], opts: &TrainOptions, senses: Option<&SenseTargets>, mut log: impl FnMut(usize, f32, f32)) -> Result<()> {
+        let usable: Vec<usize> = (0..sentences.len()).filter(|&i| sentences[i].len() >= 2).collect();
         if usable.is_empty() {
             return Ok(());
         }
@@ -208,15 +259,28 @@ impl UsageModel {
             };
             opt.set_learning_rate(lr);
 
-            let batch: Vec<&Vec<u32>> = (0..opts.batch).map(|_| usable[rng.below(usable.len() as u64) as usize]).collect();
-            let len = batch.iter().map(|s| s.len().min(max)).max().unwrap();
+            let batch: Vec<usize> = (0..opts.batch).map(|_| usable[rng.below(usable.len() as u64) as usize]).collect();
+            let len = batch.iter().map(|&s| sentences[s].len().min(max)).max().unwrap();
             let (mut input, mut flat_positions, mut targets) = (Vec::new(), Vec::new(), Vec::new());
-            for (bi, sent) in batch.iter().enumerate() {
+            // Supersense targets: (index into the masked positions, allowed set).
+            let mut sense_targets: Vec<(u32, &[u16])> = Vec::new();
+            for (bi, &si) in batch.iter().enumerate() {
+                let sent = &sentences[si];
                 let start = if sent.len() > max { rng.below((sent.len() - max + 1) as u64) as usize } else { 0 };
                 let window = &sent[start..(start + max).min(sent.len())];
                 let m = mask(window, self.config.vocab_size as u32, &mut rng);
                 for (i, label) in m.labels.iter().enumerate() {
                     if let Some(t) = label {
+                        if let (Some(st), Some(_)) = (senses, &self.supersense) {
+                            let gold = st.gold.get(si).and_then(|g| g.get(start + i)).copied().flatten();
+                            let allowed: &[u16] = match gold {
+                                Some(g) => std::slice::from_ref(&SUPERSENSE_IDS[(g as usize).min(63)]),
+                                None => st.by_id.get(*t as usize).map_or(&[], Vec::as_slice),
+                            };
+                            if !allowed.is_empty() {
+                                sense_targets.push((targets.len() as u32, allowed));
+                            }
+                        }
                         flat_positions.push((bi * len + i) as u32);
                         targets.push(*t);
                     }
@@ -228,9 +292,29 @@ impl UsageModel {
             let hidden = self.encoder.hidden(&ids)?.reshape((opts.batch * len, self.config.dim))?;
             let picked = hidden.index_select(&Tensor::new(flat_positions.as_slice(), &self.device)?, 0)?;
             let logits = self.encoder.logits(&picked)?;
-            let loss = candle_nn::loss::cross_entropy(&logits, &Tensor::new(targets.as_slice(), &self.device)?)?;
+            let word_loss = candle_nn::loss::cross_entropy(&logits, &Tensor::new(targets.as_slice(), &self.device)?)?;
+            let (loss, sense_loss) = match (&self.supersense, senses) {
+                (Some(table), Some(st)) if !sense_targets.is_empty() => {
+                    let c = table.dims()[0];
+                    let rows: Vec<u32> = sense_targets.iter().map(|(r, _)| *r).collect();
+                    let mut allowed = vec![0f32; rows.len() * c];
+                    for (k, (_, set)) in sense_targets.iter().enumerate() {
+                        for &s in *set {
+                            if (s as usize) < c {
+                                allowed[k * c + s as usize] = 1.0;
+                            }
+                        }
+                    }
+                    let h = picked.index_select(&Tensor::new(rows.as_slice(), &self.device)?, 0)?;
+                    let p = candle_nn::ops::softmax(&h.matmul(&table.t()?)?, D::Minus1)?;
+                    let mass = (p * Tensor::from_vec(allowed, (rows.len(), c), &self.device)?)?.sum(D::Minus1)?;
+                    let sense_loss = ((mass + 1e-9)?.log()?.mean_all()? * -1.0)?;
+                    ((&word_loss + (&sense_loss * st.weight as f64)?)?, sense_loss.to_scalar::<f32>()?)
+                }
+                _ => (word_loss.clone(), 0.0),
+            };
             opt.backward_step(&loss)?;
-            log(step, loss.to_scalar::<f32>()?);
+            log(step, word_loss.to_scalar::<f32>()?, sense_loss);
             if let Some((dir, every)) = &opts.checkpoint {
                 if (step + 1) % every == 0 || step + 1 == opts.steps {
                     self.checkpoint(dir, step + 1)?;
@@ -348,7 +432,8 @@ impl UsageModel {
     pub fn save(&self, dir: &Path) -> Result<()> {
         std::fs::create_dir_all(dir)?;
         self.varmap.save(dir.join("usage.safetensors"))?;
-        let meta = serde_json::to_vec(&Meta { vocab: self.vocab.clone(), config: self.config, morph: self.morph.clone() }).map_err(candle_core::Error::wrap)?;
+        let meta = serde_json::to_vec(&Meta { vocab: self.vocab.clone(), config: self.config, morph: self.morph.clone(), supersenses: self.supersenses() })
+            .map_err(candle_core::Error::wrap)?;
         std::fs::write(dir.join("usage.json"), meta)?;
         Ok(())
     }
@@ -358,11 +443,26 @@ impl UsageModel {
         let mut vocab = meta.vocab;
         vocab.reindex();
         let mut model = UsageModel::new_random(vocab, meta.config, device, 0)?;
+        if meta.supersenses > 0 {
+            model = model.with_supersenses(meta.supersenses)?;
+        }
         model.morph = meta.morph;
         model.varmap.load(dir.join("usage.safetensors"))?;
         Ok(model)
     }
 }
+/// Supersense ids 0..64, so a gold supersense can be lent as a one-element
+/// allowed set (WordNet has 45).
+const SUPERSENSE_IDS: [u16; 64] = {
+    let mut a = [0u16; 64];
+    let mut i = 0;
+    while i < 64 {
+        a[i] = i as u16;
+        i += 1;
+    }
+    a
+};
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -605,5 +705,77 @@ mod gradient_tests {
         let data = m.varmap.data().lock().unwrap();
         let missing: Vec<&String> = data.iter().filter(|(_, v)| grads.get(v.as_tensor()).is_none()).map(|(n, _)| n).collect();
         assert!(missing.is_empty(), "no gradient for {missing:?}");
+    }
+}
+
+#[cfg(test)]
+mod sense_modeling_tests {
+    use super::*;
+    use crate::usage::vocab::Vocab;
+
+    fn words(s: &str) -> Vec<String> {
+        s.split(' ').map(String::from).collect()
+    }
+
+    /// "bank" is ambiguous (river 0 / money 1); context words carry the sense.
+    fn setup() -> (UsageModel, Vec<Vec<u32>>, SenseTargets) {
+        let lines = ["the river bank was wet", "the money bank was rich", "a river bank is muddy", "a money bank is safe"];
+        let sents: Vec<Vec<String>> = lines.iter().cycle().take(64).map(|l| words(l)).collect();
+        let vocab = Vocab::build(&sents, 1, 100);
+        let model = UsageModel::new_random(vocab, Config { vocab_size: 0, dim: 32, layers: 2, heads: 2, ff: 64, max_len: 16 }, Device::Cpu, 1)
+            .unwrap()
+            .with_supersenses(3)
+            .unwrap();
+        let ids: Vec<Vec<u32>> = sents.iter().map(|s| model.vocab.encode(s)).collect();
+        let mut by_id = vec![vec![]; model.vocab.len()];
+        by_id[model.vocab.id("bank") as usize] = vec![0, 1];
+        by_id[model.vocab.id("river") as usize] = vec![0];
+        by_id[model.vocab.id("money") as usize] = vec![1];
+        by_id[model.vocab.id("muddy") as usize] = vec![2];
+        // Gold for "bank" in the first two lines of each cycle (SemCor-style).
+        let gold = sents.iter().map(|s| s.iter().map(|w| match (w.as_str(), s[1].as_str()) { ("bank", "river") => Some(0), ("bank", "money") => Some(1), _ => None }).collect()).collect();
+        (model, ids, SenseTargets { by_id, gold, weight: 1.0 })
+    }
+
+    fn opts() -> TrainOptions {
+        TrainOptions { steps: 800, batch: 16, lr: 3e-3, warmup: 50, seed: 1, start_step: 0, checkpoint: None }
+    }
+
+    #[test]
+    fn context_decides_the_supersense_of_an_ambiguous_word() {
+        let (mut model, ids, targets) = setup();
+        let mut sense_losses = vec![];
+        model.train_with_senses(&ids, &opts(), Some(&targets), |_, _, s| sense_losses.push(s)).unwrap();
+        let river = model.supersense_log_probs(&words("the river [MASK] was wet")).unwrap().unwrap();
+        let money = model.supersense_log_probs(&words("the money [MASK] was rich")).unwrap().unwrap();
+        assert!(river[2][0] > river[2][1], "{:?}", river[2]);
+        assert!(money[2][1] > money[2][0], "{:?}", money[2]);
+        assert!(sense_losses.iter().any(|&l| l > 0.0), "supersense loss was applied");
+    }
+
+    #[test]
+    fn a_word_with_one_allowed_supersense_learns_it_without_gold() {
+        let (mut model, ids, mut targets) = setup();
+        targets.gold.clear();
+        model.train_with_senses(&ids, &opts(), Some(&targets), |_, _, _| {}).unwrap();
+        let lp = model.supersense_log_probs(&words("a river bank is muddy")).unwrap().unwrap();
+        let best = (0..3).max_by(|&a, &b| lp[4][a].total_cmp(&lp[4][b])).unwrap();
+        assert_eq!(best, 2, "muddy → its only supersense: {:?}", lp[4]);
+    }
+
+    #[test]
+    fn the_supersense_table_is_saved_and_loaded_and_old_models_have_none() {
+        let (mut model, ids, targets) = setup();
+        model.train_with_senses(&ids, &TrainOptions { steps: 20, ..opts() }, Some(&targets), |_, _, _| {}).unwrap();
+        let dir = std::env::temp_dir().join(format!("usage-senses-{}", std::process::id()));
+        model.save(&dir).unwrap();
+        let loaded = UsageModel::load(&dir, Device::Cpu).unwrap();
+        assert_eq!(loaded.supersenses(), 3);
+        let s = words("the river bank was wet");
+        assert_eq!(model.supersense_log_probs(&s).unwrap(), loaded.supersense_log_probs(&s).unwrap());
+        let plain = UsageModel::new_random(model.vocab.clone(), model.config, Device::Cpu, 1).unwrap();
+        assert_eq!(plain.supersenses(), 0);
+        assert!(plain.supersense_log_probs(&s).unwrap().is_none());
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

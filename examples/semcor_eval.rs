@@ -29,6 +29,8 @@ struct Case {
     vector: Vec<f32>,
     lemma: String,
     pos: Pos,
+    /// Index of its sentence in the evaluated list (for sentence context).
+    sentence: usize,
     features: Vec<String>,
 }
 
@@ -58,7 +60,7 @@ fn cases(e: &Engine, keys: &HashMap<String, u32>, sentences: &[TaggedSentence]) 
             let gold: Vec<u32> = inst.keys.iter().filter_map(|k| keys.get(k).copied()).filter(|g| senses.contains(g)).collect();
             match v {
                 Some(vector) if !gold.is_empty() && senses.len() > 1 => {
-                    out.push(Case { senses, gold, vector, lemma: inst.lemma.clone(), pos: inst.pos, features: kgram::features(&lower, inst.index) })
+                    out.push(Case { senses, gold, vector, lemma: inst.lemma.clone(), pos: inst.pos, sentence: n, features: kgram::features(&lower, inst.index) })
                 }
                 _ => skipped += 1,
             }
@@ -106,17 +108,33 @@ fn candidates(c: &Case, lex: &Lexicon) -> Vec<Candidate> {
     c.senses.iter().enumerate().map(|(rank, &s)| Candidate { synset: s, category: lex.synsets[s as usize].category, rank }).collect()
 }
 
-fn report_head(label: &str, cases: &[Case], head: &SenseHead, lex: &Lexicon) {
+/// Supersenses of the other cases in each case's sentence, given one chosen
+/// synset per case.
+fn contexts(cases: &[Case], chosen: &[u32], lex: &Lexicon) -> Vec<Vec<u16>> {
+    let mut by_sentence: HashMap<usize, Vec<usize>> = HashMap::new();
+    for (i, c) in cases.iter().enumerate() {
+        by_sentence.entry(c.sentence).or_default().push(i);
+    }
+    (0..cases.len())
+        .map(|i| by_sentence[&cases[i].sentence].iter().filter(|&&j| j != i).map(|&j| lex.synsets[chosen[j] as usize].category).collect())
+        .collect()
+}
+
+fn head_scores(cases: &[Case], head: &SenseHead, context: Option<&[Vec<u16>]>, lex: &Lexicon) -> Vec<Vec<f32>> {
+    cases.iter().enumerate().map(|(i, c)| head.scores_in_context(&c.vector, &candidates(c, lex), context.map_or(&[][..], |x| &x[i])).unwrap()).collect()
+}
+
+/// Index chosen per case: the best candidate if it beats first-listed by `m`.
+fn pick(scores: &[Vec<f32>], m: f32) -> Vec<usize> {
+    scores.iter().map(|s| { let best = (0..s.len()).max_by(|&a, &b| s[a].total_cmp(&s[b])).unwrap_or(0); if s[best] - s[0] > m { best } else { 0 } }).collect()
+}
+
+fn sweep(label: &str, cases: &[Case], scores: &[Vec<f32>]) {
     let n = cases.len().max(1) as f64;
-    let scores: Vec<Vec<f32>> = cases.iter().map(|c| head.scores(&c.vector, &candidates(c, lex)).unwrap()).collect();
     for m in [0.0f32, 2.0, 3.0, 4.0, 5.0, 6.0, 8.0] {
-        let (mut right, mut overrides) = (0, 0);
-        for (c, s) in cases.iter().zip(&scores) {
-            let best = (0..s.len()).max_by(|&a, &b| s[a].total_cmp(&s[b])).unwrap_or(0);
-            let k = if s[best] - s[0] > m { best } else { 0 };
-            right += c.gold.contains(&c.senses[k]) as usize;
-            overrides += (k != 0) as usize;
-        }
+        let k = pick(scores, m);
+        let right = cases.iter().zip(&k).filter(|(c, k)| c.gold.contains(&c.senses[**k])).count();
+        let overrides = k.iter().filter(|&&k| k != 0).count();
         println!("{label} margin {m:<3}: {:.1}% (overrides first-listed {:.1}%)", 100.0 * right as f64 / n, 100.0 * overrides as f64 / n);
     }
 }
@@ -164,14 +182,26 @@ fn main() {
     report_kgram("SemCor held-out", &held_cases, &head, &index, &e.lexicon);
     report_kgram("ALL", &all_cases, &head, &index, &e.lexicon);
 
-    for epochs in [8usize] {
-        let examples: Vec<sense_head::Example> = train_cases
+    let examples = |context: &dyn Fn(usize) -> Vec<u16>| -> Vec<sense_head::Example> {
+        train_cases
             .iter()
-            .map(|c| sense_head::Example { vector: c.vector.clone(), candidates: candidates(c, &e.lexicon), gold: c.senses.iter().position(|s| *s == c.gold[0]).unwrap() })
-            .collect();
-        let opts = sense_head::TrainOptions { epochs, ..Default::default() };
-        let head = SenseHead::train(&examples, e.lexicon.categories.len(), &opts, scribe::usage::model::Device::Cpu).unwrap();
-        report_head(&format!("SemCor held-out, sense head {epochs} epochs"), &held_cases, &head, &e.lexicon);
-        report_head(&format!("ALL, sense head {epochs} epochs"), &all_cases, &head, &e.lexicon);
+            .enumerate()
+            .map(|(i, c)| sense_head::Example { vector: c.vector.clone(), candidates: candidates(c, &e.lexicon), gold: c.senses.iter().position(|s| *s == c.gold[0]).unwrap(), context: context(i) })
+            .collect()
+    };
+    let opts = sense_head::TrainOptions::default();
+    let cats = e.lexicon.categories.len();
+    let plain = SenseHead::train(&examples(&|_| vec![]), cats, &opts, scribe::usage::model::Device::Cpu).unwrap();
+    // Context head: trained with the other words' gold senses.
+    let gold_chosen: Vec<u32> = train_cases.iter().map(|c| c.gold[0]).collect();
+    let train_context = contexts(&train_cases, &gold_chosen, &e.lexicon);
+    let with_context = SenseHead::train(&examples(&|i| train_context[i].clone()), cats, &opts, scribe::usage::model::Device::Cpu).unwrap();
+    for (label, cases) in [("SemCor held-out", &held_cases), ("ALL", &all_cases)] {
+        let first = head_scores(cases, &plain, None, &e.lexicon);
+        sweep(&format!("{label}, sense head"), cases, &first);
+        // First pass at the dev-chosen margin, then rescore with sentence context.
+        let chosen: Vec<u32> = cases.iter().zip(pick(&first, 5.0)).map(|(c, k)| c.senses[k]).collect();
+        let ctx = contexts(cases, &chosen, &e.lexicon);
+        sweep(&format!("{label}, sense head + sentence context"), cases, &head_scores(cases, &with_context, Some(&ctx), &e.lexicon));
     }
 }

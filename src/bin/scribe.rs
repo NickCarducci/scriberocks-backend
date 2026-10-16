@@ -5,6 +5,8 @@
 //! scribe train-usage <data-dir> <models-dir> [steps] [--morph]   usage model + sense index (build with --features metal);
 //!                                                       --morph splits words into base + ending → models/usage-morph
 //! scribe build-senses <models-dir> [usage-dir-name]     rebuild the sense index from a trained usage model
+//! scribe train-senses <data-dir> <models-dir> [steps]   sense modeling: continue models/usage with a supersense
+//!                                                       objective (dictionary-allowed sets + SemCor gold) → models/usage-sense
 
 use scribe::{conllu, inflect::Inflector, lm::LanguageModel, parser::Parser, tagger::{Column, Tagger}, text, Engine, Lexicon};
 use std::io::Read;
@@ -113,6 +115,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let model = scribe::usage::model::UsageModel::load(&models.join(name), device)?;
             build_senses(&model, &Lexicon::load(&models.join("lexicon.bin"))?, &models.join(name))?;
         }
+        Some("train-senses") => {
+            let steps = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(20_000);
+            train_senses(Path::new(arg(2)?), Path::new(arg(3)?), steps)?
+        }
         Some("train-usage") => {
             let steps = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(20_000);
             let morph = args.iter().any(|a| a == "--morph");
@@ -120,6 +126,99 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         _ => eprintln!("usage: scribe build-lexicon | train | frames | variants | train-usage (see source header)"),
     }
+    Ok(())
+}
+
+/// Sense modeling (after SenseBERT): continue training the usage model with a
+/// second objective — name each masked word's supersense. Targets are the
+/// supersenses the dictionary allows for the word (context must choose), or
+/// SemCor's gold one. Only even-numbered SemCor documents are used; odd ones
+/// stay held out for examples/semcor_eval.rs.
+fn train_senses(data: &Path, models: &Path, steps: usize) -> Result<(), Box<dyn std::error::Error>> {
+    use scribe::usage::{corpus, model::{SenseTargets, TrainOptions, UsageModel}};
+    use std::collections::BTreeSet;
+
+    let lex = Lexicon::load(&models.join("lexicon.bin"))?;
+    let tokenize = |s: &str| -> Vec<String> { text::tokenize(s).into_iter().map(|w| w.to_lowercase()).collect() };
+    let mut sentences: Vec<Vec<String>> = std::fs::read_to_string(data.join("wiktionary/examples.txt"))?.lines().map(tokenize).collect();
+    let ewt = conllu::parse(&std::fs::read_to_string(data.join("en_ewt-ud-train.conllu"))?);
+    sentences.extend(ewt.iter().map(|s| s.iter().map(|t| t.form.to_lowercase()).collect()));
+    let examples = corpus::wordnet_examples(&lex);
+    sentences.extend(examples.iter().filter(|e| !corpus::is_held_out(e.synset, &e.sentence, 10)).map(|e| tokenize(&e.sentence)));
+    let mut gold: Vec<Vec<Option<u16>>> = vec![Vec::new(); sentences.len()];
+
+    let wsd = data.join("semcor/wsdeval/WSD_Evaluation_Framework/Training_Corpora/SemCor");
+    let semcor = scribe::semcor::parse(&std::fs::read_to_string(wsd.join("semcor.data.xml"))?, &std::fs::read_to_string(wsd.join("semcor.gold.key.txt"))?);
+    let keys = scribe::semcor::sense_keys(&data.join("oewn"), &lex)?;
+    let docs: Vec<&str> = semcor.iter().map(|s| s.document.as_str()).collect::<BTreeSet<_>>().into_iter().collect();
+    let held: BTreeSet<&str> = docs.iter().skip(1).step_by(2).copied().collect();
+    let mut tagged = 0;
+    for s in semcor.iter().filter(|s| !held.contains(s.document.as_str())) {
+        let mut g = vec![None; s.words.len()];
+        for inst in &s.instances {
+            if let Some(&synset) = inst.keys.iter().find_map(|k| keys.get(k)) {
+                g[inst.index] = Some(lex.synsets[synset as usize].category);
+                tagged += 1;
+            }
+        }
+        sentences.push(s.words.iter().map(|w| w.to_lowercase()).collect());
+        gold.push(g);
+    }
+    eprintln!("corpus: {} sentences ({} SemCor training sentences, {tagged} gold supersenses)", sentences.len(), semcor.len() - semcor.iter().filter(|s| held.contains(s.document.as_str())).count());
+
+    #[cfg(feature = "metal")]
+    let device = scribe::usage::model::Device::new_metal(0)?;
+    #[cfg(not(feature = "metal"))]
+    let device = scribe::usage::model::Device::Cpu;
+    let ckpt = models.join("usage-sense-checkpoint");
+    let (mut model, start) = match UsageModel::checkpoint_step(&ckpt) {
+        Some(step) if step < steps => {
+            eprintln!("resuming from checkpoint at step {step}");
+            UsageModel::resume(&ckpt, device)?
+        }
+        _ => (UsageModel::load(&models.join("usage"), device)?.with_supersenses(lex.categories.len())?, 0),
+    };
+
+    // Allowed supersenses per vocabulary word, from every sense of every
+    // lemma it can be. The 100 most frequent words (mostly function words,
+    // whose WordNet entries are rare nouns like "a" = vitamin A) get none.
+    let by_id: Vec<Vec<u16>> = (0..model.vocab.len() as u32)
+        .map(|id| {
+            if (id as usize) < scribe::usage::vocab::SPECIALS.len() + 100 {
+                return vec![];
+            }
+            let mut cats: Vec<u16> = lex
+                .lemmatize(model.vocab.word(id), None)
+                .iter()
+                .filter_map(|l| lex.lemmas.get(l))
+                .flatten()
+                .flat_map(|(_, senses)| senses.iter().map(|&s| lex.synsets[s as usize].category))
+                .collect();
+            cats.sort();
+            cats.dedup();
+            cats
+        })
+        .collect();
+    eprintln!("{} of {} vocabulary words have dictionary supersenses", by_id.iter().filter(|c| !c.is_empty()).count(), by_id.len());
+    let ids: Vec<Vec<u32>> = sentences.iter().map(|s| model.vocab.encode(s)).collect();
+    let targets = SenseTargets { by_id, gold, weight: 1.0 };
+
+    let t = Instant::now();
+    let (mut words_avg, mut senses_avg) = (Vec::new(), Vec::new());
+    let opts = TrainOptions { steps, batch: 64, lr: 3e-4, warmup: 500, seed: 11, start_step: start, checkpoint: Some((ckpt.clone(), 1000)) };
+    model.train_with_senses(&ids, &opts, Some(&targets), |step, w, s| {
+        words_avg.push(w);
+        senses_avg.push(s);
+        if (step + 1) % 1000 == 0 {
+            let avg = |v: &Vec<f32>| v.iter().sum::<f32>() / v.len() as f32;
+            eprintln!("  step {:>6}  word loss {:.3}  supersense loss {:.3}  ({:.0?})", step + 1, avg(&words_avg), avg(&senses_avg), t.elapsed());
+            words_avg.clear();
+            senses_avg.clear();
+        }
+    })?;
+    let out = models.join("usage-sense");
+    model.save(&out)?;
+    build_senses(&model, &lex, &out)?;
     Ok(())
 }
 
