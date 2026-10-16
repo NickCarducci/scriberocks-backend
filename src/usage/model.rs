@@ -239,8 +239,10 @@ impl UsageModel {
         self.vocab.encode(words).into_iter().take(self.config.max_len).collect()
     }
 
-    /// Mean log-probability of each candidate filling `position` in `words`.
-    /// A multiword candidate fills that many masked slots; an unknown word
+    /// Log-probability of each candidate filling `position` in `words`.
+    /// A multiword candidate fills that many masked slots and scores the sum
+    /// (the whole phrase's probability) — averaging would let phrases of
+    /// easy filler words ("all in") look like good fits. An unknown word
     /// scores as [UNK] with a penalty, so it never beats a known fit.
     pub fn candidate_scores(&self, words: &[String], position: usize, candidates: &[String]) -> Result<Vec<f32>> {
         let mut out = Vec::with_capacity(candidates.len());
@@ -273,7 +275,7 @@ impl UsageModel {
                 let row = &log_probs[i.min(log_probs.len() - 1)];
                 total += row[id as usize] - if id == UNK { 5.0 } else { 0.0 };
             }
-            out.push(total / k as f32);
+            out.push(total);
         }
         Ok(out)
     }
@@ -365,6 +367,14 @@ mod tests {
         assert!(scores[0] > scores[1] && scores[0] > scores[2], "{scores:?}");
         let scores = model.candidate_scores(&words("a dog sat on a rug"), 5, &cands).unwrap();
         assert!(scores[1] > scores[0], "{scores:?}");
+    }
+
+    #[test]
+    fn a_phrase_of_common_filler_words_does_not_outscore_the_right_word() {
+        let (model, _, _) = trained();
+        let c = vec!["mat".to_string(), "the on".to_string(), "on the a".to_string()];
+        let scores = model.candidate_scores(&words("the cat sat on the mat"), 5, &c).unwrap();
+        assert!(scores[0] > scores[1] && scores[0] > scores[2], "{scores:?}");
     }
 
     #[test]

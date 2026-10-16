@@ -3,6 +3,7 @@
 //! scribe frames <models-dir>                stdin → one JSON frame per clause
 //! scribe variants <models-dir> [limit]      stdin → one JSON variant per line
 //! scribe train-usage <data-dir> <models-dir> [steps]   usage model + sense index (build with --features metal)
+//! scribe build-senses <models-dir>                      rebuild the sense index from a trained usage model
 
 use scribe::{conllu, inflect::Inflector, lm::LanguageModel, parser::Parser, tagger::{Column, Tagger}, text, Engine, Lexicon};
 use std::io::Read;
@@ -101,6 +102,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 println!("{}", serde_json::to_string(&v)?);
             }
         }
+        Some("build-senses") => {
+            let models = Path::new(arg(2)?);
+            #[cfg(feature = "metal")]
+            let device = scribe::usage::model::Device::new_metal(0)?;
+            #[cfg(not(feature = "metal"))]
+            let device = scribe::usage::model::Device::Cpu;
+            let model = scribe::usage::model::UsageModel::load(&models.join("usage"), device)?;
+            build_senses(&model, &Lexicon::load(&models.join("lexicon.bin"))?, &models.join("usage"))?;
+        }
         Some("train-usage") => train_usage(Path::new(arg(2)?), Path::new(arg(3)?), args.get(4).and_then(|s| s.parse().ok()).unwrap_or(20_000))?,
         _ => eprintln!("usage: scribe build-lexicon | train | frames | variants | train-usage (see source header)"),
     }
@@ -108,7 +118,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn train_usage(data: &Path, models: &Path, steps: usize) -> Result<(), Box<dyn std::error::Error>> {
-    use scribe::usage::{corpus, model::{Config, Device, TrainOptions, UsageModel}, senses::SenseIndex, vocab::Vocab};
+    use scribe::usage::{corpus, model::{Config, Device, TrainOptions, UsageModel}, vocab::Vocab};
     use std::io::{BufRead, Write};
 
     let lex = Lexicon::load(&models.join("lexicon.bin"))?;
@@ -175,66 +185,73 @@ fn train_usage(data: &Path, models: &Path, steps: usize) -> Result<(), Box<dyn s
     let out = models.join("usage");
     model.save(&out)?;
 
-    // Sense index from the training examples.
-    let locate = |sentence: &str, word: &str| -> Option<(Vec<String>, usize)> {
-        if word.contains(' ') {
-            return None;
-        }
-        let toks = tokenize(sentence);
-        let at = corpus::find_word(&toks, word, |w| lex.lemmatize(w, None))?;
-        (at < config.max_len).then_some((toks, at))
-    };
-    let mut index = SenseIndex::default();
-    let located: Vec<(u32, Vec<String>, usize)> = train_ex.iter().filter_map(|e| locate(&e.sentence, &e.word).map(|(t, a)| (e.synset, t, a))).collect();
+    build_senses(&model, &lex, &out)?;
+    Ok(())
+}
+
+/// Sense index from WordNet example sentences (training split), using the
+/// context vector with the word hidden, centered on the mean; then the
+/// held-out evaluation against first-listed and definition-overlap baselines.
+fn build_senses(model: &scribe::usage::model::UsageModel, lex: &Lexicon, out: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    use scribe::engine::{choose_sense, SENSE_MARGIN};
+    use scribe::usage::{corpus, senses::SenseIndex};
+    let tokenize = |s: &str| -> Vec<String> { text::tokenize(s).into_iter().map(|w| w.to_lowercase()).collect() };
+    let max = model.config.max_len;
+    let examples = corpus::wordnet_examples(lex);
+    let located: Vec<(bool, &corpus::SenseExample, Vec<String>, usize)> = examples
+        .iter()
+        .filter(|e| !e.word.contains(' '))
+        .filter_map(|e| {
+            let toks = tokenize(&e.sentence);
+            let at = corpus::find_word(&toks, &e.word, |w| lex.lemmatize(w, None))?;
+            (at < max).then(|| (corpus::is_held_out(e.synset, &e.sentence, 10), e, toks, at))
+        })
+        .collect();
+    let mut vectors = Vec::with_capacity(located.len());
     for chunk in located.chunks(256) {
-        let toks: Vec<Vec<String>> = chunk.iter().map(|(_, t, _)| t.clone()).collect();
-        for ((synset, _, at), vectors) in chunk.iter().zip(model.contextual_batch(&toks)?) {
-            index.add(*synset, &vectors[*at]);
+        let masked: Vec<Vec<String>> = chunk.iter().map(|(_, _, t, at)| { let mut t = t.clone(); t[*at] = "[MASK]".into(); t }).collect();
+        for ((_, _, _, at), h) in chunk.iter().zip(model.contextual_batch(&masked)?) {
+            vectors.push(h[*at].clone());
         }
+    }
+    let train: Vec<usize> = (0..located.len()).filter(|&i| !located[i].0).collect();
+    let dim = vectors.first().map_or(0, Vec::len);
+    let mut center = vec![0.0f32; dim];
+    for &i in &train {
+        for (c, x) in center.iter_mut().zip(&vectors[i]) {
+            *c += x / train.len() as f32;
+        }
+    }
+    let mut index = SenseIndex::with_center(center);
+    for &i in &train {
+        index.add(located[i].1.synset, &vectors[i]);
     }
     std::fs::write(out.join("senses.bin"), postcard::to_allocvec(&index)?)?;
     eprintln!("sense index: {} senses with examples", index.len());
 
-    // Held-out evaluation, same cases for every method.
-    let lesk = scribe::wsd::Disambiguator::new(&lex, false);
-    let cases: Vec<(&corpus::SenseExample, Vec<String>, usize)> = held
-        .iter()
-        .filter(|e| lex.senses(&e.word, lex.synsets[e.synset as usize].pos).len() >= 2)
-        .filter_map(|e| locate(&e.sentence, &e.word).map(|(t, a)| (e, t, a)))
-        .collect();
-    let mut vectors = Vec::with_capacity(cases.len());
-    for chunk in cases.chunks(256) {
-        let toks: Vec<Vec<String>> = chunk.iter().map(|(_, t, _)| t.clone()).collect();
-        for ((_, _, at), v) in chunk.iter().zip(model.contextual_batch(&toks)?) {
-            vectors.push(v[*at].clone());
-        }
-    }
-    let names = ["first-listed sense", "definition overlap", "usage model", "usage + listing order"];
-    let mut exact = [0usize; 4];
-    let mut category = [0usize; 4];
-    for ((e, toks, _), v) in cases.iter().zip(&vectors) {
+    let lesk = scribe::wsd::Disambiguator::new(lex, false);
+    let (mut n, mut first, mut overlap, mut usage, mut cats) = (0usize, 0usize, 0usize, 0usize, [0usize; 3]);
+    for ((held, e, toks, _), v) in located.iter().zip(&vectors) {
         let pos = lex.synsets[e.synset as usize].pos;
         let senses = lex.senses(&e.word, pos);
+        if !held || senses.len() < 2 {
+            continue;
+        }
         let lemmas: Vec<String> = toks.iter().map(|w| lex.lemmatize(w, None).into_iter().next().unwrap_or(w.clone())).collect();
-        let lesk_pick = lesk.disambiguate(&lex, &e.word, pos, &lemmas);
-        let usage_pick = index.best(senses, v).or(lesk_pick);
-        let blended = senses
-            .iter()
-            .enumerate()
-            .map(|(rank, &s)| (s, index.similarity(s, v).unwrap_or(0.0) + 0.15 / (1.0 + rank as f32)))
-            .max_by(|a, b| a.1.total_cmp(&b.1))
-            .map(|(s, _)| s);
-        let picks = [Some(senses[0]), lesk_pick, usage_pick, blended];
+        let picks = [Some(senses[0]), lesk.disambiguate(lex, &e.word, pos, &lemmas), choose_sense(senses, Some(&index), Some(v), SENSE_MARGIN).map(|(s, _)| s)];
         let cat = |s: u32| lex.synsets[s as usize].category;
-        for (i, p) in picks.iter().enumerate() {
-            exact[i] += (*p == Some(e.synset)) as usize;
-            category[i] += p.is_some_and(|p| cat(p) == cat(e.synset)) as usize;
+        n += 1;
+        first += (picks[0] == Some(e.synset)) as usize;
+        overlap += (picks[1] == Some(e.synset)) as usize;
+        usage += (picks[2] == Some(e.synset)) as usize;
+        for (k, p) in picks.iter().enumerate() {
+            cats[k] += p.is_some_and(|p| cat(p) == cat(e.synset)) as usize;
         }
     }
-    let pct = |x: usize| 100.0 * x as f64 / cases.len().max(1) as f64;
-    eprintln!("held-out sense test ({} unseen dictionary examples):", cases.len());
-    for i in 0..4 {
-        eprintln!("  {:<22} exact {:.1}%   category {:.1}%", names[i], pct(exact[i]), pct(category[i]));
-    }
+    let pct = |x: usize| 100.0 * x as f64 / n.max(1) as f64;
+    eprintln!("held-out sense test ({n} unseen dictionary examples):");
+    eprintln!("  first-listed sense           exact {:.1}%   category {:.1}%", pct(first), pct(cats[0]));
+    eprintln!("  definition overlap (baseline) exact {:.1}%   category {:.1}%", pct(overlap), pct(cats[1]));
+    eprintln!("  usage model (shipped)        exact {:.1}%   category {:.1}%", pct(usage), pct(cats[2]));
     Ok(())
 }

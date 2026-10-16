@@ -7,11 +7,23 @@ use std::collections::HashMap;
 
 #[derive(Serialize, Deserialize, Default)]
 pub struct SenseIndex {
-    /// synset → (sum of example vectors, count)
+    /// synset → (sum of centered example vectors, count)
     sums: HashMap<u32, (Vec<f32>, u32)>,
+    /// Mean of all example vectors; subtracted from every vector so that the
+    /// direction all vectors share doesn't swamp the differences between senses.
+    #[serde(default)]
+    center: Vec<f32>,
 }
 
 impl SenseIndex {
+    pub fn with_center(center: Vec<f32>) -> SenseIndex {
+        SenseIndex { center, ..Default::default() }
+    }
+
+    fn centered(&self, v: &[f32]) -> Vec<f32> {
+        if self.center.len() == v.len() { v.iter().zip(&self.center).map(|(a, b)| a - b).collect() } else { v.to_vec() }
+    }
+
     pub fn from_vectors(vectors: Vec<(u32, Vec<f32>)>) -> SenseIndex {
         let mut index = SenseIndex::default();
         for (synset, v) in vectors {
@@ -21,6 +33,7 @@ impl SenseIndex {
     }
 
     pub fn add(&mut self, synset: u32, v: &[f32]) {
+        let v = &self.centered(v)[..];
         let entry = self.sums.entry(synset).or_insert_with(|| (vec![0.0; v.len()], 0));
         for (a, b) in entry.0.iter_mut().zip(v) {
             *a += b;
@@ -42,7 +55,8 @@ impl SenseIndex {
 
     /// Cosine between `v` and a sense's centroid, if the sense has examples.
     pub fn similarity(&self, synset: u32, v: &[f32]) -> Option<f32> {
-        self.sums.get(&synset).map(|(sum, _)| cosine(sum, v))
+        let v = self.centered(v);
+        self.sums.get(&synset).map(|(sum, _)| cosine(sum, &v))
     }
 
     /// The candidate sense whose centroid is closest to `v`.
@@ -57,6 +71,9 @@ impl SenseIndex {
     }
 
     fn nearest(&self, candidates: &[u32], v: &[f32], exclude: Option<(u32, &[f32])>) -> Option<u32> {
+        let v = &self.centered(v)[..];
+        let held: Option<Vec<f32>> = exclude.map(|(_, h)| self.centered(h));
+        let exclude = exclude.map(|(s, _)| (s, held.as_deref().unwrap()));
         candidates
             .iter()
             .filter_map(|&c| {
@@ -95,6 +112,16 @@ mod tests {
         let index = SenseIndex::from_vectors(vec![(1, vec![1.0, 0.0]), (2, vec![0.0, 1.0])]);
         assert_eq!(index.best(&[2], &[1.0, 0.0]), Some(2));
         assert_eq!(index.best(&[3], &[1.0, 0.0]), None);
+    }
+
+    #[test]
+    fn a_shared_center_is_subtracted_before_comparing() {
+        // Both senses lean the same way; only the offset from the center tells them apart.
+        let mut index = SenseIndex::with_center(vec![10.0, 10.0]);
+        index.add(1, &[11.0, 10.0]);
+        index.add(2, &[10.0, 11.0]);
+        assert_eq!(index.best(&[1, 2], &[10.2, 10.9]), Some(2));
+        assert!((index.similarity(1, &[11.0, 10.0]).unwrap() - 1.0).abs() < 1e-5);
     }
 
     #[test]

@@ -76,8 +76,9 @@ pub struct Engine {
 
 pub const CONTENT: &[&str] = &["NOUN", "VERB", "ADJ", "ADV"];
 
-/// Weight of "listed first in the dictionary" when choosing senses by example.
-pub const SENSE_ORDER_BONUS: f32 = 0.15;
+/// Examples must beat the first-listed sense by this cosine margin to
+/// override it (tuned on half the held-out dictionary examples).
+pub const SENSE_MARGIN: f32 = 0.5;
 
 impl Engine {
     /// Loads lexicon, tagger, xpos, parser, inflect and lm `.bin` files from
@@ -138,16 +139,24 @@ impl Engine {
                 }
             })
             .collect();
-        // Usage vectors for example-based senses, when the model is present.
-        let vectors = match (&self.usage, &self.senses) {
-            (Some(u), Some(_)) => u.contextual(&words.iter().map(|w| w.to_lowercase()).collect::<Vec<_>>()).ok(),
-            _ => None,
+        // Context vectors with each content word hidden (what the context says
+        // the word means), one batched pass per sentence.
+        let content: Vec<usize> = (0..out.len()).filter(|&i| CONTENT.contains(&out[i].upos.as_str()) && out[i].upos != "AUX").collect();
+        let vectors: std::collections::HashMap<usize, Vec<f32>> = match (&self.usage, &self.senses) {
+            (Some(u), Some(_)) if !content.is_empty() => {
+                let lower: Vec<String> = words.iter().map(|w| w.to_lowercase()).collect();
+                let masked: Vec<Vec<String>> = content.iter().map(|&i| { let mut s = lower.clone(); s[i] = "[MASK]".into(); s }).collect();
+                u.contextual_batch(&masked)
+                    .map(|batch| content.iter().zip(batch).filter_map(|(&i, h)| h.get(i).cloned().map(|v| (i, v))).collect())
+                    .unwrap_or_default()
+            }
+            _ => Default::default(),
         };
         for (i, t) in out.iter_mut().enumerate() {
             if CONTENT.contains(&t.upos.as_str()) && t.upos != "AUX" {
                 if let Some(p) = Pos::from_upos(&t.upos) {
-                    let v = vectors.as_ref().and_then(|v| v.get(i)).map(Vec::as_slice);
-                    if let Some((sense, supported)) = choose_sense(self.lexicon.senses(&t.lemma, p), self.senses.as_ref(), v) {
+                    let v = vectors.get(&i).map(Vec::as_slice);
+                    if let Some((sense, supported)) = choose_sense(self.lexicon.senses(&t.lemma, p), self.senses.as_ref(), v, SENSE_MARGIN) {
                         t.sense = Some(sense);
                         t.sense_supported = supported;
                     }
@@ -163,27 +172,23 @@ impl Engine {
     }
 }
 
-/// Chooses a sense from usage only — never from definitions:
-/// by example sentences when any of the word's senses have them (with a small
-/// bonus for senses the dictionary lists first), otherwise the first-listed
-/// sense (WordNet orders senses by how often they occur in tagged text).
-/// The flag says whether usage supports the choice (examples, or only one sense).
-pub fn choose_sense(senses: &[u32], index: Option<&SenseIndex>, v: Option<&[f32]>) -> Option<(u32, bool)> {
+/// Chooses a sense from usage only — never from definitions. Default is the
+/// first-listed sense (WordNet orders senses by frequency in tagged text);
+/// a sense whose example sentences match this context better by more than
+/// `margin` overrides it. The flag says whether usage supports the choice
+/// (only one sense, or example sentences back it).
+pub fn choose_sense(senses: &[u32], index: Option<&SenseIndex>, v: Option<&[f32]>, margin: f32) -> Option<(u32, bool)> {
     let first = *senses.first()?;
     if senses.len() == 1 {
         return Some((first, true));
     }
-    if let (Some(index), Some(v)) = (index, v) {
-        if senses.iter().any(|&s| index.knows(s)) {
-            return senses
-                .iter()
-                .enumerate()
-                .map(|(rank, &s)| (s, index.similarity(s, v).unwrap_or(0.0) + SENSE_ORDER_BONUS / (1.0 + rank as f32)))
-                .max_by(|a, b| a.1.total_cmp(&b.1))
-                .map(|(s, _)| (s, true));
-        }
+    let (Some(index), Some(v)) = (index, v) else { return Some((first, false)) };
+    let first_sim = index.similarity(first, v);
+    let best = senses.iter().filter_map(|&s| index.similarity(s, v).map(|x| (s, x))).max_by(|a, b| a.1.total_cmp(&b.1));
+    match best {
+        Some((s, x)) if s != first && x - first_sim.unwrap_or(0.0) > margin => Some((s, true)),
+        _ => Some((first, index.knows(first))),
     }
-    Some((first, false))
 }
 
 fn clitic_lemma(w: &str) -> String {
@@ -205,21 +210,24 @@ mod sense_tests {
     use super::*;
 
     #[test]
-    fn picks_by_example_when_a_sense_has_examples() {
+    fn examples_override_the_first_listed_sense_only_past_the_margin() {
         let index = SenseIndex::from_vectors(vec![(10, vec![1.0, 0.0]), (11, vec![0.0, 1.0])]);
-        assert_eq!(choose_sense(&[10, 11], Some(&index), Some(&[0.0, 1.0])), Some((11, true)));
+        // Clearly sense 11 (cos 1 vs 0): margin 1.0 > 0.5.
+        assert_eq!(choose_sense(&[10, 11], Some(&index), Some(&[0.0, 1.0]), 0.5), Some((11, true)));
+        // Only slightly closer to 11: stays with the first-listed sense, which examples still support.
+        assert_eq!(choose_sense(&[10, 11], Some(&index), Some(&[0.6, 0.8]), 0.5), Some((10, true)));
     }
 
     #[test]
     fn falls_back_to_first_listed_sense_never_definitions() {
-        assert_eq!(choose_sense(&[10, 11], None, None), Some((10, false)));
+        assert_eq!(choose_sense(&[10, 11], None, None, 0.5), Some((10, false)));
         let index = SenseIndex::from_vectors(vec![(99, vec![1.0])]);
-        assert_eq!(choose_sense(&[10, 11], Some(&index), Some(&[1.0])), Some((10, false)));
+        assert_eq!(choose_sense(&[10, 11], Some(&index), Some(&[1.0]), 0.5), Some((10, false)));
     }
 
     #[test]
     fn a_single_sense_is_always_supported() {
-        assert_eq!(choose_sense(&[7], None, None), Some((7, true)));
-        assert_eq!(choose_sense(&[], None, None), None);
+        assert_eq!(choose_sense(&[7], None, None, 0.5), Some((7, true)));
+        assert_eq!(choose_sense(&[], None, None, 0.5), None);
     }
 }

@@ -9,11 +9,12 @@ through UniFFI.
 | Lexicon | 127k lemmas, 107k senses, definitions, examples, 45 categories, irregular forms | Open English WordNet 2025 | — |
 | Tagger | averaged perceptron, dictionary features; UPOS and Penn (XPOS) | UD English EWT | UPOS 94.6%, XPOS 94.0% (test) |
 | Parser | arc-eager, dynamic oracle, jackknifed tags | UD English EWT | UAS 81.7%, LAS 77.5% (test, predicted tags) |
-| Senses | extended Lesk over definitions + examples + parent senses | WordNet | 38.4% exact / 71.7% category on 29.7k held-out dictionary examples (first-sense baseline 33.6% / 69.1%) |
+| Usage model | 4-layer transformer (256-d, ~13M params) trained from scratch to fill in hidden words | 15.3M tokens of usage sentences only: 580k Wiktionary examples, WordNet examples, EWT | masked-word loss 3.80 after 40k steps (~100 min on M5 Pro GPU) |
+| Senses | first-listed sense, overridden when the sense's example sentences match the context (word hidden, vectors centered) by > 0.5 cosine | WordNet example sentences (28k senses) | 34.3% exact / 70.5% category on 3,290 held-out examples (first-listed 33.5% / 69.6%; definition-overlap baseline, not used, 37.3% / 71.9%) |
 | Inflection | spelling rules + irregulars | EWT + WordNet | unit-tested |
-| Fluency | interpolated Kneser–Ney trigram (scores, never generates) | WordNet definitions/examples + EWT | perplexity 555 on EWT test |
+| Fluency | interpolated Kneser–Ney trigram (scores, never generates), singletons pruned | usage sentences only (no definitions) | perplexity 618 on EWT test |
 | Frames | subject, modality, negation, verb, object, clause links, categories, concepts | rules over the parse | — |
-| Variants | trim / cut / reorder / swap / reframe, ranked by fluency, ordered for diversity | rules + all of the above | ~1 ms per rock |
+| Variants | trim / cut / reorder / swap / reframe; swaps kept only if the usage model says they fit the sentence; ranked by fluency, ordered for diversity | rules + all of the above | 20–50 ms per rock with the usage model |
 
 ## Build
 
@@ -26,13 +27,15 @@ cd ..
 
 cargo build --release
 target/release/scribe build-lexicon data/oewn models   # ~0.3 s
-target/release/scribe train data models                # ~30 s: taggers, parser, inflection, fluency, senses
+target/release/scribe train data models                # ~1 min: taggers, parser, inflection, fluency
+# usage model (needs data/wiktionary/kaikki-English.jsonl from kaikki.org; ~100 min on Apple GPU, resumable)
+cargo build --release --features metal && target/release/scribe train-usage data models 40000
 
 echo "I should go running more but I'm really too tired after work." | target/release/scribe variants models 20
 echo "I want to move back home because I miss my mom." | target/release/scribe frames models
 ```
 
-Models total ~71 MB (`lexicon`, `tagger`, `xpos`, `parser`, `inflect`, `lm`, `wsd` `.bin`). Engine load ≈ 0.2 s.
+Models: ~82 MB core (`lexicon`, `tagger`, `xpos`, `parser`, `inflect`, `lm` `.bin`) + ~75 MB `usage/`. Engine load ≈ 0.35 s.
 
 ## iOS / macOS
 
@@ -54,7 +57,8 @@ for v in engine.variants(rock: text, limit: 40) { v.text; v.ops; v.changedRanges
 
 ## Known limits
 
-- Sense choice is right ~72% of the time at the category level, so swaps are only offered when the dictionary supports the chosen sense.
+- Only ~half of word senses have example sentences, which caps example-based sense choice; senses without examples fall back to dictionary order. Swaps are only offered when usage supports the chosen sense.
+- Similar-adjective links can change meaning while still fitting the sentence (tired → bored).
 - The parser is greedy and trained on 12.5k sentences; long, run-on journal sentences are where it errs most.
 
 ## Attribution
