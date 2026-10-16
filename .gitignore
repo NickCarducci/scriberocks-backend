@@ -1,0 +1,7 @@
+/target
+/data
+/models
+/swift/ScribeCore/.build
+/swift/ScribeCore/ScribeFFI.xcframework
+/swift/ScribeCore/Sources/ScribeCore/scribe.swift
+/swift/ScribeCore/.swiftpm
