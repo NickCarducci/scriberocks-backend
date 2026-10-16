@@ -3,5 +3,7 @@
 /models
 /swift/ScribeCore/.build
 /swift/ScribeCore/ScribeFFI.xcframework
-/swift/ScribeCore/Sources/ScribeCore/scribe.swift
 /swift/ScribeCore/.swiftpm
+/swift/ScribeCore/ScribeFFI.xcframework.zip
+/.build
+/.swiftpm

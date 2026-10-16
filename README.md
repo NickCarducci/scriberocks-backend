@@ -36,6 +36,11 @@ Models total ~71 MB (`lexicon`, `tagger`, `xpos`, `parser`, `inflect`, `lm`, `ws
 
 ## iOS / macOS
 
+Apps depend on this repo by URL (root `Package.swift`, prebuilt `ScribeFFI.xcframework`
+from the GitHub release). To cut a release: `scripts/build-apple.sh`, zip the
+xcframework, `swift package compute-checksum`, update the URL/checksum, tag, `gh release create`.
+
+
 ```sh
 scripts/build-apple.sh                 # → swift/ScribeCore (ScribeFFI.xcframework + Swift bindings)
 cd swift/ScribeCore && swift test      # runs the real engine through the bindings
@@ -55,4 +60,5 @@ for v in engine.variants(rock: text, limit: 40) { v.text; v.ops; v.changedRanges
 ## Attribution
 
 - Open English WordNet — CC BY 4.0, derived from Princeton WordNet (WordNet License). https://en-word.net
+- Wiktionary (via kaikki.org) — CC BY-SA 4.0. Usage examples train the usage model.
 - UD English EWT — CC BY-SA 4.0. https://universaldependencies.org/treebanks/en_ewt/ — models trained on it (`tagger`, `xpos`, `parser`, `inflect`, `lm`) should be treated as share-alike.
