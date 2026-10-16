@@ -142,7 +142,17 @@ fn sweep(label: &str, cases: &[Case], scores: &[Vec<f32>]) {
 fn main() {
     let arg = |i: usize, d: usize| std::env::args().nth(i).and_then(|a| a.parse().ok()).unwrap_or(d);
     let (eval_cap, train_cap) = (arg(1, 2000), arg(2, 8000));
-    let e = Engine::load(Path::new("models")).unwrap();
+    // USAGE=usage-sense evaluates another usage model (and its sense index).
+    let usage = std::env::var("USAGE").unwrap_or_else(|_| "usage".into());
+    let mut e = Engine::load(Path::new("models")).unwrap();
+    if usage != "usage" {
+        let dir = Path::new("models").join(&usage);
+        e.usage = Some(scribe::usage::model::UsageModel::load(&dir, scribe::usage::model::Device::Cpu).unwrap());
+        let mut index: SenseIndex = postcard::from_bytes(&std::fs::read(dir.join("senses.bin")).unwrap()).unwrap();
+        index.build_backoff(&e.lexicon);
+        e.senses = Some(index);
+        eprintln!("usage model: models/{usage}");
+    }
     let keys = semcor::sense_keys(Path::new("data/oewn"), &e.lexicon).unwrap();
 
     let semcor = load("semcor", "Training_Corpora/SemCor");
@@ -168,7 +178,7 @@ fn main() {
     report("ALL, shipped index", &all_cases, shipped, &e.lexicon);
 
     eprintln!("vectors: SemCor training documents");
-    let mut index: SenseIndex = postcard::from_bytes(&std::fs::read("models/usage/senses.bin").unwrap()).unwrap();
+    let mut index: SenseIndex = postcard::from_bytes(&std::fs::read(Path::new("models").join(&usage).join("senses.bin")).unwrap()).unwrap();
     let (train_cases, _) = cases(&e, &keys, &every(&train, train_cap));
     for c in &train_cases {
         index.add(c.gold[0], &c.vector);
