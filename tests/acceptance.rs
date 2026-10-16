@@ -38,3 +38,25 @@ fn engine_reports_that_the_usage_model_is_loaded() {
     let Some(engine) = engine() else { return };
     assert!(engine.has_usage_model());
 }
+
+fn connects(engine: &Engine, rock: &str) -> Vec<String> {
+    engine.variants(rock, 200).into_iter().filter(|v| v.ops.contains(&scribe::Op::Connect)).map(|v| v.text).collect()
+}
+
+#[test]
+fn connect_joins_statements_with_a_closed_set_connective() {
+    let Some(engine) = engine() else { return };
+    let got = connects(&engine, "I stayed home. It rained.");
+    assert!(!got.is_empty(), "no connect variants");
+    for v in &got {
+        let added: Vec<&str> = v.split(|c: char| !c.is_alphanumeric()).filter(|w| !w.is_empty())
+            .filter(|w| !["I", "stayed", "home", "it", "It", "rained"].contains(w)).collect();
+        assert!(added.len() == 1 && scribe::variants::CONNECTIVES.contains(&added[0]), "{v:?} adds {added:?}");
+    }
+}
+
+#[test]
+fn connect_never_joins_questions() {
+    let Some(engine) = engine() else { return };
+    assert!(connects(&engine, "Why did I stay home? It rained.").is_empty());
+}

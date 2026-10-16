@@ -207,9 +207,13 @@ impl Lexicon {
                     push(candidate, &mut out);
                 } else if replacement.is_empty() {
                     // Doubled consonant: "stopped" → "stopp" → "stop".
-                    let b = stem.as_bytes();
-                    if b.len() > 2 && b[b.len() - 1] == b[b.len() - 2] && has(&stem[..stem.len() - 1]) {
-                        push(stem[..stem.len() - 1].to_string(), &mut out);
+                    // Character-wise: Wiktionary has words like "co₂s".
+                    let mut rev = stem.chars().rev();
+                    if let (Some(last), Some(prev)) = (rev.next(), rev.next()) {
+                        let shorter = &stem[..stem.len() - last.len_utf8()];
+                        if last == prev && last.is_ascii_alphabetic() && shorter.chars().count() >= 2 && has(shorter) {
+                            push(shorter.to_string(), &mut out);
+                        }
                     }
                 }
             }
@@ -252,4 +256,34 @@ fn strings(value: &serde_json::Value) -> Vec<String> {
         .as_array()
         .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
         .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn lexicon(words: &[(&str, Pos)]) -> Lexicon {
+        Lexicon {
+            categories: vec![],
+            synsets: vec![],
+            lemmas: words.iter().map(|(w, p)| (w.to_string(), vec![(*p, vec![])])).collect(),
+            forms: HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn lemmatizes_regular_forms_and_doubled_consonants() {
+        let lex = lexicon(&[("stop", Pos::Verb), ("cat", Pos::Noun)]);
+        assert_eq!(lex.lemmatize("stopped", Some(Pos::Verb)), vec!["stop"]);
+        assert_eq!(lex.lemmatize("cats", None), vec!["cat"]);
+    }
+
+    #[test]
+    fn never_panics_on_non_ascii_words() {
+        let lex = lexicon(&[("co", Pos::Noun)]);
+        for w in ["co₂s", "₂₂ed", "naïveté", "café's", "日本ing", "ééed"] {
+            let _ = lex.lemmatize(w, None);
+            let _ = lex.lemmatize(w, Some(Pos::Verb));
+        }
+    }
 }

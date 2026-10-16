@@ -6,6 +6,8 @@
 //!   reorder — move a because/if/when clause to the other side
 //!   swap    — replace a word with a dictionary synonym of its chosen sense
 //!   reframe — hold the same action with a different modality (should → want to → will …)
+//!   connect — join two sentences with a closed-set connective (because / so / but / and)
+//!             when the usage model finds it as natural as the sentence break
 
 use crate::engine::{Engine, Sentence, CONTENT};
 use crate::frames::{clause_heads, clause_of, is_light};
@@ -20,6 +22,7 @@ pub enum Op {
     Reorder,
     Swap,
     Reframe,
+    Connect,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -55,6 +58,43 @@ pub const MIN_FLUENCY_DELTA: f64 = -2.5;
 /// margin of the original word, and at most this many are kept per word.
 pub const SWAP_MARGIN: f32 = 2.5;
 pub const SWAPS_PER_WORD: usize = 3;
+
+/// A connective is kept if it scores within this margin of a plain sentence
+/// break at the same spot, at most `CONNECTS_PER_JOIN` per sentence pair.
+pub const CONNECT_MARGIN: f32 = 1.0;
+pub const CONNECTS_PER_JOIN: usize = 2;
+
+/// Closed set for the connect operation: slot-filling, not free generation.
+pub const CONNECTIVES: [&str; 4] = ["because", "so", "but", "and"];
+/// Words that already open a linked sentence.
+const OPENERS: &[&str] = &["because", "but", "so", "and", "or", "then", "also", "however", "if", "when", "since", "though", "although", "yet"];
+
+/// Two adjacent sentences can be joined when both are plain statements and
+/// the second doesn't already open with a connective.
+pub fn can_join(first: &[String], second: &[String]) -> bool {
+    fn ends(s: &[String]) -> &str {
+        s.last().map(String::as_str).unwrap_or("")
+    }
+    let opener = second.first().map(|w| w.to_lowercase()).unwrap_or_default();
+    first.len() >= 3 && second.len() >= 3 && matches!(ends(first), "." | "!") && ends(second) != "?" && !OPENERS.contains(&opener.as_str())
+}
+
+/// "A." + "B." → "A because b." ("so"/"but" take a comma). `keep_case` keeps
+/// the second sentence's first word capitalized (names); "I" always is.
+pub fn join_with(first: &[String], second: &[String], connective: &str, keep_case: bool) -> Vec<String> {
+    let mut out: Vec<String> = first.to_vec();
+    while out.last().is_some_and(|w| matches!(w.as_str(), "." | "!" | "?")) {
+        out.pop();
+    }
+    if matches!(connective, "so" | "but") {
+        out.push(",".into());
+    }
+    out.push(connective.to_string());
+    for (i, w) in second.iter().enumerate() {
+        out.push(if i == 0 && !keep_case && w != "I" && !w.starts_with("I'") { lower_first(w) } else { w.clone() });
+    }
+    out
+}
 
 /// Swaps scoring within `margin` of the original, best first, at most `max`.
 pub fn keep_fitting(original: f32, mut scored: Vec<(String, f32)>, margin: f32, max: usize) -> Vec<String> {
@@ -96,6 +136,17 @@ impl Engine {
             }
         }
 
+        // Joins between adjacent sentences (needs the usage model to judge fit).
+        for (i, connective) in self.connections(&originals) {
+            let keep_case = sentences[i + 1].tokens.first().is_some_and(|t| t.upos == "PROPN");
+            let joined = join_with(&originals[i], &originals[i + 1], connective, keep_case);
+            let base = self.fluency(&[originals[i].clone(), originals[i + 1].clone()].concat());
+            let delta = self.fluency(&joined) - base;
+            let mut sents = originals.clone();
+            sents.splice(i..=i + 1, [joined]);
+            push(sents, vec![Op::Connect], delta, &mut out);
+        }
+
         for (si, s) in sentences.iter().enumerate() {
             let base = self.fluency(&originals[si]);
             for c in self.sentence_candidates(s) {
@@ -107,6 +158,34 @@ impl Engine {
         }
 
         diversify(out, limit)
+    }
+
+    /// (sentence index, connective) pairs where joining sentence i and i+1
+    /// reads about as naturally as the existing break.
+    fn connections(&self, originals: &[Vec<String>]) -> Vec<(usize, &'static str)> {
+        let Some(usage) = &self.usage else { return vec![] };
+        let mut out = Vec::new();
+        for i in 0..originals.len().saturating_sub(1) {
+            let (a, b) = (&originals[i], &originals[i + 1]);
+            if !can_join(a, b) {
+                continue;
+            }
+            // "a … [slot] b …": score each connective and "." in the slot.
+            let mut context: Vec<String> = a[..a.len() - 1].iter().map(|w| w.to_lowercase()).collect();
+            let slot = context.len();
+            context.push("[MASK]".into());
+            context.extend(b.iter().map(|w| w.to_lowercase())); // the usage model is uncased
+            let mut candidates: Vec<String> = CONNECTIVES.iter().map(|c| c.to_string()).collect();
+            candidates.push(".".into());
+            let Ok(scores) = usage.candidate_scores(&context, slot, &candidates) else { continue };
+            let sentence_break = scores[CONNECTIVES.len()];
+            let scored: Vec<(String, f32)> = CONNECTIVES.iter().map(|c| c.to_string()).zip(scores.iter().copied()).collect();
+            for c in keep_fitting(sentence_break, scored, CONNECT_MARGIN, CONNECTS_PER_JOIN) {
+                let c: &'static str = CONNECTIVES.iter().find(|x| **x == c).unwrap();
+                out.push((i, c));
+            }
+        }
+        out
     }
 
     fn sentence_candidates(&self, s: &Sentence) -> Vec<Candidate> {
@@ -529,6 +608,25 @@ fn jaccard(a: &HashSet<String>, b: &HashSet<String>) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn toks(s: &str) -> Vec<String> {
+        s.split(' ').map(String::from).collect()
+    }
+
+    #[test]
+    fn joins_two_sentences_with_a_connective() {
+        assert_eq!(join_with(&toks("I stayed home ."), &toks("It rained ."), "because", false), toks("I stayed home because it rained ."));
+        assert_eq!(join_with(&toks("I was tired ."), &toks("I went to bed ."), "so", false), toks("I was tired , so I went to bed ."));
+        assert_eq!(join_with(&toks("I tried ."), &toks("Maria left !"), "but", true), toks("I tried , but Maria left !"));
+    }
+
+    #[test]
+    fn only_joins_plain_statements() {
+        assert!(can_join(&toks("I stayed home ."), &toks("It rained .")));
+        assert!(!can_join(&toks("Why did I stay ?"), &toks("It rained .")));
+        assert!(!can_join(&toks("I stayed ."), &toks("Because it rained .")));
+        assert!(!can_join(&toks("I stayed ."), &toks("But it rained .")));
+    }
 
     #[test]
     fn keeps_only_swaps_that_fit_nearly_as_well_as_the_original() {

@@ -2,8 +2,9 @@
 //! scribe train <ewt-dir> <models-dir>       taggers, parser, inflection, fluency model
 //! scribe frames <models-dir>                stdin → one JSON frame per clause
 //! scribe variants <models-dir> [limit]      stdin → one JSON variant per line
-//! scribe train-usage <data-dir> <models-dir> [steps]   usage model + sense index (build with --features metal)
-//! scribe build-senses <models-dir>                      rebuild the sense index from a trained usage model
+//! scribe train-usage <data-dir> <models-dir> [steps] [--morph]   usage model + sense index (build with --features metal);
+//!                                                       --morph splits words into base + ending → models/usage-morph
+//! scribe build-senses <models-dir> [usage-dir-name]     rebuild the sense index from a trained usage model
 
 use scribe::{conllu, inflect::Inflector, lm::LanguageModel, parser::Parser, tagger::{Column, Tagger}, text, Engine, Lexicon};
 use std::io::Read;
@@ -108,16 +109,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let device = scribe::usage::model::Device::new_metal(0)?;
             #[cfg(not(feature = "metal"))]
             let device = scribe::usage::model::Device::Cpu;
-            let model = scribe::usage::model::UsageModel::load(&models.join("usage"), device)?;
-            build_senses(&model, &Lexicon::load(&models.join("lexicon.bin"))?, &models.join("usage"))?;
+            let name = args.get(3).map(String::as_str).unwrap_or("usage");
+            let model = scribe::usage::model::UsageModel::load(&models.join(name), device)?;
+            build_senses(&model, &Lexicon::load(&models.join("lexicon.bin"))?, &models.join(name))?;
         }
-        Some("train-usage") => train_usage(Path::new(arg(2)?), Path::new(arg(3)?), args.get(4).and_then(|s| s.parse().ok()).unwrap_or(20_000))?,
+        Some("train-usage") => {
+            let steps = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(20_000);
+            let morph = args.iter().any(|a| a == "--morph");
+            train_usage(Path::new(arg(2)?), Path::new(arg(3)?), steps, morph)?
+        }
         _ => eprintln!("usage: scribe build-lexicon | train | frames | variants | train-usage (see source header)"),
     }
     Ok(())
 }
 
-fn train_usage(data: &Path, models: &Path, steps: usize) -> Result<(), Box<dyn std::error::Error>> {
+fn train_usage(data: &Path, models: &Path, steps: usize, morph: bool) -> Result<(), Box<dyn std::error::Error>> {
     use scribe::usage::{corpus, model::{Config, Device, TrainOptions, UsageModel}, vocab::Vocab};
     use std::io::{BufRead, Write};
 
@@ -158,17 +164,32 @@ fn train_usage(data: &Path, models: &Path, steps: usize) -> Result<(), Box<dyn s
     #[cfg(not(feature = "metal"))]
     let device = Device::Cpu;
 
+    let name = if morph { "usage-morph" } else { "usage" };
+    // Base + ending pieces: split table built from every word in the corpus.
+    let morphology = morph.then(|| {
+        scribe::usage::morph::Morphology::build(sentences.iter().flatten().cloned(), |w| lex.lemmatize(w, None))
+    });
+    let pieces: Vec<Vec<String>> = match &morphology {
+        Some(m) => sentences.iter().map(|s| m.split_sentence(s).0).collect(),
+        None => sentences.clone(),
+    };
+    if let Some(m) = &morphology {
+        eprintln!("morphology: {} inflected word forms split into base + ending", m.len());
+    }
     let config = Config { vocab_size: 0, dim: 256, layers: 4, heads: 4, ff: 1024, max_len: 48 };
-    let ckpt = models.join("usage-checkpoint");
+    let ckpt = models.join(format!("{name}-checkpoint"));
     let (mut model, start) = match UsageModel::checkpoint_step(&ckpt) {
         Some(step) if step < steps => {
             eprintln!("resuming from checkpoint at step {step}");
             UsageModel::resume(&ckpt, device)?
         }
-        _ => (UsageModel::new_random(Vocab::build(&sentences, 3, 32_000), config, device, 7)?, 0),
+        _ => {
+            let fresh = UsageModel::new_random(Vocab::build(&pieces, 3, 32_000), config, device, 7)?;
+            (match morphology { Some(m) => fresh.with_morphology(m), None => fresh }, 0)
+        }
     };
     let config = model.config;
-    let ids: Vec<Vec<u32>> = sentences.iter().map(|s| model.vocab.encode(s)).collect();
+    let ids: Vec<Vec<u32>> = pieces.iter().map(|s| model.vocab.encode(s)).collect();
     eprintln!("vocab {} words; model {}×{} layers; training {steps} steps", model.vocab.len(), config.dim, config.layers);
 
     let t = Instant::now();
@@ -182,7 +203,7 @@ fn train_usage(data: &Path, models: &Path, steps: usize) -> Result<(), Box<dyn s
             window.clear();
         }
     })?;
-    let out = models.join("usage");
+    let out = models.join(name);
     model.save(&out)?;
 
     build_senses(&model, &lex, &out)?;

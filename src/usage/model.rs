@@ -2,7 +2,8 @@
 //! trained to fill in masked words.
 
 use crate::usage::masking::{mask, Rng};
-use crate::usage::vocab::{Vocab, MASK, PAD, UNK};
+use crate::usage::morph::Morphology;
+use crate::usage::vocab::{Vocab, PAD, UNK};
 pub use candle_core::Device;
 use candle_core::{DType, Module, Result, Tensor, D};
 use candle_nn::{linear, AdamW, Embedding, Linear, Optimizer, ParamsAdamW, VarBuilder, VarMap};
@@ -139,12 +140,16 @@ pub struct UsageModel {
     varmap: VarMap,
     encoder: Encoder,
     device: Device,
+    /// When set, words are split into base + ending pieces before encoding.
+    morph: Option<Morphology>,
 }
 
 #[derive(Serialize, Deserialize)]
 struct Meta {
     vocab: Vocab,
     config: Config,
+    #[serde(default)]
+    morph: Option<Morphology>,
 }
 
 impl UsageModel {
@@ -154,7 +159,24 @@ impl UsageModel {
         let varmap = VarMap::new();
         let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
         let encoder = Encoder::new(config, vb)?;
-        Ok(UsageModel { vocab, config, varmap, encoder, device })
+        Ok(UsageModel { vocab, config, varmap, encoder, device, morph: None })
+    }
+
+    pub fn with_morphology(mut self, morph: Morphology) -> UsageModel {
+        self.morph = Some(morph);
+        self
+    }
+
+    pub fn morphology(&self) -> Option<&Morphology> {
+        self.morph.as_ref()
+    }
+
+    /// Pieces for `words` and each word's base-piece index.
+    fn pieces(&self, words: &[String]) -> (Vec<String>, Vec<usize>) {
+        match &self.morph {
+            Some(m) => m.split_sentence(words),
+            None => (words.to_vec(), (0..words.len()).collect()),
+        }
     }
 
     pub fn device(&self) -> &Device {
@@ -235,45 +257,49 @@ impl UsageModel {
         Ok((Self::load(dir, device)?, step))
     }
 
-    fn encode_window(&self, words: &[String]) -> Vec<u32> {
-        self.vocab.encode(words).into_iter().take(self.config.max_len).collect()
+    /// Encoded pieces (truncated to max_len) and the base piece of each word
+    /// that fits.
+    fn encode_window(&self, words: &[String]) -> (Vec<u32>, Vec<usize>) {
+        let (pieces, base) = self.pieces(words);
+        let ids: Vec<u32> = self.vocab.encode(&pieces).into_iter().take(self.config.max_len).collect();
+        let base = base.into_iter().take_while(|&b| b < ids.len()).collect();
+        (ids, base)
     }
 
     /// Log-probability of each candidate filling `position` in `words`.
-    /// A multiword candidate fills that many masked slots and scores the sum
-    /// (the whole phrase's probability) — averaging would let phrases of
-    /// easy filler words ("all in") look like good fits. An unknown word
-    /// scores as [UNK] with a penalty, so it never beats a known fit.
+    /// A multiword candidate (or one split into base + ending) fills that
+    /// many masked slots and scores the sum — the whole phrase's probability;
+    /// averaging would let phrases of easy filler words ("all in") look like
+    /// good fits. An unknown piece scores as [UNK] with a penalty.
     pub fn candidate_scores(&self, words: &[String], position: usize, candidates: &[String]) -> Result<Vec<f32>> {
+        let before = self.pieces(&words[..position.min(words.len())]).0;
+        let after = self.pieces(&words[(position + 1).min(words.len())..]).0;
         let mut out = Vec::with_capacity(candidates.len());
         let mut cache: std::collections::HashMap<usize, Vec<Vec<f32>>> = std::collections::HashMap::new();
         for cand in candidates {
-            let parts: Vec<&str> = cand.split(' ').collect();
+            let parts: Vec<String> = self.pieces(&cand.split(' ').map(String::from).collect::<Vec<_>>()).0;
             let k = parts.len();
-            let log_probs = match cache.get(&k) {
-                Some(lp) => lp.clone(),
-                None => {
-                    let mut seq: Vec<String> = words[..position].to_vec();
-                    seq.extend(std::iter::repeat_n("[MASK]".to_string(), k));
-                    seq.extend(words[(position + 1).min(words.len())..].iter().cloned());
-                    let mut ids = self.encode_window(&seq);
-                    for slot in position..(position + k).min(ids.len()) {
-                        ids[slot] = MASK;
-                    }
-                    let n = ids.len();
-                    let t = Tensor::from_vec(ids, (1, n), &self.device)?;
-                    let hidden = self.encoder.hidden(&t)?.squeeze(0)?;
-                    let slots = hidden.narrow(0, position.min(n - 1), k.min(n - position.min(n - 1)))?;
-                    let lp = candle_nn::ops::log_softmax(&self.encoder.logits(&slots)?, D::Minus1)?.to_vec2::<f32>()?;
-                    cache.insert(k, lp.clone());
-                    lp
-                }
-            };
+            if before.len() + k > self.config.max_len {
+                out.push(f32::NEG_INFINITY);
+                continue;
+            }
+            if !cache.contains_key(&k) {
+                let mut seq = before.clone();
+                seq.extend(std::iter::repeat_n("[MASK]".to_string(), k));
+                seq.extend(after.iter().cloned());
+                let ids: Vec<u32> = self.vocab.encode(&seq).into_iter().take(self.config.max_len).collect();
+                let n = ids.len();
+                let t = Tensor::from_vec(ids, (1, n), &self.device)?;
+                let hidden = self.encoder.hidden(&t)?.squeeze(0)?;
+                let slots = hidden.narrow(0, before.len(), k)?;
+                let lp = candle_nn::ops::log_softmax(&self.encoder.logits(&slots)?, D::Minus1)?.to_vec2::<f32>()?;
+                cache.insert(k, lp);
+            }
+            let log_probs = &cache[&k];
             let mut total = 0.0;
             for (i, part) in parts.iter().enumerate() {
                 let id = self.vocab.id(part);
-                let row = &log_probs[i.min(log_probs.len() - 1)];
-                total += row[id as usize] - if id == UNK { 5.0 } else { 0.0 };
+                total += log_probs[i][id as usize] - if id == UNK { 5.0 } else { 0.0 };
             }
             out.push(total);
         }
@@ -282,10 +308,11 @@ impl UsageModel {
 
     /// Contextual vector for every word (truncated to max_len).
     pub fn contextual(&self, words: &[String]) -> Result<Vec<Vec<f32>>> {
-        let ids = self.encode_window(words);
+        let (ids, base) = self.encode_window(words);
         let n = ids.len();
         let t = Tensor::from_vec(ids, (1, n), &self.device)?;
-        self.encoder.hidden(&t)?.squeeze(0)?.to_vec2::<f32>()
+        let hidden = self.encoder.hidden(&t)?.squeeze(0)?.to_vec2::<f32>()?;
+        Ok(base.into_iter().map(|b| hidden[b].clone()).collect())
     }
 
     /// `contextual` for many sentences in one pass (padded; padding is masked
@@ -294,22 +321,22 @@ impl UsageModel {
         if sentences.is_empty() {
             return Ok(vec![]);
         }
-        let encoded: Vec<Vec<u32>> = sentences.iter().map(|s| self.encode_window(s)).collect();
-        let len = encoded.iter().map(Vec::len).max().unwrap_or(1).max(1);
+        let encoded: Vec<(Vec<u32>, Vec<usize>)> = sentences.iter().map(|s| self.encode_window(s)).collect();
+        let len = encoded.iter().map(|(ids, _)| ids.len()).max().unwrap_or(1).max(1);
         let mut flat = Vec::with_capacity(encoded.len() * len);
-        for ids in &encoded {
+        for (ids, _) in &encoded {
             flat.extend(ids.iter().copied());
             flat.extend(std::iter::repeat_n(PAD, len - ids.len()));
         }
         let t = Tensor::from_vec(flat, (encoded.len(), len), &self.device)?;
         let hidden = self.encoder.hidden(&t)?.to_vec3::<f32>()?;
-        Ok(hidden.into_iter().zip(&encoded).map(|(h, ids)| h.into_iter().take(ids.len()).collect()).collect())
+        Ok(hidden.into_iter().zip(&encoded).map(|(h, (_, base))| base.iter().map(|&b| h[b].clone()).collect()).collect())
     }
 
     pub fn save(&self, dir: &Path) -> Result<()> {
         std::fs::create_dir_all(dir)?;
         self.varmap.save(dir.join("usage.safetensors"))?;
-        let meta = serde_json::to_vec(&Meta { vocab: self.vocab.clone(), config: self.config }).map_err(candle_core::Error::wrap)?;
+        let meta = serde_json::to_vec(&Meta { vocab: self.vocab.clone(), config: self.config, morph: self.morph.clone() }).map_err(candle_core::Error::wrap)?;
         std::fs::write(dir.join("usage.json"), meta)?;
         Ok(())
     }
@@ -319,6 +346,7 @@ impl UsageModel {
         let mut vocab = meta.vocab;
         vocab.reindex();
         let mut model = UsageModel::new_random(vocab, meta.config, device, 0)?;
+        model.morph = meta.morph;
         model.varmap.load(dir.join("usage.safetensors"))?;
         Ok(model)
     }
@@ -419,6 +447,33 @@ mod tests {
     }
 
     #[test]
+    fn with_morphology_words_are_split_but_callers_still_see_words() {
+        use crate::usage::morph::Morphology;
+        let lemmas = |w: &str| -> Vec<String> {
+            match w { "cats" => vec!["cat".into()], "dogs" => vec!["dog".into()], "sat" => vec!["sit".into()], o => vec![o.into()] }
+        };
+        let lines = ["the cats sat on the mat", "the dogs sat on the rug", "a cat sat on a mat", "a dog sat on a rug"];
+        let sents: Vec<Vec<String>> = lines.iter().cycle().take(64).map(|l| words(l)).collect();
+        let morph = Morphology::build(sents.iter().flatten().cloned(), lemmas);
+        let pieces: Vec<Vec<String>> = sents.iter().map(|s| morph.split_sentence(s).0).collect();
+        let vocab = Vocab::build(&pieces, 1, 100);
+        assert!(vocab.contains("##s") && vocab.contains("cat") && !vocab.contains("cats"));
+        let mut model = UsageModel::new_random(vocab, tiny(), Device::Cpu, 1).unwrap().with_morphology(morph);
+        let ids: Vec<Vec<u32>> = pieces.iter().map(|s| model.vocab.encode(s)).collect();
+        model.train(&ids, &TrainOptions { steps: 600, batch: 16, lr: 3e-3, warmup: 30, seed: 1, start_step: 0, checkpoint: None }, |_, _| {}).unwrap();
+
+        let sentence = words("the cats sat on the mat");
+        assert_eq!(model.contextual(&sentence).unwrap().len(), 6, "one vector per word");
+        let scores = model.candidate_scores(&sentence, 1, &words("cats dogs zebras")).unwrap();
+        assert!(scores.iter().all(|x| x.is_finite()) && scores[0] > scores[2], "{scores:?}");
+
+        let dir = std::env::temp_dir().join(format!("usage-morph-{}", std::process::id()));
+        model.save(&dir).unwrap();
+        let loaded = UsageModel::load(&dir, Device::Cpu).unwrap();
+        assert_eq!(loaded.candidate_scores(&sentence, 1, &words("cats dogs")).unwrap(), model.candidate_scores(&sentence, 1, &words("cats dogs")).unwrap());
+    }
+
+    #[test]
     fn batched_contextual_matches_one_at_a_time() {
         let (model, _, _) = trained();
         let sents: Vec<Vec<String>> = ["the cat sat", "a dog slept on a rug", "bird"].iter().map(|s| words(s)).collect();
@@ -494,6 +549,7 @@ mod attention_tests {
 #[cfg(test)]
 mod gradient_tests {
     use super::*;
+    use crate::usage::vocab::MASK;
 
     /// Every parameter must receive a gradient. (candle 0.11's fused
     /// LayerNorm and softmax have no backward pass and silently cut the graph.)
