@@ -10,7 +10,7 @@ through UniFFI.
 | Tagger | averaged perceptron, dictionary features; UPOS and Penn (XPOS) | UD English EWT | UPOS 94.6%, XPOS 94.0% (test) |
 | Parser | arc-eager, dynamic oracle, jackknifed tags | UD English EWT | UAS 81.7%, LAS 77.5% (test, predicted tags) |
 | Usage model | 4-layer transformer (256-d, ~13M params) trained from scratch to fill in hidden words | 15.3M tokens of usage sentences only: 580k Wiktionary examples, WordNet examples, EWT | masked-word loss 3.80 after 40k steps (~100 min on M5 Pro GPU) |
-| Senses | first-listed sense, overridden when the sense's example sentences match the context (word hidden, vectors centered) by > 0.5 cosine | WordNet example sentences (28k senses) | 34.3% exact / 70.5% category on 3,290 held-out examples (first-listed 33.5% / 69.6%; definition-overlap baseline, not used, 37.3% / 71.9%) |
+| Senses | first-listed sense, overridden when usage evidence matches the context by > 0.5 cosine; senses without examples borrow from WordNet relatives, then their category (LMMS-style backoff) | WordNet example sentences (28k senses) + the WordNet graph | 38.3% exact on 1,645 held-out examples (first-listed 34.5%; definition overlap, not used, 37.8%); overrides the first sense on 4% of natural-text words |
 | Inflection | spelling rules + irregulars | EWT + WordNet | unit-tested |
 | Fluency | interpolated Kneser–Ney trigram (scores, never generates), singletons pruned | usage sentences only (no definitions) | perplexity 618 on EWT test |
 | Frames | subject, modality, negation, verb, object, clause links, categories, concepts | rules over the parse | — |
@@ -85,6 +85,8 @@ for v in engine.variants(rock: text, limit: 40) { v.text; v.ops; v.changedRanges
 ## Experiments
 
 - **Base + ending tokens** (`train-usage --morph`: running → run ##ing), suggested by BabyLM 2025's morpheme-segmentation results. Same data and size: 52.8% vs 53.3% when the right sense has examples, 34.9% vs 34.2% gated overall — a tie within noise (±1 pt ≈ 17 of 1,691 examples). Kept whole-word tokens.
+
+- **LMMS-style backoff** (senses without examples borrow from relatives/category). On the held-out dictionary examples it reaches 45.3% exact at margin 0.05 — but those examples spread evenly over senses, and on natural text that margin overrides the first-listed sense 59% of the time, often wrongly. Shipped at margin 0.5 until there is natural sense-tagged text to tune on.
 
 ## Known limits
 

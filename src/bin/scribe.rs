@@ -214,7 +214,7 @@ fn train_usage(data: &Path, models: &Path, steps: usize, morph: bool) -> Result<
 /// context vector with the word hidden, centered on the mean; then the
 /// held-out evaluation against first-listed and definition-overlap baselines.
 fn build_senses(model: &scribe::usage::model::UsageModel, lex: &Lexicon, out: &Path) -> Result<(), Box<dyn std::error::Error>> {
-    use scribe::engine::{choose_sense, SENSE_MARGIN};
+    use scribe::engine::choose_sense;
     use scribe::usage::{corpus, senses::SenseIndex};
     let tokenize = |s: &str| -> Vec<String> { text::tokenize(s).into_iter().map(|w| w.to_lowercase()).collect() };
     let max = model.config.max_len;
@@ -252,31 +252,57 @@ fn build_senses(model: &scribe::usage::model::UsageModel, lex: &Lexicon, out: &P
         index.add(located[i].1.synset, &vectors[i]);
     }
     std::fs::write(out.join("senses.bin"), postcard::to_allocvec(&index)?)?;
+    index.build_backoff(lex);
     eprintln!("sense index: {} senses with examples", index.len());
 
+    // Held-out evaluation. The override margin is tuned on even-numbered cases
+    // and reported on odd ones, with and without the LMMS-style backoff.
     let lesk = scribe::wsd::Disambiguator::new(lex, false);
-    let (mut n, mut first, mut overlap, mut usage, mut cats) = (0usize, 0usize, 0usize, 0usize, [0usize; 3]);
-    for ((held, e, toks, _), v) in located.iter().zip(&vectors) {
+    let without_backoff = |s: u32, v: &[f32]| index.similarity(s, v).map(|x| (x, scribe::usage::senses::Evidence::Examples));
+    let cases: Vec<(&corpus::SenseExample, &Vec<String>, &Vec<f32>)> = located
+        .iter()
+        .zip(&vectors)
+        .filter(|((held, e, _, _), _)| *held && lex.senses(&e.word, lex.synsets[e.synset as usize].pos).len() >= 2)
+        .map(|((_, e, t, _), v)| (*e, t, v))
+        .collect();
+    let (tune, report): (Vec<_>, Vec<_>) = cases.iter().enumerate().partition(|(i, _)| i % 2 == 0);
+    let accuracy = |set: &[(usize, &(&corpus::SenseExample, &Vec<String>, &Vec<f32>))], margin: f32, backoff: bool| -> (f64, f64) {
+        let (mut exact, mut cat) = (0usize, 0usize);
+        for (_, (e, _, v)) in set {
+            let senses = lex.senses(&e.word, lex.synsets[e.synset as usize].pos);
+            let pick = if backoff {
+                choose_sense(senses, |s| index.score(s, v, lex), margin)
+            } else {
+                choose_sense(senses, |s| without_backoff(s, v), margin)
+            }
+            .map(|(s, _)| s);
+            exact += (pick == Some(e.synset)) as usize;
+            cat += pick.is_some_and(|p| lex.synsets[p as usize].category == lex.synsets[e.synset as usize].category) as usize;
+        }
+        (100.0 * exact as f64 / set.len().max(1) as f64, 100.0 * cat as f64 / set.len().max(1) as f64)
+    };
+    let margins = [0.0f32, 0.05, 0.1, 0.2, 0.3, 0.5, 0.7];
+    let (mut first, mut first_cat, mut overlap) = (0usize, 0usize, 0usize);
+    for (_, (e, t, _)) in &report {
         let pos = lex.synsets[e.synset as usize].pos;
         let senses = lex.senses(&e.word, pos);
-        if !held || senses.len() < 2 {
-            continue;
-        }
-        let lemmas: Vec<String> = toks.iter().map(|w| lex.lemmatize(w, None).into_iter().next().unwrap_or(w.clone())).collect();
-        let picks = [Some(senses[0]), lesk.disambiguate(lex, &e.word, pos, &lemmas), choose_sense(senses, Some(&index), Some(v), SENSE_MARGIN).map(|(s, _)| s)];
-        let cat = |s: u32| lex.synsets[s as usize].category;
-        n += 1;
-        first += (picks[0] == Some(e.synset)) as usize;
-        overlap += (picks[1] == Some(e.synset)) as usize;
-        usage += (picks[2] == Some(e.synset)) as usize;
-        for (k, p) in picks.iter().enumerate() {
-            cats[k] += p.is_some_and(|p| cat(p) == cat(e.synset)) as usize;
-        }
+        let lemmas: Vec<String> = t.iter().map(|w| lex.lemmatize(w, None).into_iter().next().unwrap_or(w.clone())).collect();
+        first += (senses[0] == e.synset) as usize;
+        first_cat += (lex.synsets[senses[0] as usize].category == lex.synsets[e.synset as usize].category) as usize;
+        overlap += (lesk.disambiguate(lex, &e.word, pos, &lemmas) == Some(e.synset)) as usize;
     }
-    let pct = |x: usize| 100.0 * x as f64 / n.max(1) as f64;
-    eprintln!("held-out sense test ({n} unseen dictionary examples):");
-    eprintln!("  first-listed sense           exact {:.1}%   category {:.1}%", pct(first), pct(cats[0]));
-    eprintln!("  definition overlap (baseline) exact {:.1}%   category {:.1}%", pct(overlap), pct(cats[1]));
-    eprintln!("  usage model (shipped)        exact {:.1}%   category {:.1}%", pct(usage), pct(cats[2]));
+    let pct = |x: usize| 100.0 * x as f64 / report.len().max(1) as f64;
+    eprintln!("held-out sense test: tune on {} / report on {} unseen dictionary examples", tune.len(), report.len());
+    eprintln!("  first-listed sense             exact {:.1}%   category {:.1}%", pct(first), pct(first_cat));
+    eprintln!("  definition overlap (baseline)  exact {:.1}%", pct(overlap));
+    for m in margins {
+        let (e, c) = accuracy(&report, m, true);
+        eprintln!("    margin {m:<4} + backoff: exact {e:.1}%  category {c:.1}%");
+    }
+    for backoff in [false, true] {
+        let best = *margins.iter().max_by(|a, b| accuracy(&tune, **a, backoff).0.total_cmp(&accuracy(&tune, **b, backoff).0)).unwrap();
+        let (exact, cat) = accuracy(&report, best, backoff);
+        eprintln!("  usage {:<24} exact {exact:.1}%   category {cat:.1}%   (margin {best})", if backoff { "+ relatives/category" } else { "examples only" });
+    }
     Ok(())
 }

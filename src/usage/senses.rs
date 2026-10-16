@@ -2,8 +2,21 @@
 //! its word in that sense's example sentences; a new occurrence takes the
 //! nearest sense (cosine).
 
+use crate::lexicon::{Lexicon, Pos};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+
+/// How a sense's score was obtained, strongest first.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Evidence {
+    /// The sense's own example sentences.
+    Examples,
+    /// Borrowed from WordNet relatives with examples (parent concept and its
+    /// other children; for adjectives, the similar-adjective cluster).
+    Relatives,
+    /// Borrowed from the sense's dictionary category (noun.feeling, …).
+    Category,
+}
 
 #[derive(Serialize, Deserialize, Default)]
 pub struct SenseIndex {
@@ -13,6 +26,37 @@ pub struct SenseIndex {
     /// direction all vectors share doesn't swamp the differences between senses.
     #[serde(default)]
     center: Vec<f32>,
+    /// LMMS-style backoff (Loureiro & Jorge 2019), rebuilt from the dictionary
+    /// at load: parent synset → sum of unit centroids of its examples-bearing
+    /// relatives; category → sum of unit centroids in that category.
+    #[serde(skip)]
+    relatives: HashMap<u32, (Vec<f32>, u32)>,
+    #[serde(skip)]
+    categories: HashMap<u16, (Vec<f32>, u32)>,
+}
+
+fn parents(lex: &Lexicon, synset: u32) -> Vec<u32> {
+    let s = &lex.synsets[synset as usize];
+    let mut out = s.hypernyms.clone();
+    if s.pos == Pos::Adj {
+        out.extend(&s.similar);
+    }
+    out
+}
+
+fn add_into(map_entry: &mut (Vec<f32>, u32), v: &[f32]) {
+    if map_entry.0.is_empty() {
+        map_entry.0 = vec![0.0; v.len()];
+    }
+    for (a, b) in map_entry.0.iter_mut().zip(v) {
+        *a += b;
+    }
+    map_entry.1 += 1;
+}
+
+fn unit(v: &[f32]) -> Vec<f32> {
+    let n = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+    if n == 0.0 { v.to_vec() } else { v.iter().map(|x| x / n).collect() }
 }
 
 impl SenseIndex {
@@ -51,6 +95,48 @@ impl SenseIndex {
 
     pub fn knows(&self, synset: u32) -> bool {
         self.sums.contains_key(&synset)
+    }
+
+    /// Builds the relatives/category backoff from the dictionary graph.
+    pub fn build_backoff(&mut self, lex: &Lexicon) {
+        self.relatives.clear();
+        self.categories.clear();
+        let entries: Vec<(u32, Vec<f32>)> = self.sums.iter().map(|(&s, (sum, _))| (s, unit(sum))).collect();
+        for (synset, u) in entries {
+            if synset as usize >= lex.synsets.len() {
+                continue;
+            }
+            add_into(self.relatives.entry(synset).or_default(), &u);
+            for p in parents(lex, synset) {
+                add_into(self.relatives.entry(p).or_default(), &u);
+            }
+            add_into(self.categories.entry(lex.synsets[synset as usize].category).or_default(), &u);
+        }
+    }
+
+    /// Cosine between `v` and the sense, from its own examples if it has
+    /// any, else its relatives, else its category. None without evidence
+    /// (or before `build_backoff` for senses without examples).
+    pub fn score(&self, synset: u32, v: &[f32], lex: &Lexicon) -> Option<(f32, Evidence)> {
+        let q = self.centered(v);
+        if let Some((sum, _)) = self.sums.get(&synset) {
+            return Some((cosine(sum, &q), Evidence::Examples));
+        }
+        if synset as usize >= lex.synsets.len() {
+            return None;
+        }
+        let mut borrowed = (Vec::new(), 0u32);
+        for p in parents(lex, synset) {
+            if let Some((sum, n)) = self.relatives.get(&p) {
+                add_into(&mut borrowed, sum);
+                borrowed.1 += n - 1;
+            }
+        }
+        if borrowed.1 > 0 {
+            return Some((cosine(&borrowed.0, &q), Evidence::Relatives));
+        }
+        let category = lex.synsets[synset as usize].category;
+        self.categories.get(&category).map(|(sum, _)| (cosine(sum, &q), Evidence::Category))
     }
 
     /// Cosine between `v` and a sense's centroid, if the sense has examples.
@@ -136,5 +222,77 @@ mod tests {
         let index = SenseIndex::from_vectors(vec![(1, vec![1.0, 0.0]), (2, vec![0.0, 1.0]), (2, vec![0.9, 0.1])]);
         // With the [0.9, 0.1] example held out, sense 2 is just [0, 1], so 1 wins.
         assert_eq!(index.best_excluding(&[1, 2], &[0.9, 0.1], 2, &[0.9, 0.1]), Some(1));
+    }
+}
+
+#[cfg(test)]
+mod backoff_tests {
+    use super::*;
+    use crate::lexicon::{Lexicon, Pos, Synset};
+
+    fn syn(id: u32, pos: Pos, category: u16, hypernyms: Vec<u32>, similar: Vec<u32>) -> Synset {
+        Synset { id: id.to_string(), pos, category, definition: String::new(), examples: vec![], members: vec![], hypernyms, attributes: vec![], similar }
+    }
+
+    /// 0 emotion ← 1 fear (examples), 2 joy (examples), 3 dread (no examples)
+    /// 4 machine ← 5 engine (examples); 6 gadget (no examples, no relatives with examples) in category 1
+    /// 7 big (adj head, examples) ~ 8 huge (satellite, no examples)
+    fn lexicon() -> Lexicon {
+        Lexicon {
+            categories: vec!["noun.feeling".into(), "noun.artifact".into(), "adj.all".into()],
+            synsets: vec![
+                syn(0, Pos::Noun, 0, vec![], vec![]),
+                syn(1, Pos::Noun, 0, vec![0], vec![]),
+                syn(2, Pos::Noun, 0, vec![0], vec![]),
+                syn(3, Pos::Noun, 0, vec![0], vec![]),
+                syn(4, Pos::Noun, 1, vec![], vec![]),
+                syn(5, Pos::Noun, 1, vec![4], vec![]),
+                syn(6, Pos::Noun, 1, vec![], vec![]),
+                syn(7, Pos::Adj, 2, vec![], vec![8]),
+                syn(8, Pos::Adj, 2, vec![], vec![7]),
+            ],
+            lemmas: Default::default(),
+            forms: Default::default(),
+        }
+    }
+
+    fn index() -> SenseIndex {
+        let mut i = SenseIndex::from_vectors(vec![(1, vec![1.0, 0.0, 0.0]), (2, vec![0.8, 0.6, 0.0]), (5, vec![0.0, 0.0, 1.0]), (7, vec![0.0, 1.0, 0.0])]);
+        i.build_backoff(&lexicon());
+        i
+    }
+
+    #[test]
+    fn senses_with_examples_use_them() {
+        let (score, evidence) = index().score(1, &[1.0, 0.0, 0.0], &lexicon()).unwrap();
+        assert!((score - 1.0).abs() < 1e-5);
+        assert_eq!(evidence, Evidence::Examples);
+    }
+
+    #[test]
+    fn a_sense_without_examples_borrows_from_its_relatives() {
+        // dread (3) has no examples; its siblings under "emotion" (fear, joy) do.
+        let (score, evidence) = index().score(3, &[0.9, 0.3, 0.0], &lexicon()).unwrap();
+        assert_eq!(evidence, Evidence::Relatives);
+        assert!(score > 0.9, "{score}");
+        // Satellite adjective "huge" borrows from its head "big".
+        assert_eq!(index().score(8, &[0.0, 1.0, 0.0], &lexicon()).unwrap().1, Evidence::Relatives);
+    }
+
+    #[test]
+    fn otherwise_falls_back_to_the_dictionary_category() {
+        // gadget (6) has no relatives with examples; noun.artifact has engine (5).
+        let (score, evidence) = index().score(6, &[0.0, 0.0, 1.0], &lexicon()).unwrap();
+        assert_eq!(evidence, Evidence::Category);
+        assert!(score > 0.9);
+    }
+
+    #[test]
+    fn backoff_is_rebuilt_after_loading_and_never_serialized() {
+        let bytes = postcard::to_allocvec(&index()).unwrap();
+        let mut loaded: SenseIndex = postcard::from_bytes(&bytes).unwrap();
+        assert!(loaded.score(3, &[1.0, 0.0, 0.0], &lexicon()).is_none(), "no backoff until built");
+        loaded.build_backoff(&lexicon());
+        assert!(loaded.score(3, &[1.0, 0.0, 0.0], &lexicon()).is_some());
     }
 }

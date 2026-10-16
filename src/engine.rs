@@ -72,6 +72,8 @@ pub struct Engine {
     /// dictionary overlap and fluency alone.
     pub usage: Option<UsageModel>,
     pub senses: Option<SenseIndex>,
+    /// See `SENSE_MARGIN`; a field so experiments can vary it.
+    pub sense_margin: f32,
 }
 
 pub const CONTENT: &[&str] = &["NOUN", "VERB", "ADJ", "ADV"];
@@ -92,8 +94,12 @@ impl SlotScorer for UsageModel {
     }
 }
 
-/// Examples must beat the first-listed sense by this cosine margin to
-/// override it (tuned on half the held-out dictionary examples).
+/// Usage evidence must beat the first-listed sense by this cosine margin to
+/// override it. Lower margins score higher on the held-out dictionary
+/// examples (45% exact at 0.05 vs 38% at 0.5) but that test spreads senses
+/// evenly; on natural text (EWT) 0.05 overrides the first-listed sense 59%
+/// of the time, often wrongly, while 0.5 overrides 4%. Retune on natural,
+/// sense-tagged text (e.g. SemCor) — see examples/margin_sweep.rs.
 pub const SENSE_MARGIN: f32 = 0.5;
 
 impl Engine {
@@ -111,8 +117,15 @@ impl Engine {
                 true => Some(UsageModel::load(&dir.join("usage"), Device::Cpu)?),
                 false => None,
             },
-            senses: std::fs::read(dir.join("usage/senses.bin")).ok().and_then(|b| postcard::from_bytes(&b).ok()),
+            senses: std::fs::read(dir.join("usage/senses.bin"))
+                .ok()
+                .and_then(|b| postcard::from_bytes::<SenseIndex>(&b).ok())
+                .map(|mut index| {
+                    index.build_backoff(&lexicon);
+                    index
+                }),
             lexicon,
+            sense_margin: SENSE_MARGIN,
         })
     }
 
@@ -177,7 +190,11 @@ impl Engine {
             if CONTENT.contains(&t.upos.as_str()) && t.upos != "AUX" {
                 if let Some(p) = Pos::from_upos(&t.upos) {
                     let v = vectors.get(&i).map(Vec::as_slice);
-                    if let Some((sense, supported)) = choose_sense(self.lexicon.senses(&t.lemma, p), self.senses.as_ref(), v, SENSE_MARGIN) {
+                    let score = |s: u32| match (self.senses.as_ref(), v) {
+                        (Some(index), Some(v)) => index.score(s, v, &self.lexicon),
+                        _ => None,
+                    };
+                    if let Some((sense, supported)) = choose_sense(self.lexicon.senses(&t.lemma, p), score, self.sense_margin) {
                         t.sense = Some(sense);
                         t.sense_supported = supported;
                     }
@@ -195,20 +212,22 @@ impl Engine {
 
 /// Chooses a sense from usage only — never from definitions. Default is the
 /// first-listed sense (WordNet orders senses by frequency in tagged text);
-/// a sense whose example sentences match this context better by more than
-/// `margin` overrides it. The flag says whether usage supports the choice
-/// (only one sense, or example sentences back it).
-pub fn choose_sense(senses: &[u32], index: Option<&SenseIndex>, v: Option<&[f32]>, margin: f32) -> Option<(u32, bool)> {
+/// another sense overrides it when its usage evidence matches this context
+/// better by more than `margin`. `score` gives each sense's similarity and
+/// evidence (own examples, or borrowed from relatives/category). The flag
+/// says whether the chosen sense is backed by its own examples (or is the
+/// word's only sense) — only then may swaps rely on it.
+pub fn choose_sense(senses: &[u32], score: impl Fn(u32) -> Option<(f32, crate::usage::senses::Evidence)>, margin: f32) -> Option<(u32, bool)> {
+    use crate::usage::senses::Evidence;
     let first = *senses.first()?;
     if senses.len() == 1 {
         return Some((first, true));
     }
-    let (Some(index), Some(v)) = (index, v) else { return Some((first, false)) };
-    let first_sim = index.similarity(first, v);
-    let best = senses.iter().filter_map(|&s| index.similarity(s, v).map(|x| (s, x))).max_by(|a, b| a.1.total_cmp(&b.1));
+    let first_score = score(first);
+    let best = senses.iter().filter_map(|&s| score(s).map(|(x, e)| (s, x, e))).max_by(|a, b| a.1.total_cmp(&b.1));
     match best {
-        Some((s, x)) if s != first && x - first_sim.unwrap_or(0.0) > margin => Some((s, true)),
-        _ => Some((first, index.knows(first))),
+        Some((s, x, e)) if s != first && x - first_score.map_or(0.0, |f| f.0) > margin => Some((s, e == Evidence::Examples)),
+        _ => Some((first, first_score.is_some_and(|f| f.1 == Evidence::Examples))),
     }
 }
 
@@ -230,25 +249,35 @@ fn clitic_lemma(w: &str) -> String {
 mod sense_tests {
     use super::*;
 
+    use crate::usage::senses::Evidence;
+
+    fn scores(table: &'static [(u32, f32, Evidence)]) -> impl Fn(u32) -> Option<(f32, Evidence)> {
+        move |s| table.iter().find(|(x, _, _)| *x == s).map(|(_, v, e)| (*v, *e))
+    }
+
     #[test]
     fn examples_override_the_first_listed_sense_only_past_the_margin() {
-        let index = SenseIndex::from_vectors(vec![(10, vec![1.0, 0.0]), (11, vec![0.0, 1.0])]);
-        // Clearly sense 11 (cos 1 vs 0): margin 1.0 > 0.5.
-        assert_eq!(choose_sense(&[10, 11], Some(&index), Some(&[0.0, 1.0]), 0.5), Some((11, true)));
-        // Only slightly closer to 11: stays with the first-listed sense, which examples still support.
-        assert_eq!(choose_sense(&[10, 11], Some(&index), Some(&[0.6, 0.8]), 0.5), Some((10, true)));
+        let clear: &'static [(u32, f32, Evidence)] = &[(10, 0.0, Evidence::Examples), (11, 1.0, Evidence::Examples)];
+        assert_eq!(choose_sense(&[10, 11], scores(clear), 0.5), Some((11, true)));
+        let close: &'static [(u32, f32, Evidence)] = &[(10, 0.6, Evidence::Examples), (11, 0.8, Evidence::Examples)];
+        assert_eq!(choose_sense(&[10, 11], scores(close), 0.5), Some((10, true)));
+    }
+
+    #[test]
+    fn borrowed_evidence_can_pick_a_sense_but_never_supports_it() {
+        // The right sense has no examples of its own; relatives make it reachable.
+        let t: &'static [(u32, f32, Evidence)] = &[(10, 0.0, Evidence::Examples), (11, 0.9, Evidence::Relatives)];
+        assert_eq!(choose_sense(&[10, 11], scores(t), 0.5), Some((11, false)));
     }
 
     #[test]
     fn falls_back_to_first_listed_sense_never_definitions() {
-        assert_eq!(choose_sense(&[10, 11], None, None, 0.5), Some((10, false)));
-        let index = SenseIndex::from_vectors(vec![(99, vec![1.0])]);
-        assert_eq!(choose_sense(&[10, 11], Some(&index), Some(&[1.0]), 0.5), Some((10, false)));
+        assert_eq!(choose_sense(&[10, 11], |_| None, 0.5), Some((10, false)));
     }
 
     #[test]
     fn a_single_sense_is_always_supported() {
-        assert_eq!(choose_sense(&[7], None, None, 0.5), Some((7, true)));
-        assert_eq!(choose_sense(&[], None, None, 0.5), None);
+        assert_eq!(choose_sense(&[7], |_| None, 0.5), Some((7, true)));
+        assert_eq!(choose_sense(&[], |_| None, 0.5), None);
     }
 }
