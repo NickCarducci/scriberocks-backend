@@ -60,3 +60,41 @@ fn connect_never_joins_questions() {
     let Some(engine) = engine() else { return };
     assert!(connects(&engine, "Why did I stay home? It rained.").is_empty());
 }
+
+fn punctuated(engine: &Engine, rock: &str) -> Vec<String> {
+    engine.variants(rock, 200).into_iter().filter(|v| v.ops == vec![scribe::Op::Punctuate]).map(|v| v.text).collect()
+}
+
+fn letters(s: &str) -> String {
+    s.chars().filter(|c| c.is_alphanumeric() || c.is_whitespace()).collect::<String>().to_lowercase().split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+#[test]
+fn punctuate_adds_commas_and_end_marks_where_they_belong() {
+    let Some(engine) = engine() else { return };
+    for (rock, want) in [
+        ("Honestly I need a break", "Honestly, I need a break."),
+        ("I was tired so I went to bed", "I was tired, so I went to bed."),
+        ("where are my keys", "Where are my keys?"),
+    ] {
+        let got = punctuated(&engine, rock);
+        assert!(got.iter().any(|v| v == want), "{rock:?} → {got:?}");
+    }
+}
+
+#[test]
+fn punctuate_breaks_run_ons() {
+    let Some(engine) = engine() else { return };
+    let got = punctuated(&engine, "I was tired I went to bed");
+    assert!(got.iter().any(|v| v == "I was tired. I went to bed." || v == "I was tired, I went to bed."), "{got:?}");
+}
+
+#[test]
+fn punctuate_only_ever_adds_punctuation() {
+    let Some(engine) = engine() else { return };
+    for rock in ["Honestly I need a break", "I was tired I went to bed", "well i guess thats fine"] {
+        for v in punctuated(&engine, rock) {
+            assert_eq!(letters(&v), letters(rock), "{v:?}");
+        }
+    }
+}

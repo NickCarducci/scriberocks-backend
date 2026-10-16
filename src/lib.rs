@@ -14,6 +14,7 @@ pub mod inflect;
 pub mod lexicon;
 pub mod lm;
 pub mod parser;
+pub mod punctuate;
 pub mod tagger;
 pub mod text;
 pub mod usage;

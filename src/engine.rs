@@ -76,6 +76,22 @@ pub struct Engine {
 
 pub const CONTENT: &[&str] = &["NOUN", "VERB", "ADJ", "ADV"];
 
+/// The boundary between the classical head start and a learned head: the
+/// classical stages propose a closed set of candidates for a slot; a scorer
+/// says how well each fits in context (log-probability). The usage model is
+/// one implementation; a FidelityAI scoring head or a plain classical one can
+/// implement the same trait and be compared with the same tests.
+pub trait SlotScorer {
+    /// `context[slot]` is replaced by each candidate (which may be several words).
+    fn slot_scores(&self, context: &[String], slot: usize, candidates: &[String]) -> Option<Vec<f32>>;
+}
+
+impl SlotScorer for UsageModel {
+    fn slot_scores(&self, context: &[String], slot: usize, candidates: &[String]) -> Option<Vec<f32>> {
+        self.candidate_scores(context, slot, candidates).ok()
+    }
+}
+
 /// Examples must beat the first-listed sense by this cosine margin to
 /// override it (tuned on half the held-out dictionary examples).
 pub const SENSE_MARGIN: f32 = 0.5;
@@ -102,6 +118,11 @@ impl Engine {
 
     pub fn has_usage_model(&self) -> bool {
         self.usage.is_some()
+    }
+
+    /// The learned head used to judge closed-set candidates, if any.
+    pub fn slot_scorer(&self) -> Option<&dyn SlotScorer> {
+        self.usage.as_ref().map(|u| u as &dyn SlotScorer)
     }
 
     pub fn parse(&self, input: &str) -> Vec<Sentence> {

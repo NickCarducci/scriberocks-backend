@@ -16,6 +16,33 @@ through UniFFI.
 | Frames | subject, modality, negation, verb, object, clause links, categories, concepts | rules over the parse | — |
 | Variants | trim / cut / reorder / swap / reframe; swaps kept only if the usage model says they fit the sentence; ranked by fluency, ordered for diversity | rules + all of the above | 20–50 ms per rock with the usage model |
 
+## Architecture: a classical head start for a small learned head
+
+Same principle as FidelityAI's preprocessing → handoff flow: classical stages
+do the structural work and hand a learned model a small, closed decision.
+
+```
+rock ─▶ classical head start ───────────────────────▶ learned head ─▶ variants
+        dictionary · tagger · parser · rules            SlotScorer
+        propose WHERE and a CLOSED SET of WHAT           scores each candidate in context
+        (synonyms of the chosen sense, connectives,     (usage model today; a FidelityAI
+         "," "." "?", modal reframes, clause cuts)        or classical head can plug in)
+```
+
+- The learned head never generates freely: it only scores candidates the
+  classical stages proposed, so 15M tokens of usage data is enough.
+- `SlotScorer` (engine.rs) is the swap point; every head is judged by the
+  same acceptance tests and held-out evaluations.
+- Where the parse is sure a break is needed (run-ons), the head only picks
+  *which* mark; optional marks (commas) need the head's agreement.
+
+| Operation | Classical proposes | Learned head decides |
+|---|---|---|
+| swap | synonyms / similar words of the chosen sense | fits this sentence within a margin of the original |
+| connect | adjacent plain statements; because / so / but / and | as natural as the sentence break |
+| punctuate | gaps from the parse; missing end mark; i → I, dont → don't | whether "," fits; "," vs "." for run-ons |
+| trim / cut / reorder / reframe | rules over the parse | ranked by fluency |
+
 ## Build
 
 ```sh

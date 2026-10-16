@@ -6,6 +6,8 @@
 //!   reorder — move a because/if/when clause to the other side
 //!   swap    — replace a word with a dictionary synonym of its chosen sense
 //!   reframe — hold the same action with a different modality (should → want to → will …)
+//!   punctuate — add commas / end marks where the parse proposes a gap and
+//!             the scorer agrees (closed set: "," "." "?")
 //!   connect — join two sentences with a closed-set connective (because / so / but / and)
 //!             when the usage model finds it as natural as the sentence break
 
@@ -23,6 +25,7 @@ pub enum Op {
     Swap,
     Reframe,
     Connect,
+    Punctuate,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -147,6 +150,16 @@ impl Engine {
             push(sents, vec![Op::Connect], delta, &mut out);
         }
 
+        // Punctuation: each sentence with the marks the scorer accepts.
+        for (si, s) in sentences.iter().enumerate() {
+            if let Some(tokens) = self.punctuated(s) {
+                let delta = self.fluency(&tokens) - self.fluency(&originals[si]);
+                let mut sents = originals.clone();
+                sents[si] = tokens;
+                push(sents, vec![Op::Punctuate], delta, &mut out);
+            }
+        }
+
         for (si, s) in sentences.iter().enumerate() {
             let base = self.fluency(&originals[si]);
             for c in self.sentence_candidates(s) {
@@ -160,10 +173,43 @@ impl Engine {
         diversify(out, limit)
     }
 
+    /// The sentence with accepted marks inserted: gaps come from the parse
+    /// (classical), "," / "." from the scorer (learned); a missing end mark
+    /// is added by rule. None if nothing would change.
+    fn punctuated(&self, s: &Sentence) -> Option<Vec<String>> {
+        use crate::punctuate::{end_mark, fix_spelling, gaps, insert, GapKind, MIN_MARK_LOGP};
+        let original: Vec<String> = s.tokens.iter().map(|t| t.form.clone()).collect();
+        let words = fix_spelling(&original);
+        let mut marks: Vec<(usize, &str)> = Vec::new();
+        if let Some(scorer) = self.slot_scorer() {
+            let lower: Vec<String> = words.iter().map(|w| w.to_lowercase()).collect();
+            for gap in gaps(s) {
+                let options: &[&str] = if gap.kind == GapKind::RunOn { &[",", "."] } else { &[","] };
+                let mut context = lower.clone();
+                context.insert(gap.before, "[MASK]".into());
+                let candidates: Vec<String> = options.iter().map(|o| o.to_string()).collect();
+                let Some(scores) = scorer.slot_scores(&context, gap.before, &candidates) else { continue };
+                if let Some((i, &best)) = scores.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)) {
+                    // A run-on needs a break: the parse decided *where*, the
+                    // scorer only picks *which* mark. Optional commas need the
+                    // scorer's agreement.
+                    if gap.kind == GapKind::RunOn || best >= MIN_MARK_LOGP {
+                        marks.push((gap.before, options[i]));
+                    }
+                }
+            }
+        }
+        let end = end_mark(s);
+        if marks.is_empty() && end.is_none() && words == original {
+            return None;
+        }
+        Some(insert(&words, &marks, end))
+    }
+
     /// (sentence index, connective) pairs where joining sentence i and i+1
     /// reads about as naturally as the existing break.
     fn connections(&self, originals: &[Vec<String>]) -> Vec<(usize, &'static str)> {
-        let Some(usage) = &self.usage else { return vec![] };
+        let Some(scorer) = self.slot_scorer() else { return vec![] };
         let mut out = Vec::new();
         for i in 0..originals.len().saturating_sub(1) {
             let (a, b) = (&originals[i], &originals[i + 1]);
@@ -177,7 +223,7 @@ impl Engine {
             context.extend(b.iter().map(|w| w.to_lowercase())); // the usage model is uncased
             let mut candidates: Vec<String> = CONNECTIVES.iter().map(|c| c.to_string()).collect();
             candidates.push(".".into());
-            let Ok(scores) = usage.candidate_scores(&context, slot, &candidates) else { continue };
+            let Some(scores) = scorer.slot_scores(&context, slot, &candidates) else { continue };
             let sentence_break = scores[CONNECTIVES.len()];
             let scored: Vec<(String, f32)> = CONNECTIVES.iter().map(|c| c.to_string()).zip(scores.iter().copied()).collect();
             for c in keep_fitting(sentence_break, scored, CONNECT_MARGIN, CONNECTS_PER_JOIN) {
@@ -251,11 +297,11 @@ impl Engine {
                 forms.push(form);
             }
             // With the usage model, keep only words that fit this sentence.
-            if let Some(usage) = &self.usage {
+            if let Some(scorer) = self.slot_scorer() {
                 let context: Vec<String> = words(s, kept).iter().map(|w| w.to_lowercase()).collect();
                 let mut all = vec![t.form.to_lowercase()];
                 all.extend(forms.iter().map(|f| f.to_lowercase()));
-                if let Ok(scores) = usage.candidate_scores(&context, pos, &all) {
+                if let Some(scores) = scorer.slot_scores(&context, pos, &all) {
                     let fitting = keep_fitting(scores[0], forms.iter().cloned().zip(scores[1..].iter().copied()).collect(), SWAP_MARGIN, SWAPS_PER_WORD);
                     forms.retain(|f| fitting.contains(f));
                 }
