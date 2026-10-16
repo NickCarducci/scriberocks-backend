@@ -228,13 +228,17 @@ fn build_senses(model: &scribe::usage::model::UsageModel, lex: &Lexicon, out: &P
             (at < max).then(|| (corpus::is_held_out(e.synset, &e.sentence, 10), e, toks, at))
         })
         .collect();
-    let mut vectors = Vec::with_capacity(located.len());
+    // With base+ending pieces a long sentence can overflow the model's window,
+    // leaving later words without a vector: those examples are skipped.
+    let mut vectors: Vec<Option<Vec<f32>>> = Vec::with_capacity(located.len());
     for chunk in located.chunks(256) {
         let masked: Vec<Vec<String>> = chunk.iter().map(|(_, _, t, at)| { let mut t = t.clone(); t[*at] = "[MASK]".into(); t }).collect();
         for ((_, _, _, at), h) in chunk.iter().zip(model.contextual_batch(&masked)?) {
-            vectors.push(h[*at].clone());
+            vectors.push(h.get(*at).cloned());
         }
     }
+    let (located, vectors): (Vec<_>, Vec<Vec<f32>>) =
+        located.into_iter().zip(vectors).filter_map(|(l, v)| v.map(|v| (l, v))).unzip();
     let train: Vec<usize> = (0..located.len()).filter(|&i| !located[i].0).collect();
     let dim = vectors.first().map_or(0, Vec::len);
     let mut center = vec![0.0f32; dim];

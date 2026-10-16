@@ -5,7 +5,8 @@ use scribe::Engine;
 use std::path::Path;
 
 fn engine() -> Option<Engine> {
-    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("models");
+    // SCRIBE_MODELS points at another models dir (e.g. to compare usage models).
+    let dir = std::env::var("SCRIBE_MODELS").map(std::path::PathBuf::from).unwrap_or_else(|_| Path::new(env!("CARGO_MANIFEST_DIR")).join("models"));
     if !dir.join("usage/usage.safetensors").exists() {
         eprintln!("skipping: build models first (scribe train, scribe train-usage)");
         return None;

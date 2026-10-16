@@ -21,6 +21,11 @@ pub struct Config {
     pub max_len: usize,
 }
 
+/// Sentences per forward pass in `contextual_batch`. Bounds peak memory:
+/// at max_len 48 and ff 1024, one chunk's activations are a few hundred MB,
+/// whereas tens of thousands of sentences at once can exhaust the machine.
+pub const CONTEXT_CHUNK: usize = 128;
+
 pub struct TrainOptions {
     /// Total steps in the schedule (a resumed run still counts from 0).
     pub steps: usize,
@@ -318,6 +323,13 @@ impl UsageModel {
     /// `contextual` for many sentences in one pass (padded; padding is masked
     /// out of attention, so results match one-at-a-time).
     pub fn contextual_batch(&self, sentences: &[Vec<String>]) -> Result<Vec<Vec<Vec<f32>>>> {
+        if sentences.len() > CONTEXT_CHUNK {
+            let mut out = Vec::with_capacity(sentences.len());
+            for chunk in sentences.chunks(CONTEXT_CHUNK) {
+                out.extend(self.contextual_batch(chunk)?);
+            }
+            return Ok(out);
+        }
         if sentences.is_empty() {
             return Ok(vec![]);
         }
@@ -471,6 +483,34 @@ mod tests {
         model.save(&dir).unwrap();
         let loaded = UsageModel::load(&dir, Device::Cpu).unwrap();
         assert_eq!(loaded.candidate_scores(&sentence, 1, &words("cats dogs")).unwrap(), model.candidate_scores(&sentence, 1, &words("cats dogs")).unwrap());
+    }
+
+    #[test]
+    fn words_past_the_window_get_no_vector_when_pieces_overflow() {
+        use crate::usage::morph::Morphology;
+        let lemmas = |w: &str| -> Vec<String> { if w == "cats" { vec!["cat".into()] } else { vec![w.into()] } };
+        let morph = Morphology::build(["cats".to_string()].into_iter(), lemmas);
+        let vocab = Vocab::build(&[words("cat ##s the")], 1, 100);
+        let model = UsageModel::new_random(vocab, tiny(), Device::Cpu, 1).unwrap().with_morphology(morph);
+        // 10 words → 20 pieces; window is 16 pieces, so only 8 words fit.
+        let sentence: Vec<String> = std::iter::repeat_n("cats".to_string(), 10).collect();
+        assert_eq!(model.contextual(&sentence).unwrap().len(), 8);
+        assert_eq!(model.contextual_batch(&[sentence]).unwrap()[0].len(), 8);
+    }
+
+    #[test]
+    fn large_batches_are_processed_in_bounded_chunks() {
+        // Thousands of sentences in one pass exhausted a 48 GB Mac; the method
+        // must chunk internally and still return every sentence's vectors.
+        let (model, _, _) = trained();
+        let n = 3 * CONTEXT_CHUNK + 5;
+        let sents: Vec<Vec<String>> = (0..n).map(|i| words(if i % 2 == 0 { "the cat sat" } else { "a dog slept on a rug" })).collect();
+        let out = model.contextual_batch(&sents).unwrap();
+        assert_eq!(out.len(), n);
+        let last = model.contextual(&sents[n - 1]).unwrap();
+        for (x, y) in last.iter().flatten().zip(out[n - 1].iter().flatten()) {
+            assert!((x - y).abs() < 1e-4);
+        }
     }
 
     #[test]

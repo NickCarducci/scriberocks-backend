@@ -10,7 +10,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let device = Device::new_metal(0)?;
     #[cfg(not(feature = "metal"))]
     let device = Device::Cpu;
-    let model = UsageModel::load(&models.join("usage"), device)?;
+    let name = std::env::args().nth(1).unwrap_or_else(|| "usage".into());
+    let model = UsageModel::load(&models.join(&name), device)?;
+    println!("== {name}");
     let tok = |s: &str| -> Vec<String> { text::tokenize(s).into_iter().map(|w| w.to_lowercase()).collect() };
     let ex = corpus::wordnet_examples(&lex);
     let locate = |e: &corpus::SenseExample| -> Option<(Vec<String>, usize)> {
@@ -21,15 +23,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let all: Vec<(bool, u32, Vec<String>, usize)> = ex.iter().filter_map(|e| locate(e).map(|(t, a)| (corpus::is_held_out(e.synset, &e.sentence, 10), e.synset, t, a))).collect();
 
+
     // Vectors: word visible, and word masked (context only).
     let mut visible = Vec::new();
     let mut masked = Vec::new();
     for chunk in all.chunks(256) {
         let v: Vec<Vec<String>> = chunk.iter().map(|(_, _, t, _)| t.clone()).collect();
         let m: Vec<Vec<String>> = chunk.iter().map(|(_, _, t, a)| { let mut t = t.clone(); t[*a] = "[MASK]".into(); t }).collect();
-        for ((_, _, _, a), h) in chunk.iter().zip(model.contextual_batch(&v)?) { visible.push(h[*a].clone()); }
-        for ((_, _, _, a), h) in chunk.iter().zip(model.contextual_batch(&m)?) { masked.push(h[*a].clone()); }
+        // Keep one vector per example; words past the window (pieces can overflow it) get None.
+        for ((_, _, _, a), h) in chunk.iter().zip(model.contextual_batch(&v)?) { visible.push(h.get(*a).cloned()); }
+        for ((_, _, _, a), h) in chunk.iter().zip(model.contextual_batch(&m)?) { masked.push(h.get(*a).cloned()); }
     }
+    let keep: Vec<bool> = visible.iter().zip(&masked).map(|(v, m)| v.is_some() && m.is_some()).collect();
+    let all: Vec<_> = all.into_iter().zip(&keep).filter(|(_, k)| **k).map(|(x, _)| x).collect();
+    let _visible: Vec<Vec<f32>> = visible.into_iter().zip(&keep).filter(|(_, k)| **k).filter_map(|(v, _)| v).collect();
+    let masked: Vec<Vec<f32>> = masked.into_iter().zip(&keep).filter(|(_, k)| **k).filter_map(|(v, _)| v).collect();
     let mean = |vs: &[Vec<f32>]| -> Vec<f32> {
         let mut m = vec![0.0; vs[0].len()];
         for v in vs { for (a, b) in m.iter_mut().zip(v) { *a += b } }

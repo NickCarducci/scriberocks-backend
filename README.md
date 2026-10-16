@@ -82,6 +82,10 @@ let engine = try ScribeEngine(modelsDir: modelsURL.path())   // off the main thr
 for v in engine.variants(rock: text, limit: 40) { v.text; v.ops; v.changedRanges }
 ```
 
+## Experiments
+
+- **Base + ending tokens** (`train-usage --morph`: running → run ##ing), suggested by BabyLM 2025's morpheme-segmentation results. Same data and size: 52.8% vs 53.3% when the right sense has examples, 34.9% vs 34.2% gated overall — a tie within noise (±1 pt ≈ 17 of 1,691 examples). Kept whole-word tokens.
+
 ## Known limits
 
 - Only ~half of word senses have example sentences, which caps example-based sense choice; senses without examples fall back to dictionary order. Swaps are only offered when usage supports the chosen sense.
