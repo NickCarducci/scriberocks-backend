@@ -214,4 +214,83 @@ fn main() {
         let ctx = contexts(cases, &chosen, &e.lexicon);
         sweep(&format!("{label}, sense head + sentence context"), cases, &head_scores(cases, &with_context, Some(&ctx), &e.lexicon));
     }
+
+    // ── Editor view: senses as synonym options ─────────────────────────────
+    let stop = |w: &str| (e.usage.as_ref().unwrap().vocab.id(w) as usize) < scribe::usage::vocab::SPECIALS.len() + 100;
+    for (label, cases) in [("SemCor held-out", &held_cases), ("ALL", &all_cases)] {
+        let scores = head_scores(cases, &plain, None, &e.lexicon);
+        editor_report(label, cases, &scores, &e.lexicon, &stop);
+    }
+}
+
+/// Other usable single-word members of a synset (the options it offers instead of `lemma`).
+fn options(lex: &Lexicon, synset: u32, lemma: &str, stop: &dyn Fn(&str) -> bool) -> Vec<String> {
+    lex.synsets[synset as usize]
+        .members
+        .iter()
+        .map(|m| m.to_lowercase())
+        .filter(|m| m != lemma && !m.contains(' ') && scribe::usage::synonyms::usable_member(m, stop))
+        .collect()
+}
+
+/// Groups of eligible senses: "fine" (one sense each), "options" (senses that
+/// share an option merge), "options+category" (also merge same supersense).
+fn groups(eligible: &[u32], opts: &HashMap<u32, Vec<String>>, lex: &Lexicon, mode: &str) -> Vec<Vec<u32>> {
+    let mut parent: Vec<usize> = (0..eligible.len()).collect();
+    fn find(p: &mut Vec<usize>, i: usize) -> usize { if p[i] != i { let r = find(p, p[i]); p[i] = r } p[i] }
+    for i in 0..eligible.len() {
+        for j in i + 1..eligible.len() {
+            let share = opts[&eligible[i]].iter().any(|m| opts[&eligible[j]].contains(m));
+            let same_cat = lex.synsets[eligible[i] as usize].category == lex.synsets[eligible[j] as usize].category;
+            let merge = match mode { "options" => share, "options+category" => share || same_cat, _ => false };
+            if merge { let (a, b) = (find(&mut parent, i), find(&mut parent, j)); parent[a] = b; }
+        }
+    }
+    let mut out: HashMap<usize, Vec<u32>> = HashMap::new();
+    for i in 0..eligible.len() { let r = find(&mut parent, i); out.entry(r).or_default().push(eligible[i]); }
+    let mut g: Vec<Vec<u32>> = out.into_values().collect();
+    g.sort();
+    g
+}
+
+fn editor_report(label: &str, cases: &[Case], scores: &[Vec<f32>], lex: &Lexicon, stop: &dyn Fn(&str) -> bool) {
+    for mode in ["fine", "options", "options+category"] {
+        // (eligible, suggested, correct) per abstention margin, and first-listed.
+        let margins = [0.0f32, 1.0, 2.0, 4.0, 8.0];
+        let mut tally = vec![(0usize, 0usize, 0usize); margins.len()];
+        let mut first = (0usize, 0usize);
+        let mut sizes = (0usize, 0usize);
+        let mut gold_has_options = 0usize;
+        for (c, s) in cases.iter().zip(scores) {
+            let opts: HashMap<u32, Vec<String>> = c.senses.iter().map(|&x| (x, options(lex, x, &c.lemma, stop))).collect();
+            let eligible: Vec<u32> = c.senses.iter().copied().filter(|x| !opts[x].is_empty()).collect();
+            if eligible.is_empty() { continue }
+            let gs = groups(&eligible, &opts, lex, mode);
+            sizes.0 += gs.len(); sizes.1 += 1;
+            gold_has_options += eligible.iter().any(|x| c.gold.contains(x)) as usize;
+            let score_of = |x: u32| c.senses.iter().position(|y| *y == x).map_or(f32::NEG_INFINITY, |k| s[k]);
+            // All senses compete; the ones without options form one "no
+            // suggestion" group — if it wins, the editor abstains.
+            let none: Vec<u32> = c.senses.iter().copied().filter(|x| opts[x].is_empty()).collect();
+            let mut ranked: Vec<(f32, Option<&Vec<u32>>)> = gs.iter().map(|g| (g.iter().map(|&x| score_of(x)).fold(f32::NEG_INFINITY, f32::max), Some(g))).collect();
+            if !none.is_empty() { ranked.push((none.iter().map(|&x| score_of(x)).fold(f32::NEG_INFINITY, f32::max), None)); }
+            ranked.sort_by(|a, b| b.0.total_cmp(&a.0));
+            let margin = if ranked.len() > 1 { ranked[0].0 - ranked[1].0 } else { f32::INFINITY };
+            let picked = ranked[0].1;
+            let right = picked.is_some_and(|g| g.iter().any(|x| c.gold.contains(x)));
+            for (k, &m) in margins.iter().enumerate() {
+                tally[k].0 += 1;
+                if picked.is_some() && margin >= m { tally[k].1 += 1; tally[k].2 += right as usize; }
+            }
+            // First-listed eligible sense's group, never abstains.
+            let f = gs.iter().find(|g| g.contains(&eligible[0])).unwrap();
+            first.0 += 1; first.1 += f.iter().any(|x| c.gold.contains(x)) as usize;
+        }
+        println!("{label}, editor [{mode}] ({} eligible words, {:.1} meanings with options each; true sense has options in {:.1}%): first-listed {:.1}% precision at 100% coverage",
+            first.0, sizes.0 as f64 / sizes.1.max(1) as f64, 100.0 * gold_has_options as f64 / first.0.max(1) as f64, 100.0 * first.1 as f64 / first.0.max(1) as f64);
+        for (k, m) in margins.iter().enumerate() {
+            let (n, sug, ok) = tally[k];
+            println!("  head, abstain below margin {m:<3}: precision {:.1}%, coverage {:.1}%", 100.0 * ok as f64 / sug.max(1) as f64, 100.0 * sug as f64 / n.max(1) as f64);
+        }
+    }
 }
