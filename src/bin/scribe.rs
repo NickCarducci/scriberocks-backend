@@ -6,7 +6,8 @@
 //!                                                       --morph splits words into base + ending → models/usage-morph
 //! scribe build-senses <models-dir> [usage-dir-name]     rebuild the sense index from a trained usage model
 //! scribe train-senses <data-dir> <models-dir> [steps]   sense modeling: continue models/usage with a supersense
-//!                                                       objective (dictionary-allowed sets + SemCor gold) → models/usage-sense
+//!                                                       objective (dictionary-allowed sets + SemCor gold) → models/usage-sense;
+//!                                                       --control: same corpus and schedule, words only → models/usage-control
 
 use scribe::{conllu, inflect::Inflector, lm::LanguageModel, parser::Parser, tagger::{Column, Tagger}, text, Engine, Lexicon};
 use std::io::Read;
@@ -117,7 +118,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         Some("train-senses") => {
             let steps = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(20_000);
-            train_senses(Path::new(arg(2)?), Path::new(arg(3)?), steps)?
+            let control = args.iter().any(|a| a == "--control");
+            train_senses(Path::new(arg(2)?), Path::new(arg(3)?), steps, control)?
         }
         Some("train-usage") => {
             let steps = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(20_000);
@@ -134,7 +136,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// supersenses the dictionary allows for the word (context must choose), or
 /// SemCor's gold one. Only even-numbered SemCor documents are used; odd ones
 /// stay held out for examples/semcor_eval.rs.
-fn train_senses(data: &Path, models: &Path, steps: usize) -> Result<(), Box<dyn std::error::Error>> {
+fn train_senses(data: &Path, models: &Path, steps: usize, control: bool) -> Result<(), Box<dyn std::error::Error>> {
     use scribe::usage::{corpus, model::{SenseTargets, TrainOptions, UsageModel}};
     use std::collections::BTreeSet;
 
@@ -170,12 +172,16 @@ fn train_senses(data: &Path, models: &Path, steps: usize) -> Result<(), Box<dyn 
     let device = scribe::usage::model::Device::new_metal(0)?;
     #[cfg(not(feature = "metal"))]
     let device = scribe::usage::model::Device::Cpu;
-    let ckpt = models.join("usage-sense-checkpoint");
+    // The control isolates the supersense objective: identical corpus, steps,
+    // learning rate and seed, masked words only.
+    let name = if control { "usage-control" } else { "usage-sense" };
+    let ckpt = models.join(format!("{name}-checkpoint"));
     let (mut model, start) = match UsageModel::checkpoint_step(&ckpt) {
         Some(step) if step < steps => {
             eprintln!("resuming from checkpoint at step {step}");
             UsageModel::resume(&ckpt, device)?
         }
+        _ if control => (UsageModel::load(&models.join("usage"), device)?, 0),
         _ => (UsageModel::load(&models.join("usage"), device)?.with_supersenses(lex.categories.len())?, 0),
     };
 
@@ -206,7 +212,7 @@ fn train_senses(data: &Path, models: &Path, steps: usize) -> Result<(), Box<dyn 
     let t = Instant::now();
     let (mut words_avg, mut senses_avg) = (Vec::new(), Vec::new());
     let opts = TrainOptions { steps, batch: 64, lr: 3e-4, warmup: 500, seed: 11, start_step: start, checkpoint: Some((ckpt.clone(), 1000)) };
-    model.train_with_senses(&ids, &opts, Some(&targets), |step, w, s| {
+    model.train_with_senses(&ids, &opts, (!control).then_some(&targets), |step, w, s| {
         words_avg.push(w);
         senses_avg.push(s);
         if (step + 1) % 1000 == 0 {
@@ -216,7 +222,7 @@ fn train_senses(data: &Path, models: &Path, steps: usize) -> Result<(), Box<dyn 
             senses_avg.clear();
         }
     })?;
-    let out = models.join("usage-sense");
+    let out = models.join(name);
     model.save(&out)?;
     build_senses(&model, &lex, &out)?;
     Ok(())
