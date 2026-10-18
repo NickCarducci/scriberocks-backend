@@ -32,6 +32,9 @@ struct Case {
     /// Index of its sentence in the evaluated list (for sentence context).
     sentence: usize,
     features: Vec<String>,
+    /// Lower-cased window around the word (fits the usage model) and the word's index in it.
+    window: Vec<String>,
+    at: usize,
 }
 
 fn load(name: &str, dir: &str) -> Vec<TaggedSentence> {
@@ -60,7 +63,9 @@ fn cases(e: &Engine, keys: &HashMap<String, u32>, sentences: &[TaggedSentence]) 
             let gold: Vec<u32> = inst.keys.iter().filter_map(|k| keys.get(k).copied()).filter(|g| senses.contains(g)).collect();
             match v {
                 Some(vector) if !gold.is_empty() && senses.len() > 1 => {
-                    out.push(Case { senses, gold, vector, lemma: inst.lemma.clone(), pos: inst.pos, sentence: n, features: kgram::features(&lower, inst.index) })
+                    let lo = inst.index.saturating_sub(20);
+                    let window = lower[lo..(lo + 40).min(lower.len())].to_vec();
+                    out.push(Case { senses, gold, vector, lemma: inst.lemma.clone(), pos: inst.pos, sentence: n, features: kgram::features(&lower, inst.index), window, at: inst.index - lo })
                 }
                 _ => skipped += 1,
             }
@@ -220,6 +225,7 @@ fn main() {
     for (label, cases) in [("SemCor held-out", &held_cases), ("ALL", &all_cases)] {
         let scores = head_scores(cases, &plain, None, &e.lexicon);
         editor_report(label, cases, &scores, &e.lexicon, &stop);
+        editor_with_usage(label, cases, &scores, &e.lexicon, &stop, e.usage.as_ref().unwrap());
     }
 }
 
@@ -291,6 +297,61 @@ fn editor_report(label: &str, cases: &[Case], scores: &[Vec<f32>], lex: &Lexicon
         for (k, m) in margins.iter().enumerate() {
             let (n, sug, ok) = tally[k];
             println!("  head, abstain below margin {m:<3}: precision {:.1}%, coverage {:.1}%", 100.0 * ok as f64 / sug.max(1) as f64, 100.0 * sug as f64 / n.max(1) as f64);
+        }
+    }
+}
+
+/// Editor view followed by the usage model: each meaning's options are tried
+/// in the word's slot, and the meaning's fit (log of the options' mean
+/// probability, or of the best option's) is added to the head's score with
+/// weight beta, relative to the case's mean fit. beta 0 = the editor view.
+fn editor_with_usage(label: &str, cases: &[Case], scores: &[Vec<f32>], lex: &Lexicon, stop: &dyn Fn(&str) -> bool, usage: &scribe::usage::model::UsageModel) {
+    let margins = [0.0f32, 1.0, 2.0, 4.0, 8.0];
+    let betas = [0.0f32, 0.25, 0.5, 1.0, 2.0];
+    // Per case: groups ("options" mode) with head score, mean-fit and max-fit; plus the no-suggestion score.
+    struct G { head: f32, mean_fit: f32, max_fit: f32, right: bool }
+    let mut prepared: Vec<(Vec<G>, Option<f32>)> = Vec::new();
+    for (n, (c, s)) in cases.iter().zip(scores).enumerate() {
+        if n % 500 == 0 { eprintln!("  usage fit {n}/{}", cases.len()) }
+        let opts: HashMap<u32, Vec<String>> = c.senses.iter().map(|&x| (x, options(lex, x, &c.lemma, stop))).collect();
+        let eligible: Vec<u32> = c.senses.iter().copied().filter(|x| !opts[x].is_empty()).collect();
+        if eligible.is_empty() { continue }
+        let gs = groups(&eligible, &opts, lex, "options");
+        let all: Vec<String> = eligible.iter().flat_map(|x| opts[x].clone()).collect::<BTreeSet<_>>().into_iter().collect();
+        let lp: HashMap<String, f32> = all.iter().cloned().zip(usage.candidate_scores(&c.window, c.at, &all).unwrap()).collect();
+        let score_of = |x: u32| c.senses.iter().position(|y| *y == x).map_or(f32::NEG_INFINITY, |k| s[k]);
+        let out: Vec<G> = gs.iter().map(|g| {
+            let o: BTreeSet<&String> = g.iter().flat_map(|x| &opts[x]).collect();
+            let v: Vec<f32> = o.iter().map(|w| lp[*w].max(-30.0)).collect();
+            let mx = v.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            let mean = mx + (v.iter().map(|x| (x - mx).exp()).sum::<f32>() / v.len() as f32).ln();
+            G { head: g.iter().map(|&x| score_of(x)).fold(f32::NEG_INFINITY, f32::max), mean_fit: mean, max_fit: mx, right: g.iter().any(|x| c.gold.contains(x)) }
+        }).collect();
+        let none: Vec<u32> = c.senses.iter().copied().filter(|x| opts[x].is_empty()).collect();
+        let none_score = (!none.is_empty()).then(|| none.iter().map(|&x| score_of(x)).fold(f32::NEG_INFINITY, f32::max));
+        prepared.push((out, none_score));
+    }
+    for fit in ["mean", "max"] {
+        for &beta in &betas {
+            let mut tally = vec![(0usize, 0usize, 0usize); margins.len()];
+            let mut always = (0usize, 0usize);
+            for (gs, none) in &prepared {
+                let f = |g: &G| if fit == "mean" { g.mean_fit } else { g.max_fit };
+                let avg = gs.iter().map(f).sum::<f32>() / gs.len() as f32;
+                let mut ranked: Vec<(f32, Option<bool>)> = gs.iter().map(|g| (g.head + beta * (f(g) - avg), Some(g.right))).collect();
+                // Best option-bearing group, never abstaining (coverage 100%).
+                let best = ranked.iter().max_by(|a, b| a.0.total_cmp(&b.0)).unwrap();
+                always.0 += 1; always.1 += best.1.unwrap() as usize;
+                if let Some(x) = none { ranked.push((*x, None)) }
+                ranked.sort_by(|a, b| b.0.total_cmp(&a.0));
+                let margin = if ranked.len() > 1 { ranked[0].0 - ranked[1].0 } else { f32::INFINITY };
+                for (k, &m) in margins.iter().enumerate() {
+                    tally[k].0 += 1;
+                    if let Some(r) = ranked[0].1 { if margin >= m { tally[k].1 += 1; tally[k].2 += r as usize } }
+                }
+            }
+            let cells: Vec<String> = margins.iter().zip(&tally).map(|(m, (n, sug, ok))| format!("m{m}: {:.1}%@{:.1}%", 100.0 * *ok as f64 / (*sug).max(1) as f64, 100.0 * *sug as f64 / (*n).max(1) as f64)).collect();
+            println!("{label}, editor + usage fit [{fit}, beta {beta}]: never-abstain {:.1}% | precision@coverage {}", 100.0 * always.1 as f64 / always.0.max(1) as f64, cells.join("  "));
         }
     }
 }
