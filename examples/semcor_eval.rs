@@ -226,6 +226,7 @@ fn main() {
         let scores = head_scores(cases, &plain, None, &e.lexicon);
         editor_report(label, cases, &scores, &e.lexicon, &stop);
         editor_with_usage(label, cases, &scores, &e.lexicon, &stop, e.usage.as_ref().unwrap());
+        editor_hierarchical(label, cases, &scores, &e.lexicon, &stop, e.usage.as_ref().unwrap());
     }
 }
 
@@ -353,5 +354,64 @@ fn editor_with_usage(label: &str, cases: &[Case], scores: &[Vec<f32>], lex: &Lex
             let cells: Vec<String> = margins.iter().zip(&tally).map(|(m, (n, sug, ok))| format!("m{m}: {:.1}%@{:.1}%", 100.0 * *ok as f64 / (*sug).max(1) as f64, 100.0 * *sug as f64 / (*n).max(1) as f64)).collect();
             println!("{label}, editor + usage fit [{fit}, beta {beta}]: never-abstain {:.1}% | precision@coverage {}", 100.0 * always.1 as f64 / always.0.max(1) as f64, cells.join("  "));
         }
+    }
+}
+
+/// Two-step editor view: first the broad category (supersense), scored by the
+/// head's best sense in it plus gamma x the usage model's supersense
+/// log-probability for the masked word; then, within that category only, the
+/// option groups (meanings sharing a synonym), picked by the head.
+/// Reports the category step's precision, the final (option-group) precision,
+/// and how often the chosen category holds a single option group (the
+/// category alone settles the suggestion).
+fn editor_hierarchical(label: &str, cases: &[Case], scores: &[Vec<f32>], lex: &Lexicon, stop: &dyn Fn(&str) -> bool, usage: &scribe::usage::model::UsageModel) {
+    let margins = [0.0f32, 1.0, 2.0, 4.0, 8.0];
+    let gammas = [0.0f32, 0.5, 1.0, 2.0, 4.0];
+    // Per case: (category, head score, right category, option groups [(head, right)]); none-group (head, best lp).
+    struct Cat { lp: f32, head: f32, right: bool, groups: Vec<(f32, bool)> }
+    let mut prepared: Vec<(Vec<Cat>, Option<(f32, f32)>)> = Vec::new();
+    for (n, (c, s)) in cases.iter().zip(scores).enumerate() {
+        if n % 1000 == 0 { eprintln!("  supersenses {n}/{}", cases.len()) }
+        let opts: HashMap<u32, Vec<String>> = c.senses.iter().map(|&x| (x, options(lex, x, &c.lemma, stop))).collect();
+        let eligible: Vec<u32> = c.senses.iter().copied().filter(|x| !opts[x].is_empty()).collect();
+        if eligible.is_empty() { continue }
+        let mut masked = c.window.clone();
+        masked[c.at] = "[MASK]".into();
+        let lp = usage.supersense_log_probs(&masked).unwrap().and_then(|v| v.get(c.at).cloned()).expect("usage-sense model with supersenses");
+        let score_of = |x: u32| c.senses.iter().position(|y| *y == x).map_or(f32::NEG_INFINITY, |k| s[k]);
+        let cat_of = |x: u32| lex.synsets[x as usize].category;
+        let cats: BTreeSet<u16> = eligible.iter().map(|&x| cat_of(x)).collect();
+        let out: Vec<Cat> = cats.iter().map(|&k| {
+            let members: Vec<u32> = eligible.iter().copied().filter(|&x| cat_of(x) == k).collect();
+            let groups = groups(&members, &opts, lex, "options").into_iter()
+                .map(|g| (g.iter().map(|&x| score_of(x)).fold(f32::NEG_INFINITY, f32::max), g.iter().any(|x| c.gold.contains(x)))).collect::<Vec<_>>();
+            Cat { lp: lp[k as usize], head: members.iter().map(|&x| score_of(x)).fold(f32::NEG_INFINITY, f32::max), right: members.iter().any(|x| c.gold.contains(x)), groups }
+        }).collect();
+        let none: Vec<u32> = c.senses.iter().copied().filter(|x| opts[x].is_empty()).collect();
+        let none = (!none.is_empty()).then(|| (none.iter().map(|&x| score_of(x)).fold(f32::NEG_INFINITY, f32::max), none.iter().map(|&x| lp[cat_of(x) as usize]).fold(f32::NEG_INFINITY, f32::max)));
+        prepared.push((out, none));
+    }
+    for &gamma in &gammas {
+        let mut tally = vec![(0usize, 0usize, 0usize, 0usize, 0usize); margins.len()]; // n, suggested, category right, final right, single-group
+        for (cats, none) in &prepared {
+            let mut ranked: Vec<(f32, Option<&Cat>)> = cats.iter().map(|k| (k.head + gamma * k.lp, Some(k))).collect();
+            if let Some((h, l)) = none { ranked.push((h + gamma * l, None)) }
+            ranked.sort_by(|a, b| b.0.total_cmp(&a.0));
+            let margin = if ranked.len() > 1 { ranked[0].0 - ranked[1].0 } else { f32::INFINITY };
+            for (i, &m) in margins.iter().enumerate() {
+                tally[i].0 += 1;
+                if let Some(k) = ranked[0].1 {
+                    if margin >= m {
+                        let g = k.groups.iter().max_by(|a, b| a.0.total_cmp(&b.0)).unwrap();
+                        tally[i].1 += 1; tally[i].2 += k.right as usize; tally[i].3 += g.1 as usize; tally[i].4 += (k.groups.len() == 1) as usize;
+                    }
+                }
+            }
+        }
+        let cells: Vec<String> = margins.iter().zip(&tally).map(|(m, (n, sug, cat, fin, one))| {
+            let p = |x: usize| 100.0 * x as f64 / (*sug).max(1) as f64;
+            format!("m{m}: category {:.1}% final {:.1}% @{:.1}% (settled by category {:.0}%)", p(*cat), p(*fin), 100.0 * *sug as f64 / (*n).max(1) as f64, p(*one))
+        }).collect();
+        println!("{label}, editor two-step [gamma {gamma}]: {}", cells.join(" | "));
     }
 }
