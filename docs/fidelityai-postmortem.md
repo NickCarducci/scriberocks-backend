@@ -129,6 +129,11 @@ category. When the editor makes a suggestion (59.7% of the time):
   59.2% is below the single-step editor's 63.8% because category boundaries
   split synonym groups the single-step view keeps merged. So the category is
   where the hard decision lies, not a stage that makes it easier.
+- **Keeping synonym groups whole in step two** (choosing among every group
+  that has a meaning in the chosen category) restores 63.8%. The picks are
+  then the same as the single-step editor's. Holding back on category
+  confidence is 1–4 points less accurate than holding back on synonym-group
+  confidence at the same coverage.
 
 **FidelityAI's role in Scriberocks.** It isn't the sense picker. It isn't a
 gain on the category decision either: that is a choice among dozens of

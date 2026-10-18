@@ -368,7 +368,7 @@ fn editor_hierarchical(label: &str, cases: &[Case], scores: &[Vec<f32>], lex: &L
     let margins = [0.0f32, 1.0, 2.0, 4.0, 8.0];
     let gammas = [0.0f32, 0.5, 1.0, 2.0, 4.0];
     // Per case: (category, head score, right category, option groups [(head, right)]); none-group (head, best lp).
-    struct Cat { lp: f32, head: f32, right: bool, groups: Vec<(f32, bool)> }
+    struct Cat { lp: f32, head: f32, right: bool, groups: Vec<(f32, bool)>, whole: Vec<(f32, bool)> }
     let mut prepared: Vec<(Vec<Cat>, Option<(f32, f32)>)> = Vec::new();
     for (n, (c, s)) in cases.iter().zip(scores).enumerate() {
         if n % 1000 == 0 { eprintln!("  supersenses {n}/{}", cases.len()) }
@@ -381,11 +381,15 @@ fn editor_hierarchical(label: &str, cases: &[Case], scores: &[Vec<f32>], lex: &L
         let score_of = |x: u32| c.senses.iter().position(|y| *y == x).map_or(f32::NEG_INFINITY, |k| s[k]);
         let cat_of = |x: u32| lex.synsets[x as usize].category;
         let cats: BTreeSet<u16> = eligible.iter().map(|&x| cat_of(x)).collect();
+        // Synonym groups over all eligible meanings (not split by category).
+        let all_groups = groups(&eligible, &opts, lex, "options");
         let out: Vec<Cat> = cats.iter().map(|&k| {
+            let whole = all_groups.iter().filter(|g| g.iter().any(|&x| cat_of(x) == k))
+                .map(|g| (g.iter().map(|&x| score_of(x)).fold(f32::NEG_INFINITY, f32::max), g.iter().any(|x| c.gold.contains(x)))).collect::<Vec<_>>();
             let members: Vec<u32> = eligible.iter().copied().filter(|&x| cat_of(x) == k).collect();
             let groups = groups(&members, &opts, lex, "options").into_iter()
                 .map(|g| (g.iter().map(|&x| score_of(x)).fold(f32::NEG_INFINITY, f32::max), g.iter().any(|x| c.gold.contains(x)))).collect::<Vec<_>>();
-            Cat { lp: lp[k as usize], head: members.iter().map(|&x| score_of(x)).fold(f32::NEG_INFINITY, f32::max), right: members.iter().any(|x| c.gold.contains(x)), groups }
+            Cat { whole, lp: lp[k as usize], head: members.iter().map(|&x| score_of(x)).fold(f32::NEG_INFINITY, f32::max), right: members.iter().any(|x| c.gold.contains(x)), groups }
         }).collect();
         let none: Vec<u32> = c.senses.iter().copied().filter(|x| opts[x].is_empty()).collect();
         let none = (!none.is_empty()).then(|| (none.iter().map(|&x| score_of(x)).fold(f32::NEG_INFINITY, f32::max), none.iter().map(|&x| lp[cat_of(x) as usize]).fold(f32::NEG_INFINITY, f32::max)));
@@ -393,6 +397,7 @@ fn editor_hierarchical(label: &str, cases: &[Case], scores: &[Vec<f32>], lex: &L
     }
     for &gamma in &gammas {
         let mut tally = vec![(0usize, 0usize, 0usize, 0usize, 0usize); margins.len()]; // n, suggested, category right, final right, single-group
+        let mut whole_right = vec![0usize; margins.len()];
         for (cats, none) in &prepared {
             let mut ranked: Vec<(f32, Option<&Cat>)> = cats.iter().map(|k| (k.head + gamma * k.lp, Some(k))).collect();
             if let Some((h, l)) = none { ranked.push((h + gamma * l, None)) }
@@ -403,14 +408,15 @@ fn editor_hierarchical(label: &str, cases: &[Case], scores: &[Vec<f32>], lex: &L
                 if let Some(k) = ranked[0].1 {
                     if margin >= m {
                         let g = k.groups.iter().max_by(|a, b| a.0.total_cmp(&b.0)).unwrap();
+                        whole_right[i] += k.whole.iter().max_by(|a, b| a.0.total_cmp(&b.0)).unwrap().1 as usize;
                         tally[i].1 += 1; tally[i].2 += k.right as usize; tally[i].3 += g.1 as usize; tally[i].4 += (k.groups.len() == 1) as usize;
                     }
                 }
             }
         }
-        let cells: Vec<String> = margins.iter().zip(&tally).map(|(m, (n, sug, cat, fin, one))| {
+        let cells: Vec<String> = margins.iter().zip(&tally).zip(&whole_right).map(|((m, (n, sug, cat, fin, one)), w)| {
             let p = |x: usize| 100.0 * x as f64 / (*sug).max(1) as f64;
-            format!("m{m}: category {:.1}% final {:.1}% @{:.1}% (settled by category {:.0}%)", p(*cat), p(*fin), 100.0 * *sug as f64 / (*n).max(1) as f64, p(*one))
+            format!("m{m}: category {:.1}% final {:.1}% whole-groups {:.1}% @{:.1}% (settled by category {:.0}%)", p(*cat), p(*fin), p(*w), 100.0 * *sug as f64 / (*n).max(1) as f64, p(*one))
         }).collect();
         println!("{label}, editor two-step [gamma {gamma}]: {}", cells.join(" | "));
     }
