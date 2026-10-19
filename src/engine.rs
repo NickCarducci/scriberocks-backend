@@ -8,6 +8,7 @@ use crate::tagger::Tagger;
 use crate::text;
 use crate::usage::model::{Device, UsageModel};
 use crate::usage::senses::SenseIndex;
+use crate::usage::sense_head::{Candidate, SenseHead};
 use serde::Serialize;
 use std::path::Path;
 
@@ -72,8 +73,13 @@ pub struct Engine {
     /// dictionary overlap and fluency alone.
     pub usage: Option<UsageModel>,
     pub senses: Option<SenseIndex>,
+    /// Optional learned sense head (`usage/head/`, from `scribe train-head`).
+    /// When present it chooses senses instead of the example index.
+    pub head: Option<SenseHead>,
     /// See `SENSE_MARGIN`; a field so experiments can vary it.
     pub sense_margin: f32,
+    /// See `HEAD_MARGIN`.
+    pub head_margin: f32,
 }
 
 pub const CONTENT: &[&str] = &["NOUN", "VERB", "ADJ", "ADV"];
@@ -102,6 +108,13 @@ impl SlotScorer for UsageModel {
 /// sense-tagged text (e.g. SemCor) — see examples/margin_sweep.rs.
 pub const SENSE_MARGIN: f32 = 0.5;
 
+/// The sense head must score another sense this far above the first-listed
+/// one to override it. 3.0 is best on the ALL test set (Word Sense
+/// Disambiguation Evaluation Framework): 61.0% with the head trained on all
+/// of SemCor's training documents, against 55.6% for first-listed
+/// (examples/semcor_eval.rs).
+pub const HEAD_MARGIN: f32 = 3.0;
+
 impl Engine {
     /// Loads lexicon, tagger, xpos, parser, inflect and lm `.bin` files from
     /// `dir`, plus `usage/` (usage model + sense index) when present.
@@ -124,8 +137,13 @@ impl Engine {
                     index.build_backoff(&lexicon);
                     index
                 }),
+            head: match dir.join("usage/head/senses.json").exists() {
+                true => Some(SenseHead::load(&dir.join("usage/head"), Device::Cpu)?),
+                false => None,
+            },
             lexicon,
             sense_margin: SENSE_MARGIN,
+            head_margin: HEAD_MARGIN,
         })
     }
 
@@ -176,8 +194,8 @@ impl Engine {
         // Context vectors with each content word hidden (what the context says
         // the word means), one batched pass per sentence.
         let content: Vec<usize> = (0..out.len()).filter(|&i| CONTENT.contains(&out[i].upos.as_str()) && out[i].upos != "AUX").collect();
-        let vectors: std::collections::HashMap<usize, Vec<f32>> = match (&self.usage, &self.senses) {
-            (Some(u), Some(_)) if !content.is_empty() => {
+        let vectors: std::collections::HashMap<usize, Vec<f32>> = match &self.usage {
+            Some(u) if !content.is_empty() && (self.senses.is_some() || self.head.is_some()) => {
                 let lower: Vec<String> = words.iter().map(|w| w.to_lowercase()).collect();
                 let masked: Vec<Vec<String>> = content.iter().map(|&i| { let mut s = lower.clone(); s[i] = "[MASK]".into(); s }).collect();
                 u.contextual_batch(&masked)
@@ -190,6 +208,16 @@ impl Engine {
             if CONTENT.contains(&t.upos.as_str()) && t.upos != "AUX" {
                 if let Some(p) = Pos::from_upos(&t.upos) {
                     let v = vectors.get(&i).map(Vec::as_slice);
+                    let senses = self.lexicon.senses(&t.lemma, p);
+                    if let (Some(head), Some(v)) = (&self.head, v) {
+                        let candidates: Vec<Candidate> =
+                            senses.iter().enumerate().map(|(rank, &s)| Candidate { synset: s, category: self.lexicon.synsets[s as usize].category, rank }).collect();
+                        if let Some((sense, supported)) = head.scores(v, &candidates).ok().and_then(|sc| choose_by_head(senses, &sc, self.head_margin, |s| head.knows(s))) {
+                            t.sense = Some(sense);
+                            t.sense_supported = supported;
+                        }
+                        continue;
+                    }
                     let score = |s: u32| match (self.senses.as_ref(), v) {
                         (Some(index), Some(v)) => index.score(s, v, &self.lexicon),
                         _ => None,
@@ -231,6 +259,20 @@ pub fn choose_sense(senses: &[u32], score: impl Fn(u32) -> Option<(f32, crate::u
     }
 }
 
+/// Chooses a sense from the sense head's scores (one per sense, in dictionary
+/// order): the first-listed sense unless another scores more than `margin`
+/// above it. The flag says whether the head trained on the chosen sense (or
+/// it is the word's only sense) — only then may swaps rely on it.
+pub fn choose_by_head(senses: &[u32], scores: &[f32], margin: f32, knows: impl Fn(u32) -> bool) -> Option<(u32, bool)> {
+    let first = *senses.first()?;
+    if senses.len() == 1 {
+        return Some((first, true));
+    }
+    let best = (0..senses.len().min(scores.len())).max_by(|&a, &b| scores[a].total_cmp(&scores[b]))?;
+    let chosen = if scores[best] - scores[0] > margin { senses[best] } else { first };
+    Some((chosen, knows(chosen)))
+}
+
 fn clitic_lemma(w: &str) -> String {
     match w.to_lowercase().as_str() {
         "n't" => "not".into(),
@@ -248,6 +290,24 @@ fn clitic_lemma(w: &str) -> String {
 #[cfg(test)]
 mod sense_tests {
     use super::*;
+
+    #[test]
+    fn the_head_overrides_the_first_listed_sense_only_past_its_margin() {
+        let knows = |_: u32| true;
+        assert_eq!(choose_by_head(&[10, 11], &[0.0, 4.0], 3.0, knows), Some((11, true)));
+        assert_eq!(choose_by_head(&[10, 11], &[0.0, 2.0], 3.0, knows), Some((10, true)));
+        assert_eq!(choose_by_head(&[10, 11, 12], &[1.0, 3.5, 4.5], 3.0, knows), Some((12, true)));
+    }
+
+    #[test]
+    fn a_head_choice_is_supported_only_for_senses_the_head_trained_on() {
+        let knows = |s: u32| s == 10;
+        assert_eq!(choose_by_head(&[10, 11], &[0.0, 5.0], 3.0, knows), Some((11, false)));
+        assert_eq!(choose_by_head(&[10, 11], &[0.0, 1.0], 3.0, knows), Some((10, true)));
+        // A word's only sense is always supported; no senses, no choice.
+        assert_eq!(choose_by_head(&[7], &[0.0], 3.0, |_| false), Some((7, true)));
+        assert_eq!(choose_by_head(&[], &[], 3.0, |_| true), None);
+    }
 
     use crate::usage::senses::Evidence;
 

@@ -178,6 +178,15 @@ fn main() {
     eprintln!("vectors: ALL (Senseval/SemEval)");
     let (all_cases, _) = cases(&e, &keys, &every(&load("ALL", "Evaluation_Datasets/ALL"), eval_cap));
 
+    // SHIPPED_HEAD=1: score only the saved head (models/<usage>/head, from
+    // `scribe train-head`) on ALL, as the engine uses it, and stop.
+    if std::env::var("SHIPPED_HEAD").is_ok() {
+        let head = SenseHead::load(&Path::new("models").join(&usage).join("head"), scribe::usage::model::Device::Cpu).unwrap();
+        sweep("ALL, shipped head", &all_cases, &head_scores(&all_cases, &head, None, &e.lexicon));
+        let first = all_cases.iter().filter(|c| c.gold.contains(&c.senses[0])).count();
+        println!("ALL, first-listed: {:.1}% (n={})", 100.0 * first as f64 / all_cases.len().max(1) as f64, all_cases.len());
+        return;
+    }
     let shipped = e.senses.as_ref().unwrap();
     report("SemCor held-out, shipped index", &held_cases, shipped, &e.lexicon);
     report("ALL, shipped index", &all_cases, shipped, &e.lexicon);
@@ -226,7 +235,9 @@ fn main() {
         let scores = head_scores(cases, &plain, None, &e.lexicon);
         editor_report(label, cases, &scores, &e.lexicon, &stop);
         editor_with_usage(label, cases, &scores, &e.lexicon, &stop, e.usage.as_ref().unwrap());
-        editor_hierarchical(label, cases, &scores, &e.lexicon, &stop, e.usage.as_ref().unwrap());
+        if e.usage.as_ref().unwrap().supersenses() > 0 {
+            editor_hierarchical(label, cases, &scores, &e.lexicon, &stop, e.usage.as_ref().unwrap());
+        }
     }
 }
 

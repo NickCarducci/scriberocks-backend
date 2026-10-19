@@ -8,6 +8,10 @@
 //! scribe train-senses <data-dir> <models-dir> [steps]   sense modeling: continue models/usage with a supersense
 //!                                                       objective (dictionary-allowed sets + SemCor gold) → models/usage-sense;
 //!                                                       --control: same corpus and schedule, words only → models/usage-control
+//! scribe train-head <data-dir> <models-dir> [usage-dir-name] [--held-out]
+//!                                                       sense head on SemCor's sense-tagged text (masked-word vectors from the
+//!                                                       usage model) → <usage-dir>/head, which the engine then uses to choose
+//!                                                       senses; --held-out trains on even documents only (as semcor_eval does)
 
 use scribe::{conllu, inflect::Inflector, lm::LanguageModel, parser::Parser, tagger::{Column, Tagger}, text, Engine, Lexicon};
 use std::io::Read;
@@ -115,6 +119,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let name = args.get(3).map(String::as_str).unwrap_or("usage");
             let model = scribe::usage::model::UsageModel::load(&models.join(name), device)?;
             build_senses(&model, &Lexicon::load(&models.join("lexicon.bin"))?, &models.join(name))?;
+        }
+        Some("train-head") => {
+            let name = args.get(4).filter(|a| !a.starts_with("--")).map_or("usage", String::as_str);
+            train_head(Path::new(arg(2)?), Path::new(arg(3)?), name, args.iter().any(|a| a == "--held-out"))?
         }
         Some("train-senses") => {
             let steps = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(20_000);
@@ -409,5 +417,46 @@ fn build_senses(model: &scribe::usage::model::UsageModel, lex: &Lexicon, out: &P
         let (exact, cat) = accuracy(&report, best, backoff);
         eprintln!("  usage {:<24} exact {exact:.1}%   category {cat:.1}%   (margin {best})", if backoff { "+ relatives/category" } else { "examples only" });
     }
+    Ok(())
+}
+
+/// Trains the sense head on SemCor: for every sense-tagged word with more than
+/// one dictionary sense, the usage model's vector at the masked word, its
+/// candidate senses in dictionary order, and the gold sense.
+fn train_head(data: &Path, models: &Path, usage_name: &str, held_out: bool) -> Result<(), Box<dyn std::error::Error>> {
+    use scribe::usage::{model::{Device, UsageModel}, sense_head::{self, Candidate, SenseHead}};
+    use std::collections::BTreeSet;
+
+    let t = Instant::now();
+    let lex = Lexicon::load(&models.join("lexicon.bin"))?;
+    let dir = models.join(usage_name);
+    let usage = UsageModel::load(&dir, Device::Cpu)?;
+    let wsd = data.join("semcor/wsdeval/WSD_Evaluation_Framework/Training_Corpora/SemCor");
+    let semcor = scribe::semcor::parse(&std::fs::read_to_string(wsd.join("semcor.data.xml"))?, &std::fs::read_to_string(wsd.join("semcor.gold.key.txt"))?);
+    let keys = scribe::semcor::sense_keys(&data.join("oewn"), &lex)?;
+    let docs: Vec<&str> = semcor.iter().map(|s| s.document.as_str()).collect::<BTreeSet<_>>().into_iter().collect();
+    let held: BTreeSet<&str> = if held_out { docs.iter().skip(1).step_by(2).copied().collect() } else { BTreeSet::new() };
+    let mut examples = Vec::new();
+    let sentences: Vec<_> = semcor.iter().filter(|s| !held.contains(s.document.as_str())).collect();
+    for (n, s) in sentences.iter().enumerate() {
+        if n % 2000 == 0 { eprintln!("  {n}/{} sentences, {} examples", sentences.len(), examples.len()) }
+        let lower: Vec<String> = s.words.iter().map(|w| w.to_lowercase()).collect();
+        let masked: Vec<Vec<String>> = s.instances.iter().map(|i| { let mut m = lower.clone(); m[i.index] = "[MASK]".into(); m }).collect();
+        let Ok(batch) = usage.contextual_batch(&masked) else { continue };
+        for (inst, h) in s.instances.iter().zip(batch) {
+            let senses = lex.senses(&inst.lemma, inst.pos);
+            let Some(gold) = inst.keys.iter().filter_map(|k| keys.get(k)).find_map(|g| senses.iter().position(|s| s == g)) else { continue };
+            let Some(vector) = h.get(inst.index).cloned() else { continue };
+            if senses.len() < 2 { continue }
+            let candidates = senses.iter().enumerate().map(|(rank, &x)| Candidate { synset: x, category: lex.synsets[x as usize].category, rank }).collect();
+            examples.push(sense_head::Example { vector, candidates, gold, context: vec![] });
+        }
+    }
+    eprintln!("{} training examples from {} sentences{}", examples.len(), sentences.len(), if held_out { " (even documents)" } else { "" });
+    let head = SenseHead::train(&examples, lex.categories.len(), &sense_head::TrainOptions::default(), Device::Cpu)?;
+    let out = dir.join("head");
+    head.save(&out)?;
+    let bytes: u64 = ["senses.safetensors", "senses.json"].iter().filter_map(|f| std::fs::metadata(out.join(f)).ok()).map(|m| m.len()).sum();
+    eprintln!("sense head → {} ({:.1} MB) in {:.1?}", out.display(), bytes as f64 / 1e6, t.elapsed());
     Ok(())
 }
