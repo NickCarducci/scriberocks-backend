@@ -1,0 +1,9 @@
+{
+  "functions": [
+    {
+      "source": "functions",
+      "codebase": "scriberocks",
+      "ignore": ["node_modules", "*.test.js"]
+    }
+  ]
+}
