@@ -10,11 +10,34 @@ through UniFFI.
 | Tagger | averaged perceptron, dictionary features; UPOS and Penn (XPOS) | UD English EWT | UPOS 94.6%, XPOS 94.0% (test) |
 | Parser | arc-eager, dynamic oracle, jackknifed tags | UD English EWT | UAS 81.7%, LAS 77.5% (test, predicted tags) |
 | Usage model | 4-layer transformer (256-d, ~13M params) trained from scratch to fill in hidden words | 15.3M tokens of usage sentences only: 580k Wiktionary examples, WordNet examples, EWT | masked-word loss 3.80 after 40k steps (~100 min on M5 Pro GPU) |
-| Senses | first-listed sense, overridden when usage evidence matches the context by > 0.5 cosine; senses without examples borrow from WordNet relatives, then their category (LMMS-style backoff) | WordNet example sentences (28k senses) + the WordNet graph | 38.3% exact on 1,645 held-out examples (first-listed 34.5%; definition overlap, not used, 37.8%); overrides the first sense on 4% of natural-text words |
+| Senses | sense head: scores each word's dictionary senses from the usage model's vector of its context, plus its category and dictionary rank; keeps the first-listed sense unless another wins by > 3.0 (`HEAD_MARGIN`). Without the head file, the earlier example-matching method (first-listed, overridden past a 0.5 cosine margin) | SemCor (all 37k sentences, 176k sense-tagged words) | 62.4% on the ALL test set of the Word Sense Disambiguation Evaluation Framework (first-listed sense: 55.6%) |
 | Inflection | spelling rules + irregulars | EWT + WordNet | unit-tested |
 | Fluency | interpolated Kneser–Ney trigram (scores, never generates), singletons pruned | usage sentences only (no definitions) | perplexity 618 on EWT test |
 | Frames | subject, modality, negation, verb, object, clause links, categories, concepts | rules over the parse | — |
 | Variants | trim / cut / reorder / swap / reframe; swaps kept only if the usage model says they fit the sentence; ranked by fluency, ordered for diversity | rules + all of the above | 20–50 ms per rock with the usage model |
+
+## How a rock becomes suggestions
+
+Rules and dictionaries propose a closed set of edits; small trained models
+judge them. Nothing generates text freely, and nothing is a large language
+model: the one neural network (the usage model, ~13M parameters) only scores
+options the rules proposed, and everything runs on the device.
+
+| Step | What it does | How |
+|---|---|---|
+| 1. Split and look up words | Breaks the text into words and finds each word's dictionary form | Rules, plus the lexicon compiled from the Open English WordNet database |
+| 2. Tag parts of speech | Marks nouns, verbs and so on | Trained ML model: averaged perceptron learned from UD English EWT (hand-labelled sentences); UPOS 94.6% |
+| 3. Parse | Works out which word connects to which | Trained ML model: arc-eager transition parser learned from UD English EWT; LAS 77.5% |
+| 4. Pick word meanings | Chooses each word's dictionary sense, so swaps offer synonyms of the right meaning | Trained ML model: the sense head (on the usage model's vectors), learned from SemCor; 62.4% vs 55.6% for the first-listed sense |
+| 5. Propose edits | Trim, cut, reorder, reframe; swap words; join sentences; add punctuation | Database and rules: swap candidates are WordNet synonyms of the chosen sense; trim/cut/reorder/reframe and punctuation gaps are rules over the parse; joins use a closed list of connectives (because / so / but / and); spelling fixes are a closed list (i → I, dont → don't) |
+| 6. Judge the edits | Keeps swaps, joins and commas only if they fit the sentence; ranks how natural each version reads | Two language models in the ML sense: the usage model (a small transformer built with candle, Hugging Face's Rust ML library, trained from scratch on ~15M words of usage sentences to fill in hidden words) and a Kneser–Ney trigram fluency model (word-triple statistics; scores, never generates) |
+| 7. Choose and order | Drops near-duplicates, orders the suggestions for variety | Rules |
+
+The boundary between steps 5 and 6 is `SlotScorer` (engine.rs): any scorer
+(the usage model today; FidelityAI or a classical head later) is judged by the
+same tests. History: `2835dad` (lexicon, tagger, parser, variants, usage model),
+`95ecc59` (usage model training), `4859a20` (joins), `cc4ec1f` (punctuation,
+`SlotScorer`), `e510005` (sense head).
 
 ## Architecture: a classical head start for a small learned head
 
