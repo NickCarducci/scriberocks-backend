@@ -3,7 +3,13 @@
     {
       "source": "functions",
       "codebase": "scriberocks",
-      "ignore": ["node_modules", "*.test.js"]
+      "ignore": [
+        "node_modules",
+        "*.test.js"
+      ]
     }
-  ]
+  ],
+  "firestore": {
+    "rules": "firestore.rules"
+  }
 }

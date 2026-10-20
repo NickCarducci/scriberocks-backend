@@ -9,8 +9,13 @@ emails each report to the moderator with signed **Keep**, **Remove** and
 
 The Firebase project `actuapedia-18ikj` is shared with other apps, so:
 
-- **Rules:** merge `firestore-scriberocks.rules` into the project's existing
-  rules in the console. Don't deploy it as the whole rules file.
+- **Rules:** `firestore.rules` is the project's complete rules file (as of
+  October 20, 2026 the live rules held only a deny-all default and
+  Scriberocks' blocks). Paste it into the console, or
+  `firebase deploy --only firestore:rules`. If another app adds rules to this
+  project later, merge instead of replacing.
+- **Rules tests:** the Firebase Rules API's `projects.test` endpoint compiles
+  and tests a ruleset without deploying it.
 - **Functions:** deploy from this folder. They're in their own codebase
   (`scriberocks`), so other apps' functions are left alone.
 
@@ -25,7 +30,10 @@ The Firebase project `actuapedia-18ikj` is shared with other apps, so:
        firebase functions:secrets:set MODERATION_KEY   # any long random string, e.g. `openssl rand -hex 32`
 
 3. Deploy: `cd functions && npm install && cd .. && firebase deploy --only functions:scriberocks`
-4. Create groups in the console: collection `scriberocks_groups`, documents
+4. Guardian controls: once `guardianControls` is true on a
+   `scriberocks_users/{uid}` document the app can't clear it. Clear it in the
+   console when a member turns 18 or a guardian lifts Communication Limits.
+5. Create groups in the console: collection `scriberocks_groups`, documents
    with `name` (string), `about` (string), `reportsToHide` (number: 1 for
    groups meant for younger writers, 2 otherwise).
 
