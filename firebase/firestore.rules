@@ -28,6 +28,14 @@ service cloud.firestore {
         || get(path).data.get('postingApproved', false) == true;
     }
 
+    // Minors-only groups (e.g. Young Writers) admit members whose account says
+    // they're under 18 (isMinor, from the latest Declared Age Range answer).
+    function srMayJoin(groupId) {
+      let user = /databases/$(database)/documents/scriberocks_users/$(request.auth.uid);
+      return get(/databases/$(database)/documents/scriberocks_groups/$(groupId)).data.get('minorsOnly', false) != true
+        || (exists(user) && get(user).data.get('isMinor', false) == true);
+    }
+
     // Terms acceptance and posting approval. guardianControls follows the
     // device's latest Declared Age Range answer (set and cleared by the app),
     // so turning 18 or lifted Communication Limits need no manual step.
@@ -45,7 +53,7 @@ service cloud.firestore {
 
       match /members/{uid} {
         allow read: if srSignedIn() && (request.auth.uid == uid || srMember(groupId));
-        allow create, update: if srSignedIn() && request.auth.uid == uid
+        allow create, update: if srSignedIn() && request.auth.uid == uid && srMayJoin(groupId)
           && request.resource.data.uid == uid
           && request.resource.data.keys().hasOnly(['uid', 'displayName', 'joinedAt', 'guardianApproved']);
         allow delete: if srSignedIn() && request.auth.uid == uid;
