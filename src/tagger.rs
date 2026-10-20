@@ -18,7 +18,7 @@ pub enum Column {
 }
 
 impl Column {
-    fn of(self, t: &crate::conllu::Token) -> &str {
+    pub fn of(self, t: &crate::conllu::Token) -> &str {
         match self {
             Column::Upos => &t.upos,
             Column::Xpos => &t.xpos,

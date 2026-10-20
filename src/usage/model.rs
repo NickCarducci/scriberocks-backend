@@ -348,6 +348,24 @@ impl UsageModel {
 
     /// Encoded pieces (truncated to max_len) and the base piece of each word
     /// that fits.
+    // MARK: fine-tuning a task head (tagging, parsing, senses) on the encoder
+
+    /// Piece ids for `words` (truncated to max_len) and each word's base-piece index.
+    pub fn encode_words(&self, words: &[String]) -> (Vec<u32>, Vec<usize>) {
+        self.encode_window(words)
+    }
+
+    /// Hidden states [batch, len, dim] for padded piece ids (PAD = 0); differentiable,
+    /// so a task head can be trained together with the encoder.
+    pub fn hidden_states(&self, ids: &Tensor) -> Result<Tensor> {
+        self.encoder.hidden(ids)
+    }
+
+    /// The encoder's parameters, for an optimizer that fine-tunes them.
+    pub fn trainable_vars(&self) -> Vec<candle_core::Var> {
+        self.varmap.all_vars()
+    }
+
     fn encode_window(&self, words: &[String]) -> (Vec<u32>, Vec<usize>) {
         let (pieces, base) = self.pieces(words);
         let ids: Vec<u32> = self.vocab.encode(&pieces).into_iter().take(self.config.max_len).collect();
