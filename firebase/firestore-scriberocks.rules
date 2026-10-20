@@ -11,10 +11,25 @@
     function srBanned() {
       return exists(/databases/$(database)/documents/scriberocks_banned/$(request.auth.uid));
     }
+    // Members under guardian controls post only after a guardian approved
+    // posting (PermissionKit, recorded by the app). Both fields are reported by
+    // the app; Apple gives the server no proof. A missing user doc = no controls.
+    function srPostingAllowed() {
+      let path = /databases/$(database)/documents/scriberocks_users/$(request.auth.uid);
+      return !exists(path)
+        || get(path).data.get('guardianControls', false) != true
+        || get(path).data.get('postingApproved', false) == true;
+    }
 
-    // Terms acceptance and blocks (the rocks backup has its own rule).
+    // Terms acceptance, posting approval and blocks (the rocks backup has its own rule).
+    // Once guardianControls is true the app can't clear it (only the console
+    // or account deletion can) — clear it by hand when a member turns 18 or
+    // the guardian lifts Communication Limits.
     match /scriberocks_users/{uid} {
-      allow read, write: if srSignedIn() && request.auth.uid == uid;
+      allow read, create, delete: if srSignedIn() && request.auth.uid == uid;
+      allow update: if srSignedIn() && request.auth.uid == uid
+        && !(resource.data.get('guardianControls', false) == true
+             && request.resource.data.get('guardianControls', false) != true);
       match /blocks/{blockedUid} {
         allow read, write: if srSignedIn() && request.auth.uid == uid;
       }
@@ -36,7 +51,7 @@
       match /posts/{postId} {
         allow read: if srMember(groupId);
         // Members post as themselves, unreported, unless banned.
-        allow create: if srMember(groupId) && !srBanned()
+        allow create: if srMember(groupId) && !srBanned() && srPostingAllowed()
           && request.resource.data.authorId == request.auth.uid
           && request.resource.data.keys().hasOnly(['authorId', 'authorName', 'text', 'createdAt', 'reportedBy'])
           && request.resource.data.text is string && request.resource.data.text.size() <= 20000
