@@ -28,15 +28,11 @@ service cloud.firestore {
         || get(path).data.get('postingApproved', false) == true;
     }
 
-    // Terms acceptance, posting approval and blocks (the rocks backup has its own rule).
-    // Once guardianControls is true the app can't clear it (only the console
-    // or account deletion can) — clear it by hand when a member turns 18 or
-    // the guardian lifts Communication Limits.
+    // Terms acceptance and posting approval. guardianControls follows the
+    // device's latest Declared Age Range answer (set and cleared by the app),
+    // so turning 18 or lifted Communication Limits need no manual step.
     match /scriberocks_users/{uid} {
-      allow read, create, delete: if srSignedIn() && request.auth.uid == uid;
-      allow update: if srSignedIn() && request.auth.uid == uid
-        && !(resource.data.get('guardianControls', false) == true
-             && request.resource.data.get('guardianControls', false) != true);
+      allow read, write: if srSignedIn() && request.auth.uid == uid;
       match /blocks/{blockedUid} {
         allow read, write: if srSignedIn() && request.auth.uid == uid;
       }

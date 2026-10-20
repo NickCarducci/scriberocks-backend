@@ -30,9 +30,10 @@ The Firebase project `actuapedia-18ikj` is shared with other apps, so:
        firebase functions:secrets:set MODERATION_KEY   # any long random string, e.g. `openssl rand -hex 32`
 
 3. Deploy: `cd functions && npm install && cd .. && firebase deploy --only functions:scriberocks`
-4. Guardian controls: once `guardianControls` is true on a
-   `scriberocks_users/{uid}` document the app can't clear it. Clear it in the
-   console when a member turns 18 or a guardian lifts Communication Limits.
+4. Guardian controls need no upkeep: the app re-reads Declared Age Range on
+   each launch (Apple caches it; it updates on the declaration's anniversary,
+   or when the person taps Share Age Range for the app in Settings) and sets
+   or clears `guardianControls` to match.
 5. Create groups in the console: collection `scriberocks_groups`, documents
    with `name` (string), `about` (string), `reportsToHide` (number: 1 for
    groups meant for younger writers, 2 otherwise).
