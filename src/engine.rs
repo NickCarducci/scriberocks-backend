@@ -80,6 +80,9 @@ pub struct Engine {
     pub sense_margin: f32,
     /// See `HEAD_MARGIN`.
     pub head_margin: f32,
+    /// Optional neural syntax (`syntax/`, from examples/parse_finetune.rs):
+    /// refines the perceptron's UPOS tags and the transition parser's arcs.
+    pub syntax: Option<crate::syntax::SyntaxModel>,
 }
 
 pub const CONTENT: &[&str] = &["NOUN", "VERB", "ADJ", "ADV"];
@@ -141,6 +144,10 @@ impl Engine {
                 true => Some(SenseHead::load(&dir.join("usage/head"), Device::Cpu)?),
                 false => None,
             },
+            syntax: match dir.join("syntax/parser_head.json").exists() {
+                true => Some(crate::syntax::SyntaxModel::load(&dir.join("syntax"))?),
+                false => None,
+            },
             lexicon,
             sense_margin: SENSE_MARGIN,
             head_margin: HEAD_MARGIN,
@@ -170,18 +177,22 @@ impl Engine {
         let upos = self.upos.tag(&words, Some(&self.lexicon));
         let xpos = self.xpos.tag(&words, Some(&self.lexicon));
         let arcs = self.parser.parse(&words, &upos);
+        let (upos, arcs): (Vec<String>, _) = match self.syntax.as_ref().and_then(|m| m.refine(&words, &upos, &arcs).ok()) {
+            Some(refined) => refined,
+            None => (upos.iter().map(|t| t.to_string()).collect(), arcs),
+        };
         let mut out: Vec<Token> = words
             .iter()
             .enumerate()
             .map(|(i, w)| {
-                let lemma = match Pos::from_upos(upos[i]) {
+                let lemma = match Pos::from_upos(&upos[i]) {
                     Some(p) if upos[i] != "PROPN" => self.lexicon.lemmatize(w, Some(p)).into_iter().next(),
                     _ => None,
                 }
                 .unwrap_or_else(|| clitic_lemma(w));
                 Token {
                     form: w.to_string(),
-                    upos: upos[i].to_string(),
+                    upos: upos[i].clone(),
                     xpos: xpos[i].to_string(),
                     lemma,
                     head: arcs[i].head.checked_sub(1),

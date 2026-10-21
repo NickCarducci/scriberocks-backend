@@ -18,6 +18,7 @@ pub mod parser;
 pub mod punctuate;
 pub mod roles;
 pub mod semcor;
+pub mod syntax;
 pub mod tagger;
 pub mod text;
 pub mod usage;

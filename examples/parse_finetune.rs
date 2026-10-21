@@ -10,6 +10,13 @@
 //! of every word as head of every other (argmax head per word). Labels: an MLP
 //! over the dependent and its head. LAS counts base relations (before ':'),
 //! as the shipped parser's evaluation does. Nothing is saved.
+//!
+//! --stack: also give it the shipped parser's choices (jackknifed on train):
+//! a learned bonus on each word's prior head, and the prior relation as a
+//! label input. Batches group sentences of similar length.
+//!
+//! Each epoch prints dev and test; the best epoch by dev is saved to
+//! models/syntax-<usage>[-stacked]/ (usage model + parser_head.safetensors/.json).
 use candle_core::{DType, Device, Tensor, D};
 use candle_nn::{embedding, linear, AdamW, Embedding, Linear, Module, Optimizer, ParamsAdamW, VarBuilder, VarMap};
 use scribe::conllu::{self, Sentence};
@@ -90,10 +97,18 @@ struct Model {
     lab_dep: Linear,
     lab_head: Linear,
     lab_out: Linear,
+    /// Learned weight on "the shipped parser chose this head".
+    prior_bonus: Tensor,
+    /// UPOS tagging head (multi-task: tagging and parsing share the encoder).
+    tag_hidden: Linear,
+    tag_out: Linear,
 }
 
+/// The shipped parser's choice per word: (head, relation index).
+type Prior = Vec<(usize, u32)>;
+
 impl Model {
-    fn new(vb: VarBuilder, input: usize, labels: usize) -> candle_core::Result<Model> {
+    fn new(vb: VarBuilder, input: usize, labels: usize, tags: usize, stack: bool) -> candle_core::Result<Model> {
         Ok(Model {
             chars: embedding(CHAR_BUCKETS, CHAR_DIM, vb.pp("chars"))?,
             root: vb.get_with_hints((1, input), "root", candle_nn::Init::Randn { mean: 0.0, stdev: 0.02 })?,
@@ -103,9 +118,17 @@ impl Model {
             arc_bias: linear(ARC, 1, vb.pp("arc_bias"))?,
             lab_dep: linear(input, LAB, vb.pp("lab_dep"))?,
             lab_head: linear(input, LAB, vb.pp("lab_head"))?,
-            lab_out: linear(3 * LAB, labels, vb.pp("lab_out"))?,
+            lab_out: linear(3 * LAB + if stack { labels } else { 0 }, labels, vb.pp("lab_out"))?,
+            prior_bonus: vb.get_with_hints(1, "prior_bonus", candle_nn::Init::Const(if stack { 1.0 } else { 0.0 }))?,
+            tag_hidden: linear(input, 256, vb.pp("tag_hidden"))?,
+            tag_out: linear(256, tags, vb.pp("tag_out"))?,
         })
     }
+}
+
+fn tag_logits(m: &Model, xs: &[Tensor]) -> candle_core::Result<Tensor> {
+    let x = Tensor::cat(xs, 0)?;
+    m.tag_out.forward(&m.tag_hidden.forward(&x)?.relu()?)
 }
 
 /// Word matrices [n, input] for a batch of sentences, from one encoder pass over all their windows.
@@ -145,28 +168,67 @@ fn word_vectors(enc: &UsageModel, m: &Model, batch: &[(&Sentence, &Prepared, &Ve
     Ok(out)
 }
 
-/// Arc scores [n, n+1] (dependent × head, head 0 = root) and the head/dep label projections.
-fn scores(m: &Model, x: &Tensor) -> candle_core::Result<(Tensor, Tensor, Tensor)> {
-    let with_root = Tensor::cat(&[m.root.clone(), x.clone()], 0)?; // [n+1, input]
-    let dep = m.arc_dep.forward(x)?.relu()?; // [n, ARC]
-    let head = m.arc_head.forward(&with_root)?.relu()?; // [n+1, ARC]
-    let bil = dep.matmul(&m.arc_u)?.matmul(&head.t()?)?; // [n, n+1]
-    let bias = m.arc_bias.forward(&head)?.t()?; // [1, n+1]
-    let arcs = bil.broadcast_add(&bias)?;
-    let ld = m.lab_dep.forward(x)?.relu()?; // [n, LAB]
-    let lh = m.lab_head.forward(&with_root)?.relu()?; // [n+1, LAB]
-    Ok((arcs, ld, lh))
+/// Batched scoring. `xs`: word matrices [n_i, input]. Returns arc scores
+/// [b, L, L+1] (dependent × head, head 0 = root; padded heads masked to -1e9)
+/// and the label projections [b, L, LAB] (dependents) / [b, L+1, LAB] (heads).
+fn scores(m: &Model, xs: &[Tensor], priors: Option<&[&Prior]>, dev: &Device) -> candle_core::Result<(Tensor, Tensor, Tensor, usize)> {
+    let b = xs.len();
+    let l = xs.iter().map(|x| x.dim(0).unwrap()).max().unwrap_or(1);
+    let input = xs[0].dim(1)?;
+    let mut padded = Vec::with_capacity(b);
+    let mut mask = vec![0f32; b * (l + 1)];
+    for (i, x) in xs.iter().enumerate() {
+        let n = x.dim(0)?;
+        let rows = Tensor::cat(&[m.root.clone(), x.clone()], 0)?;
+        let rows = if n < l { Tensor::cat(&[rows, Tensor::zeros((l - n, input), DType::F32, dev)?], 0)? } else { rows };
+        padded.push(rows);
+        for j in n + 1..=l { mask[i * (l + 1) + j] = -1e9 }
+    }
+    let with_root = Tensor::stack(&padded, 0)?; // [b, L+1, input]
+    let words = with_root.narrow(1, 1, l)?; // [b, L, input]
+    let dep = m.arc_dep.forward(&words)?.relu()?; // [b, L, ARC]
+    let head = m.arc_head.forward(&with_root)?.relu()?; // [b, L+1, ARC]
+    let bil = dep.broadcast_matmul(&m.arc_u)?.matmul(&head.transpose(1, 2)?.contiguous()?)?; // [b, L, L+1]
+    let bias = m.arc_bias.forward(&head)?.transpose(1, 2)?; // [b, 1, L+1]
+    let mut arcs = bil.broadcast_add(&bias)?.broadcast_add(&Tensor::from_vec(mask, (b, 1, l + 1), dev)?)?;
+    if let Some(priors) = priors {
+        let mut ind = vec![0f32; b * l * (l + 1)];
+        for (si, p) in priors.iter().enumerate() {
+            for (k, &(h, _)) in p.iter().enumerate() { ind[si * l * (l + 1) + k * (l + 1) + h] = 1.0 }
+        }
+        let ind = Tensor::from_vec(ind, (b, l, l + 1), dev)?;
+        arcs = (arcs + ind.broadcast_mul(&m.prior_bonus.reshape((1, 1, 1))?)?)?;
+    }
+    let ld = m.lab_dep.forward(&words)?.relu()?;
+    let lh = m.lab_head.forward(&with_root)?.relu()?;
+    Ok((arcs, ld, lh, l))
 }
 
-fn label_logits(m: &Model, ld: &Tensor, lh: &Tensor, heads: &[u32], dev: &Device) -> candle_core::Result<Tensor> {
-    let h = lh.index_select(&Tensor::new(heads, dev)?, 0)?;
-    m.lab_out.forward(&Tensor::cat(&[ld.clone(), h.clone(), (ld * &h)?], 1)?)
+/// Label logits for (sentence, dependent, head) triples.
+fn label_logits(m: &Model, ld: &Tensor, lh: &Tensor, triples: &[(usize, usize, usize)], l: usize, prior_labels: Option<(&[u32], usize)>, dev: &Device) -> candle_core::Result<Tensor> {
+    let lab = ld.dim(2)?;
+    let ld = ld.reshape((ld.dim(0)? * l, lab))?;
+    let lh = lh.reshape((lh.dim(0)? * (l + 1), lab))?;
+    let di: Vec<u32> = triples.iter().map(|&(s, d, _)| (s * l + d) as u32).collect();
+    let hi: Vec<u32> = triples.iter().map(|&(s, _, h)| (s * (l + 1) + h) as u32).collect();
+    let d = ld.index_select(&Tensor::new(di.as_slice(), dev)?, 0)?;
+    let h = lh.index_select(&Tensor::new(hi.as_slice(), dev)?, 0)?;
+    let mut parts = vec![d.clone(), h.clone(), (d * &h)?];
+    if let Some((pl, n)) = prior_labels {
+        let mut one = vec![0f32; pl.len() * n];
+        for (k, &l) in pl.iter().enumerate() { one[k * n + l as usize] = 1.0 }
+        parts.push(Tensor::from_vec(one, (pl.len(), n), dev)?);
+    }
+    m.lab_out.forward(&Tensor::cat(&parts, 1)?)
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().collect();
     let usage_name = args.get(1).cloned().unwrap_or_else(|| "usage-morph".into());
+    // Tagging + parsing in one model: saved as models/syntax-<usage>[-stacked]/.
     let epochs: usize = args.get(2).and_then(|e| e.parse().ok()).unwrap_or(5);
+    let stack = args.iter().any(|a| a == "--stack");
+    let enc_lr: f64 = args.iter().position(|a| a == "--enc-lr").and_then(|i| args.get(i + 1)).and_then(|v| v.parse().ok()).unwrap_or(5e-5);
     #[cfg(feature = "metal")]
     let dev = Device::new_metal(0)?;
     #[cfg(not(feature = "metal"))]
@@ -210,65 +272,131 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     labels.dedup();
     let li = |l: &str| labels.iter().position(|x| x == base(l)).unwrap_or(0) as u32;
 
+    // Shipped-parser choices: shipped models on dev/test; jackknifed on train
+    // (parsers trained on 4/5 with jackknifed tags, parsing the held-out fifth).
+    let tag_strings = |g: &Vec<usize>| -> Vec<String> { g.iter().map(|&i| upos[i].clone()).collect() };
+    let parse_with = |p: &Parser, s: &Sentence, g: &Vec<usize>| -> Prior {
+        let words: Vec<&str> = s.iter().map(|t| t.form.as_str()).collect();
+        let tags = tag_strings(g);
+        let refs: Vec<&str> = tags.iter().map(String::as_str).collect();
+        p.parse(&words, &refs).into_iter().map(|a| (a.head.min(s.len()), li(&a.label))).collect()
+    };
+    let (dev_prior, test_prior, train_prior): (Vec<Prior>, Vec<Prior>, Vec<Prior>) = if stack {
+        let dp = devset.iter().zip(&dev_g).map(|(s, g)| parse_with(&shipped_parser, s, g)).collect();
+        let tp = test.iter().zip(&test_g).map(|(s, g)| parse_with(&shipped_parser, s, g)).collect();
+        let mut trp: Vec<Prior> = vec![Vec::new(); train.len()];
+        for fold in 0..5 {
+            let rest: Vec<usize> = (0..train.len()).filter(|i| i % 5 != fold).collect();
+            let sents: Vec<Sentence> = rest.iter().map(|&i| train[i].clone()).collect();
+            let tags: Vec<Vec<String>> = rest.iter().map(|&i| tag_strings(&train_g[i])).collect();
+            let p = Parser::train(&sents, &tags, 12);
+            for i in (0..train.len()).filter(|i| i % 5 == fold) { trp[i] = parse_with(&p, &train[i], &train_g[i]) }
+            eprintln!("  jackknifed parser fold {} done", fold + 1);
+        }
+        (dp, tp, trp)
+    } else {
+        (vec![Vec::new(); devset.len()], vec![Vec::new(); test.len()], vec![Vec::new(); train.len()])
+    };
+
     let enc = UsageModel::load(&Path::new("models").join(&usage_name), dev.clone())?;
     let prep = |set: &[Sentence]| set.iter().map(|s| prepare(&enc, s)).collect::<Vec<_>>();
     let (tr_p, dev_p, te_p) = (prep(&train), prep(&devset), prep(&test));
     let input = enc.config.dim + CHAR_DIM + upos.len();
     let heads_map = VarMap::new();
-    let m = Model::new(VarBuilder::from_varmap(&heads_map, DType::F32, &dev), input, labels.len())?;
-    let mut enc_opt = AdamW::new(enc.trainable_vars(), ParamsAdamW { lr: 5e-5, weight_decay: 0.01, ..Default::default() })?;
+    let m = Model::new(VarBuilder::from_varmap(&heads_map, DType::F32, &dev), input, labels.len(), upos.len(), stack)?;
+    let mut enc_opt = AdamW::new(enc.trainable_vars(), ParamsAdamW { lr: enc_lr, weight_decay: 0.01, ..Default::default() })?;
     let mut head_opt = AdamW::new(heads_map.all_vars(), ParamsAdamW { lr: 1e-3, weight_decay: 1e-4, ..Default::default() })?;
 
-    let evaluate = |set: &[Sentence], p: &[Prepared], g: &[Vec<usize>]| -> candle_core::Result<(f64, f64)> {
-        let (mut uas, mut las, mut n) = (0usize, 0usize, 0usize);
+    let evaluate = |set: &[Sentence], p: &[Prepared], g: &[Vec<usize>], prior: &[Prior]| -> candle_core::Result<(f64, f64, f64)> {
+        let (mut uas, mut las, mut n, mut tags_right) = (0usize, 0usize, 0usize, 0usize);
         let idx: Vec<usize> = (0..set.len()).collect();
         for chunk in idx.chunks(32) {
             let batch: Vec<_> = chunk.iter().map(|&i| (&set[i], &p[i], &g[i])).collect();
-            for ((s, _, _), x) in batch.iter().zip(word_vectors(&enc, &m, &batch, upos.len(), &dev)?) {
-                let (arcs, ld, lh) = scores(&m, &x)?;
-                let heads = arcs.argmax(D::Minus1)?.to_vec1::<u32>()?;
-                let labs = label_logits(&m, &ld, &lh, &heads, &dev)?.argmax(D::Minus1)?.to_vec1::<u32>()?;
+            let xs = word_vectors(&enc, &m, &batch, upos.len(), &dev)?;
+            let tag_pred = tag_logits(&m, &xs)?.argmax(D::Minus1)?.to_vec1::<u32>()?;
+            let gold_tags: Vec<u32> = batch.iter().flat_map(|(s, _, _)| s.iter().map(|t| ti(&t.upos) as u32)).collect();
+            tags_right += tag_pred.iter().zip(&gold_tags).filter(|(a, b)| a == b).count();
+            let pr: Vec<&Prior> = chunk.iter().map(|&i| &prior[i]).collect();
+            let (arcs, ld, lh, l) = scores(&m, &xs, stack.then_some(&pr[..]), &dev)?;
+            let heads = arcs.argmax(D::Minus1)?.to_vec2::<u32>()?;
+            let plabels: Vec<u32> = if stack { chunk.iter().flat_map(|&i| prior[i].iter().map(|&(_, l)| l)).collect() } else { Vec::new() };
+            let mut triples = Vec::new();
+            for (si, (s, _, _)) in batch.iter().enumerate() {
+                for k in 0..s.len() { triples.push((si, k, heads[si][k] as usize)) }
+            }
+            let labs = label_logits(&m, &ld, &lh, &triples, l, stack.then_some((&plabels[..], labels.len())), &dev)?.argmax(D::Minus1)?.to_vec1::<u32>()?;
+            let mut t_i = 0;
+            for (si, (s, _, _)) in batch.iter().enumerate() {
                 for (k, t) in s.iter().enumerate() {
-                    if heads[k] as usize == t.head {
+                    if heads[si][k] as usize == t.head {
                         uas += 1;
-                        las += (labs[k] == li(&t.deprel)) as usize;
+                        las += (labs[t_i] == li(&t.deprel)) as usize;
                     }
+                    t_i += 1;
                     n += 1;
                 }
             }
         }
-        Ok((100.0 * uas as f64 / n as f64, 100.0 * las as f64 / n as f64))
+        Ok((100.0 * uas as f64 / n as f64, 100.0 * las as f64 / n as f64, 100.0 * tags_right as f64 / n as f64))
     };
 
     let mut order: Vec<usize> = (0..train.len()).collect();
     let mut rng = 0x2545F4914F6CDD1Du64;
+    let mut next = move |n: usize| { rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17; (rng % n as u64) as usize };
+    let mut best = f64::MIN;
     for epoch in 0..epochs {
-        for i in (1..order.len()).rev() {
-            rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17;
-            order.swap(i, (rng % (i as u64 + 1)) as usize);
+        for i in (1..order.len()).rev() { order.swap(i, next(i + 1)) }
+        // Length buckets: sort within pools of 50 batches, then shuffle the batches.
+        let mut batches: Vec<Vec<usize>> = Vec::new();
+        for pool in order.chunks(32 * 50) {
+            let mut pool = pool.to_vec();
+            pool.sort_by_key(|&i| train[i].len());
+            batches.extend(pool.chunks(32).map(|c| c.to_vec()));
         }
+        for i in (1..batches.len()).rev() { batches.swap(i, next(i + 1)) }
         let t0 = std::time::Instant::now();
-        for chunk in order.chunks(16) {
+        for chunk in &batches {
             let batch: Vec<_> = chunk.iter().map(|&i| (&train[i], &tr_p[i], &train_g[i])).collect();
             let xs = word_vectors(&enc, &m, &batch, upos.len(), &dev)?;
-            let mut losses = Vec::new();
-            for ((s, _, _), x) in batch.iter().zip(xs) {
-                let (arcs, ld, lh) = scores(&m, &x)?;
-                let gold_heads: Vec<u32> = s.iter().map(|t| t.head as u32).collect();
-                let gold_labels: Vec<u32> = s.iter().map(|t| li(&t.deprel)).collect();
-                let arc_loss = candle_nn::loss::cross_entropy(&arcs, &Tensor::new(gold_heads.as_slice(), &dev)?)?;
-                let lab_loss = candle_nn::loss::cross_entropy(&label_logits(&m, &ld, &lh, &gold_heads, &dev)?, &Tensor::new(gold_labels.as_slice(), &dev)?)?;
-                losses.push((arc_loss + lab_loss)?);
+            let pr: Vec<&Prior> = chunk.iter().map(|&i| &train_prior[i]).collect();
+            let (arcs, ld, lh, l) = scores(&m, &xs, stack.then_some(&pr[..]), &dev)?;
+            let plabels: Vec<u32> = if stack { chunk.iter().flat_map(|&i| train_prior[i].iter().map(|&(_, l)| l)).collect() } else { Vec::new() };
+            // Real words only: rows of the flattened [b*L, L+1] arc scores.
+            let (mut rows, mut gold_heads, mut triples, mut gold_labels) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+            for (si, (s, _, _)) in batch.iter().enumerate() {
+                for (k, t) in s.iter().enumerate() {
+                    rows.push((si * l + k) as u32);
+                    gold_heads.push(t.head as u32);
+                    triples.push((si, k, t.head));
+                    gold_labels.push(li(&t.deprel));
+                }
             }
-            let loss = (Tensor::stack(&losses, 0)?.sum_all()? / losses.len() as f64)?;
+            let flat = arcs.reshape((batch.len() * l, l + 1))?.index_select(&Tensor::new(rows.as_slice(), &dev)?, 0)?;
+            let arc_loss = candle_nn::loss::cross_entropy(&flat, &Tensor::new(gold_heads.as_slice(), &dev)?)?;
+            let lab_loss = candle_nn::loss::cross_entropy(&label_logits(&m, &ld, &lh, &triples, l, stack.then_some((&plabels[..], labels.len())), &dev)?, &Tensor::new(gold_labels.as_slice(), &dev)?)?;
+            let gold_tags: Vec<u32> = batch.iter().flat_map(|(s, _, _)| s.iter().map(|t| ti(&t.upos) as u32)).collect();
+            let tag_loss = candle_nn::loss::cross_entropy(&tag_logits(&m, &xs)?, &Tensor::new(gold_tags.as_slice(), &dev)?)?;
+            let loss = ((arc_loss + lab_loss)? + tag_loss)?;
             let grads = loss.backward()?;
             enc_opt.step(&grads)?;
             head_opt.step(&grads)?;
         }
-        let (u, l) = evaluate(&devset, &dev_p, &dev_g)?;
-        println!("epoch {}: dev UAS {u:.2}% LAS {l:.2}% ({:.0?})", epoch + 1, t0.elapsed());
+        let train_time = t0.elapsed();
+        let (u, l, tg) = evaluate(&devset, &dev_p, &dev_g, &dev_prior)?;
+        let (tu, tl, ttg) = evaluate(&test, &te_p, &test_g, &test_prior)?;
+        let better = u + l + tg > best;
+        println!("epoch {}: dev UAS {u:.2}% LAS {l:.2}% UPOS {tg:.2}%  test UAS {tu:.2}% LAS {tl:.2}% UPOS {ttg:.2}%  (train {train_time:.0?}, total {:.0?}){}",
+                 epoch + 1, t0.elapsed(), if better { "  saved" } else { "" });
+        if better {
+            // The best epoch by dev score: fine-tuned usage model + parser head + label/tag lists.
+            best = u + l + tg;
+            let out = Path::new("models").join(format!("syntax-{usage_name}{}", if stack { "-stacked" } else { "" }));
+            enc.save(&out)?;
+            heads_map.save(out.join("parser_head.safetensors"))?;
+            let meta = serde_json::json!({ "labels": labels, "upos": upos, "stack": stack, "epoch": epoch + 1,
+                "dev": { "uas": u, "las": l, "upos": tg }, "test": { "uas": tu, "las": tl, "upos": ttg } });
+            std::fs::write(out.join("parser_head.json"), serde_json::to_vec_pretty(&meta)?)?;
+        }
     }
-    let (u, l) = evaluate(&test, &te_p, &test_g)?;
-    println!("biaffine ({usage_name}): test UAS {u:.2}% LAS {l:.2}%");
     Ok(())
 }
