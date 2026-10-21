@@ -12,7 +12,7 @@
 //! GPT-3 F@10 34.6; BERT F@10 31.7 / GAP 56.9; thesaurus alone F@10 12.0.
 //! Data: data/swords/swords-v1.1_{dev,test}.json from github.com/p-lambda/swords.
 //! LM=bert (BERT_DIR=models/bert-mini-usage[-dictionary] for the adapted ones) or USAGE=<models dir> swaps the language model; POS=ADJ|NOUN|VERB|ADV
-//! and LIMIT=n score a subset (quick pilots).
+//! and LIMIT=n score a subset (quick pilots). PROPOSER=bert: BERT-mini proposes, the LM above judges.
 //!
 //! The judge combines fit (the usage model's log-probability of the
 //! candidate in the masked slot) with closeness to the original word, as
@@ -115,7 +115,12 @@ impl Lm for scribe::bert::Bert {
 }
 
 static LM: std::sync::OnceLock<Box<dyn Lm>> = std::sync::OnceLock::new();
+/// The judge (and the default proposer).
 fn lm() -> &'static dyn Lm { LM.get().expect("language model loaded").as_ref() }
+/// PROPOSER=bert (BERT-mini, raw) proposes while LM/USAGE judges: a broad
+/// casual source narrowed by the standards judge.
+static PROPOSER: std::sync::OnceLock<Box<dyn Lm>> = std::sync::OnceLock::new();
+fn proposer() -> &'static dyn Lm { PROPOSER.get().map(|b| b.as_ref()).unwrap_or_else(lm) }
 
 /// Lemmas ordered by the usage model's fit in the slot (inflected like the word), best first, with scores.
 fn judged(e: &Engine, words: &[String], at: usize, xpos: &str, upos: &str, lemmas: &[String]) -> Vec<(String, f32)> {
@@ -214,6 +219,10 @@ fn main() {
         _ => Box::new(scribe::usage::model::UsageModel::load(Path::new("models/usage"), scribe::usage::model::Device::Cpu).unwrap()),
     };
     let _ = LM.set(model);
+    if std::env::var("PROPOSER").as_deref() == Ok("bert") {
+        eprintln!("proposer: BERT-mini (data/bert-mini)");
+        let _ = PROPOSER.set(Box::new(scribe::bert::Bert::load(Path::new("data/bert-mini"), scribe::usage::model::Device::Cpu).unwrap()));
+    }
     let targets = load(&split);
     eprintln!("SWORDS {split}: {} targets", targets.len());
 
@@ -309,7 +318,7 @@ fn main() {
         // Generated: the usage model's own top words for the slot, as lemmas
         // usable in the word's part of speech.
         let generated_by = |mode: u8, k: usize| -> Vec<String> {
-            let (u, Some(p)) = (lm(), Pos::from_upos(&tok.upos)) else { return vec![] };
+            let (u, Some(p)) = (proposer(), Pos::from_upos(&tok.upos)) else { return vec![] };
             let lower: Vec<String> = t.words.iter().map(|w| w.to_lowercase()).collect();
             let all = |visible: bool| -> HashMap<String, f32> { u.top(&lower, t.at, usize::MAX, visible).into_iter().collect() };
             let mut scored: Vec<(String, f32)> = match mode {

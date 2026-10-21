@@ -55,6 +55,14 @@ impl Bert {
         Ok((bert, vars))
     }
 
+    /// A fresh, randomly initialized model with `dir`'s config.json and
+    /// vocab.txt (training from scratch); weights in the returned VarMap.
+    pub fn new_random(dir: &Path, device: Device) -> std::result::Result<(Bert, VarMap), Box<dyn std::error::Error>> {
+        let vars = VarMap::new();
+        let bert = Bert::build(dir, VarBuilder::from_varmap(&vars, DType::F32, &device), device)?;
+        Ok((bert, vars))
+    }
+
     fn build(dir: &Path, vb: VarBuilder, device: Device) -> std::result::Result<Bert, Box<dyn std::error::Error>> {
         let config: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(dir.join("config.json"))?)?;
         let n = |k: &str| config[k].as_u64().unwrap_or(0) as usize;

@@ -20,11 +20,13 @@ pub mod parser;
 pub mod punctuate;
 pub mod roles;
 pub mod semcor;
+pub mod slm_train;
 pub mod syntax;
 pub mod tagger;
 pub mod text;
 pub mod usage;
 pub mod variants;
+pub mod wordpiece;
 pub mod wsd;
 
 pub use engine::Engine;
