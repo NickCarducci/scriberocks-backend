@@ -13,6 +13,7 @@ pub mod frames;
 pub mod inflect;
 pub mod kgram;
 pub mod lexicon;
+pub mod lexsub;
 pub mod lm;
 pub mod parser;
 pub mod punctuate;
