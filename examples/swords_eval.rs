@@ -207,9 +207,12 @@ fn main() {
             hyponyms.entry(h).or_default().push(i as u32);
         }
     }
-    let sources = ["chosen meaning: synonyms", "  + more general", "  + more specific", "  + sisters", "every meaning: synonyms", "every meaning: all four"];
+    let sources = ["chosen meaning: synonyms", "  + more general", "  + more specific", "  + sisters", "every meaning: synonyms", "every meaning: all four",
+                   "model, word hidden (top 50)", "model, word visible (top 50)", "model, both combined (top 50)", "dictionary (chosen+3) + model (top 20)"];
     // Per source: (perfect-judge top 10, new-judge top 10), and list sizes.
-    let mut widened: Vec<(Vec<(HashSet<String>, Vec<String>)>, Vec<(HashSet<String>, Vec<String>)>)> = vec![(Vec::new(), Vec::new()); sources.len()];
+    // Per source: perfect judge, new judge, and the proposer's own order.
+    type Lists = Vec<(HashSet<String>, Vec<String>)>;
+    let mut widened: Vec<(Lists, Lists, Lists, Lists)> = vec![(Vec::new(), Vec::new(), Vec::new(), Vec::new()); sources.len()];
     let mut sizes = vec![0usize; sources.len()];
     let (mut pos_right, mut with_sense) = (0usize, 0usize);
     for (n, t) in targets.iter().enumerate() {
@@ -259,13 +262,43 @@ fn main() {
         let (up, down, sis) = related(&e, &hyponyms, &chosen);
         let (eup, edown, esis) = related(&e, &hyponyms, &every);
         let cat = |parts: &[&[u32]]| -> Vec<u32> { parts.concat() };
-        let lists: [Vec<String>; 6] = [
+        // Generated: the usage model's own top words for the slot, as lemmas
+        // usable in the word's part of speech.
+        let generated_by = |mode: u8, k: usize| -> Vec<String> {
+            let (Some(u), Some(p)) = (e.usage.as_ref(), Pos::from_upos(&tok.upos)) else { return vec![] };
+            let lower: Vec<String> = t.words.iter().map(|w| w.to_lowercase()).collect();
+            let all = |visible: bool| -> HashMap<String, f32> { u.predict(&lower, t.at, usize::MAX, visible).unwrap_or_default().into_iter().collect() };
+            let mut scored: Vec<(String, f32)> = match mode {
+                0 => all(false).into_iter().collect(),
+                1 => all(true).into_iter().collect(),
+                _ => { let v = all(true); all(false).into_iter().map(|(w, s)| { let x = v.get(&w).copied().unwrap_or(-30.0); (w, s + x) }).collect() }
+            };
+            scored.sort_by(|a, b| b.1.total_cmp(&a.1));
+            let mut seen = HashSet::new();
+            let mut out = Vec::new();
+            for (form, _) in scored {
+                if out.len() == k { break }
+                let Some(l) = e.lexicon.lemmatize(&form, Some(p)).into_iter().next() else { continue };
+                let l = l.to_lowercase();
+                if l != lemma && !e.lexicon.senses(&l, p).is_empty() && seen.insert(l.clone()) { out.push(l) }
+            }
+            out
+        };
+        let dictionary = members(&e, &cat(&[&chosen, &up, &down]), adj, &lemma);
+        let mut hybrid = dictionary.clone();
+        hybrid.truncate(MAX_PROPOSALS);
+        for w in generated_by(2, 20) { if !hybrid.contains(&w) { hybrid.push(w) } }
+        let lists: [Vec<String>; 10] = [
             members(&e, &chosen, adj, &lemma),
             members(&e, &cat(&[&chosen, &up]), adj, &lemma),
             members(&e, &cat(&[&chosen, &up, &down]), adj, &lemma),
             members(&e, &cat(&[&chosen, &up, &down, &sis]), adj, &lemma),
             members(&e, &every, adj, &lemma),
             members(&e, &cat(&[&every, &eup, &edown, &esis]), adj, &lemma),
+            generated_by(0, 50),
+            generated_by(1, 50),
+            generated_by(2, 50),
+            hybrid,
         ];
         let weight: HashMap<&str, f64> = rated.iter().map(|(s, w)| (s.as_str(), *w)).collect();
         for (k, mut list) in lists.into_iter().enumerate() {
@@ -275,6 +308,8 @@ fn main() {
             perfect.sort_by(|a, b| weight.get(b.as_str()).unwrap_or(&-1.0).total_cmp(weight.get(a.as_str()).unwrap_or(&-1.0)));
             widened[k].0.push((accepted.clone(), lenient(perfect.into_iter().take(10).collect())));
             widened[k].1.push((accepted.clone(), lenient(judge(&list, 10))));
+            widened[k].2.push((accepted.clone(), lenient(list.iter().take(10).cloned().collect())));
+            widened[k].3.push((accepted.clone(), list.iter().take(10).cloned().collect()));
         }
     }
     let mean = |v: &[f64]| 100.0 * v.iter().sum::<f64>() / v.len().max(1) as f64;
@@ -291,6 +326,7 @@ fn main() {
     for (k, name) in sources.iter().enumerate() {
         let (_, _, ceiling) = pr_at_k(&widened[k].0, 10);
         let (p, r, f) = pr_at_k(&widened[k].1, 10);
-        println!("  {name:<28} {:>6.1} words   ceiling {ceiling:.1}   judged {f:.1} (P {p:.1}, R {r:.1})", sizes[k] as f64 / n);
+        let (rp, rr, rf) = pr_at_k(&widened[k].2, 10);
+        println!("  {name:<38} {:>6.1} words   ceiling {ceiling:.1}   judged {f:.1} (P {p:.1}, R {r:.1})   as proposed {rf:.1} (P {rp:.1}, R {rr:.1}), strict {:.1}", sizes[k] as f64 / n, pr_at_k(&widened[k].3, 10).2);
     }
 }

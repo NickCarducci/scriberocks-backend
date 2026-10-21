@@ -140,6 +140,8 @@ impl Encoder {
     }
 }
 
+const SPECIALS_LEN: usize = crate::usage::vocab::SPECIALS.len();
+
 pub struct UsageModel {
     pub vocab: Vocab,
     pub config: Config,
@@ -373,6 +375,29 @@ impl UsageModel {
         (ids, base)
     }
 
+    /// The `k` most likely whole words for `position`, best first, with
+    /// log-probabilities. `visible` keeps the original word in the input
+    /// (proposals stay near it, as BERT-based substitution does); otherwise
+    /// the slot is masked (proposals fit the context only). Special tokens
+    /// and pieces that aren't words (no letter) are skipped.
+    pub fn predict(&self, words: &[String], position: usize, k: usize, visible: bool) -> Result<Vec<(String, f32)>> {
+        let (mut seq, base) = self.pieces(words);
+        let Some(&slot) = base.get(position) else { return Ok(vec![]) };
+        if !visible {
+            seq[slot] = "[MASK]".to_string();
+        }
+        let ids: Vec<u32> = self.vocab.encode(&seq).into_iter().take(self.config.max_len).collect();
+        if slot >= ids.len() {
+            return Ok(vec![]);
+        }
+        let n = ids.len();
+        let hidden = self.encoder.hidden(&Tensor::from_vec(ids, (1, n), &self.device)?)?.squeeze(0)?;
+        let lp = candle_nn::ops::log_softmax(&self.encoder.logits(&hidden.narrow(0, slot, 1)?)?, D::Minus1)?.squeeze(0)?.to_vec1::<f32>()?;
+        let mut order: Vec<usize> = (SPECIALS_LEN..lp.len()).filter(|&i| self.vocab.word(i as u32).chars().any(char::is_alphabetic)).collect();
+        order.sort_by(|&a, &b| lp[b].total_cmp(&lp[a]));
+        Ok(order.into_iter().take(k).map(|i| (self.vocab.word(i as u32).to_string(), lp[i])).collect())
+    }
+
     /// Log-probability of each candidate filling `position` in `words`.
     /// A multiword candidate (or one split into base + ending) fills that
     /// many masked slots and scores the sum — the whole phrase's probability;
@@ -514,6 +539,19 @@ mod tests {
 
     fn words(s: &str) -> Vec<String> {
         s.split(' ').map(String::from).collect()
+    }
+
+    #[test]
+    fn predicts_words_for_a_slot_hidden_or_visible() {
+        let (model, _, _) = trained();
+        let top = model.predict(&words("the cat sat on the mat"), 5, 3, false).unwrap();
+        assert!(top.iter().any(|(w, _)| w == "mat"), "{top:?}");
+        assert!(top.iter().all(|(w, _)| !w.starts_with('[')), "no special tokens: {top:?}");
+        assert!(top.windows(2).all(|p| p[0].1 >= p[1].1), "best first");
+        // With the word visible the model leans toward it (BERT-style 80/10/10
+        // training leaves some words unmasked).
+        let score = |visible: bool| model.predict(&words("the cat sat on the rug"), 5, 100, visible).unwrap().into_iter().find(|(w, _)| w == "rug").unwrap().1;
+        assert!(score(true) > score(false), "visible {} vs hidden {}", score(true), score(false));
     }
 
     #[test]
