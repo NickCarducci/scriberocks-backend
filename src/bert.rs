@@ -57,9 +57,23 @@ impl Bert {
 
     /// A fresh, randomly initialized model with `dir`'s config.json and
     /// vocab.txt (training from scratch); weights in the returned VarMap.
+    /// Initialized as BERT is (weights normal with σ = 0.02, biases 0,
+    /// LayerNorm scale 1): with the library's defaults (σ = 1 embeddings) a
+    /// from-scratch model stalls at word frequencies.
     pub fn new_random(dir: &Path, device: Device) -> std::result::Result<(Bert, VarMap), Box<dyn std::error::Error>> {
         let vars = VarMap::new();
-        let bert = Bert::build(dir, VarBuilder::from_varmap(&vars, DType::F32, &device), device)?;
+        let bert = Bert::build(dir, VarBuilder::from_varmap(&vars, DType::F32, &device), device.clone())?;
+        for (name, var) in vars.data().lock().unwrap().iter() {
+            let shape = var.shape().clone();
+            let value = if name.contains("LayerNorm") {
+                if name.ends_with("bias") { Tensor::zeros(shape, DType::F32, &device)? } else { Tensor::ones(shape, DType::F32, &device)? }
+            } else if name.ends_with("bias") {
+                Tensor::zeros(shape, DType::F32, &device)?
+            } else {
+                Tensor::randn(0f32, 0.02, shape, &device)?
+            };
+            var.set(&value)?;
+        }
         Ok((bert, vars))
     }
 
@@ -308,6 +322,15 @@ mod tests {
         assert_eq!(m.word_pieces("unaffable").concat().replace("##", ""), "unaffable");
         let v = m.contextual_batch(&[words("the bank of the river"), words("a bank loan")]).unwrap();
         assert_eq!((v[0].len(), v[1].len(), v[0][0].len()), (5, 3, 256));
+        // A fresh model starts as BERT does: small weights, unit LayerNorm.
+        let (_, fresh) = Bert::new_random(dir, Device::Cpu).unwrap();
+        for (name, v) in fresh.data().lock().unwrap().iter() {
+            let t = v.as_tensor().flatten_all().unwrap();
+            let std = t.sqr().unwrap().mean_all().unwrap().to_scalar::<f32>().unwrap().sqrt();
+            if name.contains("LayerNorm") && name.ends_with("weight") { assert!((std - 1.0).abs() < 1e-5, "{name}") }
+            else if name.ends_with("bias") { assert!(std < 1e-6, "{name}") }
+            else { assert!((0.015..0.025).contains(&std), "{name}: {std}") }
+        }
         // The trainable copy computes the same thing.
         let (t, vars) = Bert::load_trainable(dir, Device::Cpu).unwrap();
         assert!(vars.all_vars().len() >= 70);
