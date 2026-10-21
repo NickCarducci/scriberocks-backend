@@ -172,6 +172,16 @@ impl Bert {
         self.encode(words).0
     }
 
+    /// Piece ids and the index of each word's first piece.
+    pub fn encode_words(&self, words: &[String]) -> (Vec<u32>, Vec<usize>) {
+        self.encode(words)
+    }
+
+    /// The id of a word that is a single vocabulary entry, if it is one.
+    pub fn single_piece(&self, word: &str) -> Option<u32> {
+        self.index.get(&word.to_lowercase()).copied()
+    }
+
     pub fn vocab_len(&self) -> usize {
         self.vocab.len()
     }

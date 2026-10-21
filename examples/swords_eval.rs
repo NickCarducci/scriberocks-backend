@@ -11,7 +11,7 @@
 //! are dropped first). Published (test): humans F@10 48.8 / GAP 66.2;
 //! GPT-3 F@10 34.6; BERT F@10 31.7 / GAP 56.9; thesaurus alone F@10 12.0.
 //! Data: data/swords/swords-v1.1_{dev,test}.json from github.com/p-lambda/swords.
-//! LM=bert or USAGE=<models dir> swaps the language model; POS=ADJ|NOUN|VERB|ADV
+//! LM=bert (BERT_DIR=models/scribe-slm for ScribeSLM) or USAGE=<models dir> swaps the language model; POS=ADJ|NOUN|VERB|ADV
 //! and LIMIT=n score a subset (quick pilots).
 //!
 //! The judge combines fit (the usage model's log-probability of the
@@ -205,7 +205,11 @@ fn main() {
     let split = std::env::args().nth(1).unwrap_or_else(|| "test".into());
     let e = Engine::load(Path::new("models")).unwrap();
     let model: Box<dyn Lm> = match (std::env::var("LM").as_deref(), std::env::var("USAGE")) {
-        (Ok("bert"), _) => Box::new(scribe::bert::Bert::load(Path::new("data/bert-mini"), scribe::usage::model::Device::Cpu).unwrap()),
+        (Ok("bert"), _) => {
+            let dir = std::env::var("BERT_DIR").unwrap_or_else(|_| "data/bert-mini".into());
+            eprintln!("language model: BERT-format model in {dir}");
+            Box::new(scribe::bert::Bert::load(Path::new(&dir), scribe::usage::model::Device::Cpu).unwrap())
+        }
         (_, Ok(dir)) => Box::new(scribe::usage::model::UsageModel::load(&Path::new("models").join(dir), scribe::usage::model::Device::Cpu).unwrap()),
         _ => Box::new(scribe::usage::model::UsageModel::load(Path::new("models/usage"), scribe::usage::model::Device::Cpu).unwrap()),
     };
