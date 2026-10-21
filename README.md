@@ -9,7 +9,7 @@ through UniFFI.
 | Lexicon | 127k lemmas, 107k senses, definitions, examples, 45 categories, irregular forms | Open English WordNet 2025 | — |
 | Tagger | averaged perceptron, dictionary features; UPOS and Penn (XPOS) | UD English EWT | UPOS 94.6%, XPOS 94.0% (test) |
 | Parser | arc-eager, dynamic oracle, jackknifed tags | UD English EWT | UAS 81.7%, LAS 77.5% (test, predicted tags) |
-| Usage model | 4-layer transformer (256-d, ~13M params) trained from scratch to fill in hidden words | 15.3M tokens of usage sentences only: 580k Wiktionary examples, WordNet examples, EWT | masked-word loss 3.80 after 40k steps (~100 min on M5 Pro GPU) |
+| Usage model | 4-layer transformer (256-d, 11.4M parameters; BERT-base has 110M) trained from scratch to fill in hidden words | 15.3M tokens of usage sentences only: 580k Wiktionary examples, WordNet examples, EWT | masked-word loss 3.80 after 40k steps (~100 min on M5 Pro GPU) |
 | Senses | sense head: scores each word's dictionary senses from the usage model's vector of its context, plus its category and dictionary rank; keeps the first-listed sense unless another wins by > 3.0 (`HEAD_MARGIN`). Without the head file, the earlier example-matching method (first-listed, overridden past a 0.5 cosine margin) | SemCor (all 37k sentences, 176k sense-tagged words) | 62.4% on the ALL test set of the Word Sense Disambiguation Evaluation Framework (first-listed sense: 55.6%) |
 | Inflection | spelling rules + irregulars | EWT + WordNet | unit-tested |
 | Fluency | interpolated Kneser–Ney trigram (scores, never generates), singletons pruned | usage sentences only (no definitions) | perplexity 618 on EWT test |
@@ -20,7 +20,7 @@ through UniFFI.
 
 Rules and dictionaries propose a closed set of edits; small trained models
 judge them. Nothing generates text freely, and nothing is a large language
-model: the one neural network (the usage model, ~13M parameters) only scores
+model: the one neural network (the usage model, 11.4M parameters) only scores
 options the rules proposed, and everything runs on the device.
 
 | Step | What it does | How |

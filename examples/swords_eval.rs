@@ -11,7 +11,13 @@
 //! are dropped first). Published (test): humans F@10 48.8 / GAP 66.2;
 //! GPT-3 F@10 34.6; BERT F@10 31.7 / GAP 56.9; thesaurus alone F@10 12.0.
 //! Data: data/swords/swords-v1.1_{dev,test}.json from github.com/p-lambda/swords.
-use scribe::engine::{SlotScorer, CONTENT};
+//!
+//! The judge combines fit (the usage model's log-probability of the
+//! candidate in the masked slot) with closeness to the original word, as
+//! BERT-based substitution does (Zhou et al. 2019): cosine between the
+//! original and the substituted sentence's vectors, word visible, at the slot
+//! and averaged over the other words. Weights are tuned on dev.
+use scribe::engine::CONTENT;
 use scribe::lexsub::{gap, pr_at_k};
 use scribe::{Engine, Pos};
 use std::collections::{HashMap, HashSet};
@@ -90,14 +96,99 @@ fn judged(e: &Engine, words: &[String], at: usize, xpos: &str, upos: &str, lemma
     out
 }
 
+fn cosine(a: &[f32], b: &[f32]) -> f32 {
+    let dot: f32 = a.iter().zip(b).map(|(x, y)| x * y).sum();
+    let norm = |v: &[f32]| v.iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-6);
+    dot / (norm(a) * norm(b))
+}
+
+/// Per candidate: (fit, closeness at the slot, closeness over the rest of the sentence).
+fn components(e: &Engine, words: &[String], at: usize, xpos: &str, upos: &str, lemmas: &[String]) -> Vec<(f32, f32, f32)> {
+    let (Some(u), Some(scorer)) = (e.usage.as_ref(), e.slot_scorer()) else { return vec![(0.0, 0.0, 0.0); lemmas.len()] };
+    if lemmas.is_empty() { return vec![] }
+    let lower: Vec<String> = words.iter().map(|w| w.to_lowercase()).collect();
+    let forms: Vec<String> = lemmas.iter().map(|l| if CONTENT.contains(&upos) { e.inflector.inflect(l, xpos) } else { l.clone() }.to_lowercase()).collect();
+    let fit = scorer.slot_scores(&lower, at, &forms).unwrap_or_else(|| vec![0.0; forms.len()]);
+    let mut sentences = vec![lower.clone()];
+    for f in &forms {
+        let mut s = lower.clone();
+        s.splice(at..at + 1, f.split(' ').map(String::from));
+        sentences.push(s);
+    }
+    let Ok(vectors) = u.contextual_batch(&sentences) else { return fit.into_iter().map(|f| (f, 0.0, 0.0)).collect() };
+    let original = &vectors[0];
+    forms.iter().enumerate().map(|(k, f)| {
+        let v = &vectors[k + 1];
+        let extra = f.split(' ').count() - 1;
+        let slot = match (original.get(at), v.get(at)) { (Some(a), Some(b)) => cosine(a, b), _ => 0.0 };
+        let others: Vec<f32> = (0..original.len()).filter(|&j| j != at).filter_map(|j| {
+            let j2 = if j > at { j + extra } else { j };
+            v.get(j2).map(|b| cosine(&original[j], b))
+        }).collect();
+        let rest = if others.is_empty() { 0.0 } else { others.iter().sum::<f32>() / others.len() as f32 };
+        (fit[k], slot, rest)
+    }).collect()
+}
+
+/// One target's rated candidates with their judge components, after our parse.
+struct Scored {
+    rated: Vec<(String, f64)>,
+    parts: Vec<(f32, f32, f32)>,
+}
+
+fn rank(sc: &Scored, w: (f32, f32)) -> Vec<String> {
+    let mut idx: Vec<usize> = (0..sc.rated.len()).collect();
+    let total = |i: usize| { let (f, a, b) = sc.parts[i]; f + w.0 * a + w.1 * b };
+    idx.sort_by(|&a, &b| total(b).total_cmp(&total(a)));
+    idx.into_iter().map(|i| sc.rated[i].0.clone()).collect()
+}
+
+fn ranking_set(e: &Engine, targets: &[Target]) -> Vec<Scored> {
+    targets.iter().map(|t| {
+        let parsed = e.parse_tokens(&t.words);
+        let tok = &parsed.tokens[t.at];
+        let lemma = tok.lemma.to_lowercase();
+        let rated: Vec<(String, f64)> = t.rated.iter().filter(|(s, _)| *s != lemma).cloned().collect();
+        let lemmas: Vec<String> = rated.iter().map(|(s, _)| s.clone()).collect();
+        let parts = components(e, &t.words, t.at, &tok.xpos, &tok.upos, &lemmas);
+        Scored { rated, parts }
+    }).collect()
+}
+
+const WEIGHTS: &[f32] = &[0.0, 5.0, 20.0, 50.0, 100.0, 200.0, 500.0, 1000.0];
+
 fn main() {
     let split = std::env::args().nth(1).unwrap_or_else(|| "test".into());
     let e = Engine::load(Path::new("models")).unwrap();
     let targets = load(&split);
     eprintln!("SWORDS {split}: {} targets", targets.len());
 
+    // Stage 7: tune the closeness weights on dev, score on this split.
+    eprintln!("judge components: dev, then {split}");
+    let dev = ranking_set(&e, &load("dev"));
+    let here = ranking_set(&e, &targets);
+    let mean_gap = |set: &[Scored], w: (f32, f32)| 100.0 * set.iter().map(|sc| gap(&sc.rated, &rank(sc, w))).sum::<f64>() / set.len().max(1) as f64;
+    let grid: Vec<(f32, f32)> = WEIGHTS.iter().flat_map(|&a| WEIGHTS.iter().map(move |&b| (a, b))).collect();
+    let best = |fit_weight_on: bool| -> (f32, f32) {
+        // Without fit, scale closeness up so fit (log-prob) is negligible.
+        let options: Vec<(f32, f32)> = if fit_weight_on { grid.clone() } else { vec![(1e4, 0.0), (0.0, 1e4), (1e4, 1e4)] };
+        options.into_iter().max_by(|&a, &b| mean_gap(&dev, a).total_cmp(&mean_gap(&dev, b))).unwrap()
+    };
+    let (combined, closeness) = (best(true), best(false));
+    // Candidates the usage model can't spell from known pieces (judged blind).
+    if let Some(u) = e.usage.as_ref() {
+        let all: Vec<&String> = targets.iter().flat_map(|t| t.rated.iter().map(|(s, _)| s)).collect();
+        let unknown = all.iter().filter(|s| u.encode_words(&s.split(' ').map(String::from).collect::<Vec<_>>()).0.contains(&scribe::usage::vocab::UNK)).count();
+        println!("candidates with a piece unknown to the usage model: {:.1}% of {}", 100.0 * unknown as f64 / all.len() as f64, all.len());
+    }
+    println!("ranking (stage 7), GAP on {split}:");
+    println!("  fit alone (shipped judge)            {:.1}", mean_gap(&here, (0.0, 0.0)));
+    println!("  closeness alone {:<20} {:.1}", format!("{closeness:?}"), mean_gap(&here, closeness));
+    println!("  fit + closeness {:<20} {:.1}  (weights tuned on dev: {:.1})", format!("{combined:?}"), mean_gap(&here, combined), mean_gap(&dev, combined));
+
     let (mut gaps, mut gaps_random) = (Vec::new(), Vec::new());
-    let systems = ["app (chosen sense, fit margin, ≤3)", "chosen sense, top 10 by fit", "every sense, top 10 by fit", "every sense, dictionary order"];
+    let systems = ["app (chosen sense, fit margin, ≤3)", "chosen sense, top 10 by fit", "every sense, top 10 by fit", "every sense, dictionary order",
+                   "chosen sense, top 3 by new judge", "chosen sense, top 10 by new judge", "every sense, top 10 by new judge"];
     let mut generated: Vec<Vec<(HashSet<String>, Vec<String>)>> = vec![Vec::new(); systems.len()];
     let (mut pos_right, mut with_sense) = (0usize, 0usize);
     for (n, t) in targets.iter().enumerate() {
@@ -121,6 +212,11 @@ fn main() {
         let chosen: Vec<u32> = tok.sense.filter(|_| tok.sense_supported).into_iter().collect();
         with_sense += (!chosen.is_empty()) as usize;
         let every: Vec<u32> = Pos::from_upos(&tok.upos).map(|p| e.lexicon.senses(&lemma, p).to_vec()).unwrap_or_default();
+        let judge = |lemmas: &[String], k: usize| -> Vec<String> {
+            let parts = components(&e, &t.words, t.at, &tok.xpos, &tok.upos, lemmas);
+            let sc = Scored { rated: lemmas.iter().map(|l| (l.clone(), 0.0)).collect(), parts };
+            rank(&sc, combined).into_iter().take(k).collect()
+        };
         let lenient = |list: Vec<String>| -> Vec<String> { list.into_iter().filter(|s| names.contains(s)).collect() };
         let original = judged(&e, &t.words, t.at, &tok.xpos, &tok.upos, std::slice::from_ref(&lemma)).first().map_or(0.0, |x| x.1);
         let chosen_fit = judged(&e, &t.words, t.at, &tok.xpos, &tok.upos, &members(&e, &chosen, adj, &lemma));
@@ -130,6 +226,9 @@ fn main() {
             chosen_fit.into_iter().map(|x| x.0).collect(),
             judged(&e, &t.words, t.at, &tok.xpos, &tok.upos, &members(&e, &every, adj, &lemma)).into_iter().map(|x| x.0).collect(),
             members(&e, &every, adj, &lemma),
+            judge(&members(&e, &chosen, adj, &lemma), 3),
+            judge(&members(&e, &chosen, adj, &lemma), 10),
+            judge(&members(&e, &every, adj, &lemma), 10),
         ];
         for (g, list) in generated.iter_mut().zip(lists) {
             g.push((accepted.clone(), lenient(list)));
