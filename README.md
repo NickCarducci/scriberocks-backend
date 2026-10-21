@@ -1,7 +1,10 @@
-# scribe — Scriberocks language core
+# ScribeSLM — the language pipeline behind Scriberocks
 
-A language engine built from a dictionary and a grammar treebank. No pretrained
-language model, nothing scraped from the web. Written in Rust; used from Swift
+ScribeSLM is the whole pipeline: the dictionary, the rules and the small
+trained models, in four stages (below). Scriberocks is the app built on it.
+The models inside have no names of their own; each is described by what it
+learned from and how. The live release uses no pretrained language model and
+nothing scraped from the web. Written in Rust (crate `scribe`); used from Swift
 through UniFFI.
 
 | Layer | What | Learned from | Measured |
@@ -30,7 +33,7 @@ generates text freely, and everything runs on the device.
 | Usage model (11.4M parameters, from scratch) | 15.3M tokens of usage sentences only: Wiktionary and WordNet examples, EWT | Live (v0.1.3) |
 | Tagger, parser | UD English EWT (hand-labelled sentences) | Live |
 | Sense head | SemCor (hand-labelled meanings) | Live |
-| ScribeSLM: BERT-mini's base (Apache 2.0) adapted to usage — Wiktionary and WordNet examples, EWT, Tatoeba; jointly with SemCor's meanings (`examples/slm_adapt.rs --joint`) | — | In progress; not shipped |
+| BERT-mini's base (Apache 2.0) adapted to usage — Wiktionary and WordNet examples, EWT, Tatoeba; jointly with SemCor's meanings (`examples/slm_adapt.rs --joint`) | — | In progress; not shipped |
 
 Volume, where it is used at all, comes only from the pretrained base;
 everything added is curated usage. No definitions in usage training.
@@ -59,12 +62,12 @@ everything added is curated usage. No definitions in usage training.
 | Choose and order | Drops near-duplicates, orders for variety | Rules | — |
 
 The boundary between proposing and judging is `SlotScorer` (engine.rs): any
-scorer (the usage model today; ScribeSLM, FidelityAI or a classical head
+scorer (the from-scratch usage model today; BERT-mini adapted to usage, FidelityAI or a classical head
 later) is judged by the same tests (`examples/swords_eval.rs`,
 `examples/sense_pipeline_eval.rs`). History: `2835dad` (lexicon, tagger,
 parser, variants, usage model), `95ecc59` (usage model training), `4859a20`
 (joins), `cc4ec1f` (punctuation, `SlotScorer`), `e510005` (sense head),
-`9661762` (neural syntax), `0e08c4b` (SWORDS), `3c165b0` (ScribeSLM).
+`9661762` (neural syntax), `0e08c4b` (SWORDS), `3c165b0` (BERT-mini adapted to usage).
 
 ## Architecture: a classical head start for a small learned head
 

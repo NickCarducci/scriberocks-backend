@@ -1,16 +1,16 @@
-//! ScribeSLM: BERT-mini's weights (volume) adapted to usage standards by
+//! BERT-mini's weights (volume) adapted to usage standards, for ScribeSLM, by
 //! continued masked-word training on usage sentences only — Wiktionary and
 //! WordNet examples (WordNet's held-out split kept out), the EWT treebank's
 //! training sentences, and Tatoeba. No definitions; nothing from the test sets
 //! (SWORDS, ALL, EWT dev/test).
 //!
-//!   cargo run --release --features metal --example slm_adapt [steps] [--from data/bert-mini] [--out models/scribe-slm]
+//!   cargo run --release --features metal --example slm_adapt [steps] [--from data/bert-mini] [--out models/bert-mini-usage]
 //!
 //! Masking as BERT (15% of pieces; 80% [MASK], 10% random, 10% unchanged).
 //! Keeps the step with the lowest held-out loss (2,000 Tatoeba sentences
 //! never trained on).
 //!
-//! --joint [w] (output models/scribe-slm-joint): usage and dictionary learned
+//! --joint [w] (output models/bert-mini-usage-dictionary): usage and dictionary learned
 //! together. Each step also takes a batch of SemCor words (hand-labelled with
 //! their WordNet meaning, in base form so synonyms fit grammatically), hides
 //! the word, and adds w × −log P(slot ∈ the word or its meaning's synonyms).
@@ -119,7 +119,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let joint: Option<f64> = args.iter().position(|a| a == "--joint").map(|i| args.get(i + 1).and_then(|v| v.parse().ok()).unwrap_or(1.0));
     let from = flag("--from", "data/bert-mini");
-    let out = flag("--out", if joint.is_some() { "models/scribe-slm-joint" } else { "models/scribe-slm" });
+    let out = flag("--out", if joint.is_some() { "models/bert-mini-usage-dictionary" } else { "models/bert-mini-usage" });
     #[cfg(feature = "metal")]
     let dev = Device::new_metal(0)?;
     #[cfg(not(feature = "metal"))]
