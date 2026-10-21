@@ -18,26 +18,53 @@ through UniFFI.
 
 ## How a rock becomes suggestions
 
-Rules and dictionaries propose a closed set of edits; small trained models
-judge them. Nothing generates text freely, and nothing is a large language
-model: the one neural network (the usage model, 11.4M parameters) only scores
-options the rules proposed, and everything runs on the device.
+Four stages: **standards, not volume**; **dictionary and usage**; **dual
+meanings and synonyms**; **proposing and judging**. Rules and the dictionary
+propose a closed set of edits and small trained models judge them; nothing
+generates text freely, and everything runs on the device.
 
-| Step | What it does | How |
+### 1. Standards, not volume — what the models learn from
+
+| Model | Learned from | Status |
 |---|---|---|
-| 1. Split and look up words | Breaks the text into words and finds each word's dictionary form | Rules, plus the lexicon compiled from the Open English WordNet database |
-| 2. Tag parts of speech | Marks nouns, verbs and so on | Trained ML model: averaged perceptron learned from UD English EWT (hand-labelled sentences); UPOS 94.6% |
-| 3. Parse | Works out which word connects to which | Trained ML model: arc-eager transition parser learned from UD English EWT; LAS 77.5% |
-| 4. Pick word meanings | Chooses each word's dictionary sense, so swaps offer synonyms of the right meaning | Trained ML model: the sense head (on the usage model's vectors), learned from SemCor; 62.4% vs 55.6% for the first-listed sense |
-| 5. Propose edits | Trim, cut, reorder, reframe; swap words; join sentences; add punctuation | Database and rules: swap candidates are WordNet synonyms of the chosen sense; trim/cut/reorder/reframe and punctuation gaps are rules over the parse; joins use a closed list of connectives (because / so / but / and); spelling fixes are a closed list (i → I, dont → don't) |
-| 6. Judge the edits | Keeps swaps, joins and commas only if they fit the sentence; ranks how natural each version reads | Two language models in the ML sense: the usage model (a small transformer built with candle, Hugging Face's Rust ML library, trained from scratch on ~15M words of usage sentences to fill in hidden words) and a Kneser–Ney trigram fluency model (word-triple statistics; scores, never generates) |
-| 7. Choose and order | Drops near-duplicates, orders the suggestions for variety | Rules |
+| Usage model (11.4M parameters, from scratch) | 15.3M tokens of usage sentences only: Wiktionary and WordNet examples, EWT | Live (v0.1.3) |
+| Tagger, parser | UD English EWT (hand-labelled sentences) | Live |
+| Sense head | SemCor (hand-labelled meanings) | Live |
+| ScribeSLM: BERT-mini's base (Apache 2.0) adapted to usage — Wiktionary and WordNet examples, EWT, Tatoeba; jointly with SemCor's meanings (`examples/slm_adapt.rs --joint`) | — | In progress; not shipped |
 
-The boundary between steps 5 and 6 is `SlotScorer` (engine.rs): any scorer
-(the usage model today; FidelityAI or a classical head later) is judged by the
-same tests. History: `2835dad` (lexicon, tagger, parser, variants, usage model),
-`95ecc59` (usage model training), `4859a20` (joins), `cc4ec1f` (punctuation,
-`SlotScorer`), `e510005` (sense head).
+Volume, where it is used at all, comes only from the pretrained base;
+everything added is curated usage. No definitions in usage training.
+
+### 2. Dictionary and usage — reading the rock
+
+| Step | What it does | How | Measured |
+|---|---|---|---|
+| Split and look up | Words and their dictionary forms | Rules + the lexicon (Open English WordNet) | — |
+| Tag | Nouns, verbs and so on | Averaged perceptron (EWT) | UPOS 94.6% (neural syntax, not shipped: 95.7%) |
+| Parse | Which word connects to which | Arc-eager transition parser (EWT) | LAS 77.5% (neural syntax, not shipped: 79.6%) |
+
+### 3. Dual meanings and synonyms
+
+| Step | What it does | How | Measured |
+|---|---|---|---|
+| Pick each word's meaning | *bank* the shore vs *bank* the lender | Sense head on the usage model's vectors | ALL test set (Word Sense Disambiguation Evaluation Framework): 62.4% given the test's lemma and part of speech, 57.7% end to end; first-listed 55.6% |
+| That meaning's synonyms | Swap candidates for this sentence only | WordNet members of the chosen meaning | SWORDS (Stanford Word Substitution Benchmark) strict F@10 14.4 |
+
+### 4. Proposing and judging
+
+| Step | What it does | How | Measured |
+|---|---|---|---|
+| Propose | Trim, cut, reorder, reframe; swap; join; punctuate | Rules over the parse; synonyms from stage 3; closed lists of connectives (because / so / but / and), marks ("," "." "?") and spelling fixes | — |
+| Judge | Keeps edits that fit the sentence; ranks how natural each version reads | Usage model (fit in the slot) + Kneser–Ney trigram fluency (scores, never generates) | SWORDS GAP 37.1 (with closeness to the original, not shipped: 42.4; BERT-mini 48.1) |
+| Choose and order | Drops near-duplicates, orders for variety | Rules | — |
+
+The boundary between proposing and judging is `SlotScorer` (engine.rs): any
+scorer (the usage model today; ScribeSLM, FidelityAI or a classical head
+later) is judged by the same tests (`examples/swords_eval.rs`,
+`examples/sense_pipeline_eval.rs`). History: `2835dad` (lexicon, tagger,
+parser, variants, usage model), `95ecc59` (usage model training), `4859a20`
+(joins), `cc4ec1f` (punctuation, `SlotScorer`), `e510005` (sense head),
+`9661762` (neural syntax), `0e08c4b` (SWORDS), `3c165b0` (ScribeSLM).
 
 ## Architecture: a classical head start for a small learned head
 
