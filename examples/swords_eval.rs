@@ -155,6 +155,17 @@ fn ranking_set(e: &Engine, targets: &[Target]) -> Vec<Scored> {
     }).collect()
 }
 
+/// Synsets related to `synsets`: (more general, more specific, sisters).
+fn related(e: &Engine, hyponyms: &HashMap<u32, Vec<u32>>, synsets: &[u32]) -> (Vec<u32>, Vec<u32>, Vec<u32>) {
+    let up: Vec<u32> = synsets.iter().flat_map(|&s| e.lexicon.synsets[s as usize].hypernyms.iter().copied()).collect();
+    let down: Vec<u32> = synsets.iter().flat_map(|s| hyponyms.get(s).into_iter().flatten().copied()).collect();
+    let sisters: Vec<u32> = up.iter().flat_map(|s| hyponyms.get(s).into_iter().flatten().copied()).filter(|s| !synsets.contains(s)).collect();
+    (up, down, sisters)
+}
+
+/// Lists longer than this are cut (dictionary order) before judging.
+const MAX_PROPOSALS: usize = 200;
+
 const WEIGHTS: &[f32] = &[0.0, 5.0, 20.0, 50.0, 100.0, 200.0, 500.0, 1000.0];
 
 fn main() {
@@ -190,6 +201,16 @@ fn main() {
     let systems = ["app (chosen sense, fit margin, ≤3)", "chosen sense, top 10 by fit", "every sense, top 10 by fit", "every sense, dictionary order",
                    "chosen sense, top 3 by new judge", "chosen sense, top 10 by new judge", "every sense, top 10 by new judge"];
     let mut generated: Vec<Vec<(HashSet<String>, Vec<String>)>> = vec![Vec::new(); systems.len()];
+    let mut hyponyms: HashMap<u32, Vec<u32>> = HashMap::new();
+    for (i, syn) in e.lexicon.synsets.iter().enumerate() {
+        for &h in &syn.hypernyms {
+            hyponyms.entry(h).or_default().push(i as u32);
+        }
+    }
+    let sources = ["chosen meaning: synonyms", "  + more general", "  + more specific", "  + sisters", "every meaning: synonyms", "every meaning: all four"];
+    // Per source: (perfect-judge top 10, new-judge top 10), and list sizes.
+    let mut widened: Vec<(Vec<(HashSet<String>, Vec<String>)>, Vec<(HashSet<String>, Vec<String>)>)> = vec![(Vec::new(), Vec::new()); sources.len()];
+    let mut sizes = vec![0usize; sources.len()];
     let (mut pos_right, mut with_sense) = (0usize, 0usize);
     for (n, t) in targets.iter().enumerate() {
         if n % 100 == 0 { eprintln!("  {n}/{}", targets.len()) }
@@ -233,6 +254,28 @@ fn main() {
         for (g, list) in generated.iter_mut().zip(lists) {
             g.push((accepted.clone(), lenient(list)));
         }
+
+        // Wider proposals: the perfect-judge ceiling and the new judge.
+        let (up, down, sis) = related(&e, &hyponyms, &chosen);
+        let (eup, edown, esis) = related(&e, &hyponyms, &every);
+        let cat = |parts: &[&[u32]]| -> Vec<u32> { parts.concat() };
+        let lists: [Vec<String>; 6] = [
+            members(&e, &chosen, adj, &lemma),
+            members(&e, &cat(&[&chosen, &up]), adj, &lemma),
+            members(&e, &cat(&[&chosen, &up, &down]), adj, &lemma),
+            members(&e, &cat(&[&chosen, &up, &down, &sis]), adj, &lemma),
+            members(&e, &every, adj, &lemma),
+            members(&e, &cat(&[&every, &eup, &edown, &esis]), adj, &lemma),
+        ];
+        let weight: HashMap<&str, f64> = rated.iter().map(|(s, w)| (s.as_str(), *w)).collect();
+        for (k, mut list) in lists.into_iter().enumerate() {
+            list.truncate(MAX_PROPOSALS);
+            sizes[k] += list.len();
+            let mut perfect = list.clone();
+            perfect.sort_by(|a, b| weight.get(b.as_str()).unwrap_or(&-1.0).total_cmp(weight.get(a.as_str()).unwrap_or(&-1.0)));
+            widened[k].0.push((accepted.clone(), lenient(perfect.into_iter().take(10).collect())));
+            widened[k].1.push((accepted.clone(), lenient(judge(&list, 10))));
+        }
     }
     let mean = |v: &[f64]| 100.0 * v.iter().sum::<f64>() / v.len().max(1) as f64;
     let n = targets.len() as f64;
@@ -243,5 +286,11 @@ fn main() {
     for (name, g) in systems.iter().zip(&generated) {
         let (p, r, f) = pr_at_k(g, 10);
         println!("  {name:<36} F@10 {f:.1}  (P {p:.1}, R {r:.1})");
+    }
+    println!("wider proposals (lenient F@10): average list size, perfect judge, new judge:");
+    for (k, name) in sources.iter().enumerate() {
+        let (_, _, ceiling) = pr_at_k(&widened[k].0, 10);
+        let (p, r, f) = pr_at_k(&widened[k].1, 10);
+        println!("  {name:<28} {:>6.1} words   ceiling {ceiling:.1}   judged {f:.1} (P {p:.1}, R {r:.1})", sizes[k] as f64 / n);
     }
 }
