@@ -13,6 +13,11 @@
 //! - Whole-word masking, many passes, and (--joint) the dictionary objective:
 //!   a hidden SemCor word's slot should accept its labelled meaning's synonyms.
 //! - --sample N: N sentences per source (smoke tests).
+//! - --focus-swords ADJ|NOUN|VERB|ADV [--cap 300000]: a topic slice for quick
+//!   recipe tests. Focus words are the SWORDS test's target words of that part
+//!   of speech (never its answer lists) plus their WordNet synonyms and similar
+//!   words; training keeps every standards sentence holding a focus word (up to
+//!   --cap) plus the --sample background. Score with swords_eval POS=<same>.
 //! Keeps the step with the lowest held-out loss: 2,000 Tatoeba sentences and
 //! 1,000 SemCor words never trained on.
 use candle_core::Device;
@@ -20,8 +25,8 @@ use candle_nn::{AdamW, Optimizer, ParamsAdamW};
 use scribe::bert::Bert;
 use scribe::slm_train::{dictionary_examples, dictionary_loss, mask_whole_words, masked_loss, DictExample, Encoded, Rng};
 use scribe::usage::corpus;
-use scribe::{conllu, text, wordpiece, Lexicon};
-use std::collections::HashMap;
+use scribe::{conllu, text, wordpiece, Lexicon, Pos};
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 const BATCH: usize = 128;
@@ -30,6 +35,27 @@ const WARMUP: usize = 2000;
 const LR: f64 = 5e-4;
 const MAX_LEN: usize = 128;
 const SEMCOR: &str = "data/semcor/wsdeval/WSD_Evaluation_Framework/Training_Corpora/SemCor/semcor";
+
+/// SWORDS test target words of one part of speech, with their WordNet
+/// synonyms (every meaning) and, for adjectives, similar words.
+fn focus_words(lex: &Lexicon, pos: &str) -> Result<HashSet<String>, Box<dyn std::error::Error>> {
+    let d: serde_json::Value = serde_json::from_str(&std::fs::read_to_string("data/swords/swords-v1.1_test.json")?)?;
+    let p = match pos { "NOUN" => Pos::Noun, "VERB" => Pos::Verb, "ADJ" => Pos::Adj, "ADV" => Pos::Adv, _ => return Err("POS must be ADJ, NOUN, VERB or ADV".into()) };
+    let mut out = HashSet::new();
+    for t in d["targets"].as_object().ok_or("no targets")?.values() {
+        if t["pos"].as_str() != Some(pos) { continue }
+        let word = t["target"].as_str().unwrap_or("").to_lowercase();
+        out.insert(word.clone());
+        let lemma = lex.lemmatize(&word, Some(p)).into_iter().next().unwrap_or(word);
+        for &s in lex.senses(&lemma, p) {
+            let syn = &lex.synsets[s as usize];
+            let similar = syn.similar.iter().flat_map(|&x| lex.synsets[x as usize].members.iter());
+            out.extend(syn.members.iter().chain(similar).filter(|m| !m.contains(' ')).map(|m| m.to_lowercase()));
+        }
+        out.insert(lemma);
+    }
+    Ok(out)
+}
 
 /// Every `len / n`-th item (a spread sample), or all of them.
 fn sample<T: Clone>(v: Vec<T>, n: Option<usize>) -> Vec<T> {
@@ -48,6 +74,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let joint: f32 = value("--joint").and_then(|v| v.parse().ok()).unwrap_or(1.0);
     let out = PathBuf::from(value("--out").unwrap_or_else(|| "models/curated-scratch".into()));
     let resume = args.iter().any(|a| a == "--resume");
+    let focus_pos = value("--focus-swords");
+    let cap: usize = value("--cap").and_then(|v| v.parse().ok()).unwrap_or(300_000);
     #[cfg(feature = "metal")]
     let dev = Device::new_metal(0)?;
     #[cfg(not(feature = "metal"))]
@@ -58,13 +86,35 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let lines = |p: &str| -> Result<Vec<Vec<String>>, std::io::Error> { Ok(std::fs::read_to_string(p)?.lines().map(text::tokenize).filter(|t| !t.is_empty()).collect()) };
     let mut tatoeba = lines("data/corpus/tatoeba.txt")?;
     let held: Vec<Vec<String>> = tatoeba.drain(..HELD_OUT).collect();
-    let sources: Vec<(&str, Vec<Vec<String>>)> = vec![
-        ("wiktionary examples", sample(lines("data/wiktionary/examples.txt")?, n)),
-        ("EWT treebank", sample(conllu::parse(&std::fs::read_to_string("data/en_ewt-ud-train.conllu")?).iter().map(|s| s.iter().map(|t| t.form.clone()).collect()).collect(), n)),
-        ("WordNet examples", sample(corpus::wordnet_examples(&lex).into_iter().filter(|e| !corpus::is_held_out(e.synset, &e.sentence, 10)).map(|e| text::tokenize(&e.sentence)).collect(), n)),
-        ("Tatoeba", sample(tatoeba, n)),
-        ("Simple English Wikipedia", sample(lines("data/corpus/simplewiki.txt")?, n)),
+    let full: Vec<(&str, Vec<Vec<String>>)> = vec![
+        ("wiktionary examples", lines("data/wiktionary/examples.txt")?),
+        ("EWT treebank", conllu::parse(&std::fs::read_to_string("data/en_ewt-ud-train.conllu")?).iter().map(|s| s.iter().map(|t| t.form.clone()).collect()).collect()),
+        ("WordNet examples", corpus::wordnet_examples(&lex).into_iter().filter(|e| !corpus::is_held_out(e.synset, &e.sentence, 10)).map(|e| text::tokenize(&e.sentence)).collect()),
+        ("Tatoeba", tatoeba),
+        ("Simple English Wikipedia", lines("data/corpus/simplewiki.txt")?),
     ];
+    // Topic slice: sentences holding a focus word (capped), plus the background sample.
+    let focus = match &focus_pos { Some(p) => Some(focus_words(&lex, p)?), None => None };
+    let mut focused: Vec<Vec<String>> = Vec::new();
+    let mut sources: Vec<(&str, Vec<Vec<String>>)> = Vec::new();
+    for (name, sents) in full {
+        match &focus {
+            Some(f) => {
+                let (hit, rest): (Vec<_>, Vec<_>) = sents.into_iter().partition(|s| s.iter().any(|w| f.contains(&w.to_lowercase())));
+                eprintln!("  {name}: {} sentences hold a focus word", hit.len());
+                focused.extend(hit);
+                sources.push((name, sample(rest, n)));
+            }
+            None => sources.push((name, sample(sents, n))),
+        }
+    }
+    if let (Some(f), Some(p)) = (&focus, &focus_pos) {
+        let mut rng = Rng(17);
+        for i in (1..focused.len()).rev() { focused.swap(i, (rng.next() % (i as u64 + 1)) as usize) }
+        focused.truncate(cap);
+        eprintln!("topic slice {p}: {} focus words; {} focus sentences kept (cap {cap})", f.len(), focused.len());
+        sources.push(("focus", focused));
+    }
     for (name, s) in &sources {
         eprintln!("  {name}: {} sentences, {} words", s.len(), s.iter().map(Vec::len).sum::<usize>());
     }
