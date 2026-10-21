@@ -5,7 +5,8 @@
 //! scribe train-usage <data-dir> <models-dir> [steps] [--morph]   usage model + sense index (build with --features metal);
 //!                                                       --morph splits words into base + ending → models/usage-morph;
 //!                                                       --extra <file> (repeatable) adds one-sentence-per-line text
-//!                                                       (scripts/extract_corpus.py); --name <dir> names the output
+//!                                                       (scripts/extract_corpus.py); --name <dir> names the output;
+//!                                                       --only-extra trains on the extra files alone (pilot runs)
 //! scribe build-senses <models-dir> [usage-dir-name]     rebuild the sense index from a trained usage model
 //! scribe train-senses <data-dir> <models-dir> [steps]   sense modeling: continue models/usage with a supersense
 //!                                                       objective (dictionary-allowed sets + SemCor gold) → models/usage-sense;
@@ -136,7 +137,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let morph = args.iter().any(|a| a == "--morph");
             let extra: Vec<PathBuf> = args.windows(2).filter(|w| w[0] == "--extra").map(|w| PathBuf::from(&w[1])).collect();
             let name = args.windows(2).find(|w| w[0] == "--name").map(|w| w[1].clone());
-            train_usage(Path::new(arg(2)?), Path::new(arg(3)?), steps, morph, &extra, name)?
+            let only_extra = args.iter().any(|a| a == "--only-extra");
+            train_usage(Path::new(arg(2)?), Path::new(arg(3)?), steps, morph, &extra, name, only_extra)?
         }
         _ => eprintln!("usage: scribe build-lexicon | train | frames | variants | train-usage (see source header)"),
     }
@@ -240,7 +242,7 @@ fn train_senses(data: &Path, models: &Path, steps: usize, control: bool) -> Resu
     Ok(())
 }
 
-fn train_usage(data: &Path, models: &Path, steps: usize, morph: bool, extra: &[PathBuf], name: Option<String>) -> Result<(), Box<dyn std::error::Error>> {
+fn train_usage(data: &Path, models: &Path, steps: usize, morph: bool, extra: &[PathBuf], name: Option<String>, only_extra: bool) -> Result<(), Box<dyn std::error::Error>> {
     use scribe::usage::{corpus, model::{Config, Device, TrainOptions, UsageModel}, vocab::Vocab};
     use std::io::{BufRead, Write};
 
@@ -270,6 +272,9 @@ fn train_usage(data: &Path, models: &Path, steps: usize, morph: bool, extra: &[P
     let examples = corpus::wordnet_examples(&lex);
     let (held, train_ex): (Vec<_>, Vec<_>) = examples.into_iter().partition(|e| corpus::is_held_out(e.synset, &e.sentence, 10));
     sentences.extend(train_ex.iter().map(|e| tokenize(&e.sentence)));
+    if only_extra {
+        sentences.clear();
+    }
     for file in extra {
         let more = corpus::plain_sentences(&std::fs::read_to_string(file)?, 40);
         eprintln!("extra corpus {}: {} sentences", file.display(), more.len());

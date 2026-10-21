@@ -6,6 +6,7 @@
 //! On top — `frames` (what a rock says) and `variants` (other cuts of a rock),
 //! with `inflect` and a dictionary-trained fluency model (`lm`).
 
+pub mod bert;
 pub mod conllu;
 pub mod engine;
 pub mod ffi;

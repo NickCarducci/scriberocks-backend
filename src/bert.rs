@@ -1,0 +1,302 @@
+//! A BERT encoder with its masked-word head, in candle, for comparison with
+//! the usage model on the same tests (and on the same runtime the app uses).
+//! Loads a Hugging Face BERT checkpoint converted to safetensors (names as in
+//! BertForPreTraining: `bert.*`, `cls.predictions.*`) plus its `vocab.txt`
+//! and `config.json`. Uncased WordPiece; inputs are already-tokenized words.
+use candle_core::{DType, Device, Module, Result, Tensor, D};
+use candle_nn::{embedding, layer_norm, linear, Embedding, LayerNorm, Linear, VarBuilder, VarMap};
+use std::collections::HashMap;
+use std::path::Path;
+
+struct Layer {
+    q: Linear,
+    k: Linear,
+    v: Linear,
+    attn_out: Linear,
+    attn_norm: LayerNorm,
+    ff_in: Linear,
+    ff_out: Linear,
+    ff_norm: LayerNorm,
+}
+
+pub struct Bert {
+    words: Embedding,
+    positions: Embedding,
+    types: Embedding,
+    norm: LayerNorm,
+    layers: Vec<Layer>,
+    head_dense: Linear,
+    head_norm: LayerNorm,
+    decoder: Linear,
+    heads: usize,
+    vocab: Vec<String>,
+    index: HashMap<String, u32>,
+    max_len: usize,
+    device: Device,
+}
+
+const CLS: &str = "[CLS]";
+const SEP: &str = "[SEP]";
+const MASK: &str = "[MASK]";
+const UNK: &str = "[UNK]";
+
+impl Bert {
+    pub fn load(dir: &Path, device: Device) -> std::result::Result<Bert, Box<dyn std::error::Error>> {
+        let vb = unsafe { VarBuilder::from_mmaped_safetensors(&[dir.join("model.safetensors")], DType::F32, &device)? };
+        Bert::build(dir, vb, device)
+    }
+
+    /// As `load`, but with every weight in a VarMap so it can be trained
+    /// (continued masked-word training); save with `VarMap::save`.
+    pub fn load_trainable(dir: &Path, device: Device) -> std::result::Result<(Bert, VarMap), Box<dyn std::error::Error>> {
+        let mut vars = VarMap::new();
+        let bert = Bert::build(dir, VarBuilder::from_varmap(&vars, DType::F32, &device), device)?;
+        vars.load(dir.join("model.safetensors"))?;
+        Ok((bert, vars))
+    }
+
+    fn build(dir: &Path, vb: VarBuilder, device: Device) -> std::result::Result<Bert, Box<dyn std::error::Error>> {
+        let config: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(dir.join("config.json"))?)?;
+        let n = |k: &str| config[k].as_u64().unwrap_or(0) as usize;
+        let (dim, layers, heads, ff, max_len) = (n("hidden_size"), n("num_hidden_layers"), n("num_attention_heads"), n("intermediate_size"), n("max_position_embeddings"));
+        let eps = config["layer_norm_eps"].as_f64().unwrap_or(1e-12);
+        let vocab: Vec<String> = std::fs::read_to_string(dir.join("vocab.txt"))?.lines().map(String::from).collect();
+        let index = vocab.iter().enumerate().map(|(i, w)| (w.clone(), i as u32)).collect();
+        let b = vb.pp("bert");
+        let e = b.pp("embeddings");
+        let layer = |i: usize| -> Result<Layer> {
+            let l = b.pp(format!("encoder.layer.{i}"));
+            Ok(Layer {
+                q: linear(dim, dim, l.pp("attention.self.query"))?,
+                k: linear(dim, dim, l.pp("attention.self.key"))?,
+                v: linear(dim, dim, l.pp("attention.self.value"))?,
+                attn_out: linear(dim, dim, l.pp("attention.output.dense"))?,
+                attn_norm: layer_norm(dim, eps, l.pp("attention.output.LayerNorm"))?,
+                ff_in: linear(dim, ff, l.pp("intermediate.dense"))?,
+                ff_out: linear(ff, dim, l.pp("output.dense"))?,
+                ff_norm: layer_norm(dim, eps, l.pp("output.LayerNorm"))?,
+            })
+        };
+        let p = vb.pp("cls.predictions");
+        Ok(Bert {
+            words: embedding(vocab.len(), dim, e.pp("word_embeddings"))?,
+            positions: embedding(max_len, dim, e.pp("position_embeddings"))?,
+            types: embedding(2, dim, e.pp("token_type_embeddings"))?,
+            norm: layer_norm(dim, eps, e.pp("LayerNorm"))?,
+            layers: (0..layers).map(layer).collect::<Result<_>>()?,
+            head_dense: linear(dim, dim, p.pp("transform.dense"))?,
+            head_norm: layer_norm(dim, eps, p.pp("transform.LayerNorm"))?,
+            decoder: linear(dim, vocab.len(), p.pp("decoder"))?,
+            heads,
+            vocab,
+            index,
+            max_len,
+            device,
+        })
+    }
+
+    /// WordPiece pieces of one (already split) word, lowercased; [UNK] if it can't be spelled.
+    pub fn word_pieces(&self, word: &str) -> Vec<String> {
+        if word == MASK {
+            return vec![MASK.into()];
+        }
+        let chars: Vec<char> = word.to_lowercase().chars().collect();
+        let (mut out, mut start) = (Vec::new(), 0);
+        while start < chars.len() {
+            let mut end = chars.len();
+            let mut found = None;
+            while end > start {
+                let piece: String = chars[start..end].iter().collect();
+                let piece = if start > 0 { format!("##{piece}") } else { piece };
+                if self.index.contains_key(&piece) {
+                    found = Some(piece);
+                    break;
+                }
+                end -= 1;
+            }
+            match found {
+                Some(p) => { out.push(p); start = end }
+                None => return vec![UNK.into()],
+            }
+        }
+        out
+    }
+
+    /// Piece ids for [CLS] words [SEP], and the index of each word's first piece.
+    fn encode(&self, words: &[String]) -> (Vec<u32>, Vec<usize>) {
+        let mut ids = vec![self.index[CLS]];
+        let mut first = Vec::with_capacity(words.len());
+        for w in words {
+            first.push(ids.len());
+            ids.extend(self.word_pieces(w).iter().map(|p| self.index.get(p).copied().unwrap_or(self.index[UNK])));
+        }
+        ids.push(self.index[SEP]);
+        ids.truncate(self.max_len);
+        (ids, first)
+    }
+
+    /// Hidden states [b, t, dim] for padded id rows (padding masked out of attention).
+    fn hidden(&self, rows: &[Vec<u32>]) -> Result<Tensor> {
+        let (b, t) = (rows.len(), rows.iter().map(Vec::len).max().unwrap_or(1));
+        let mut flat = Vec::with_capacity(b * t);
+        let mut pad = Vec::with_capacity(b * t);
+        for r in rows {
+            flat.extend(r.iter().copied());
+            flat.extend(std::iter::repeat_n(0u32, t - r.len()));
+            pad.extend(std::iter::repeat_n(0f32, r.len()));
+            pad.extend(std::iter::repeat_n(-1e9f32, t - r.len()));
+        }
+        let ids = Tensor::from_vec(flat, (b, t), &self.device)?;
+        let pos = Tensor::arange(0u32, t as u32, &self.device)?.unsqueeze(0)?.broadcast_as((b, t))?.contiguous()?;
+        let mut x = (self.words.forward(&ids)? + self.positions.forward(&pos)?)?
+            .broadcast_add(&self.types.forward(&Tensor::zeros((b, t), DType::U32, &self.device)?)?)?;
+        x = self.norm.forward(&x)?;
+        let mask = Tensor::from_vec(pad, (b, 1, 1, t), &self.device)?;
+        let dim = x.dim(2)?;
+        let dh = dim / self.heads;
+        for l in &self.layers {
+            let split = |y: Tensor| -> Result<Tensor> { y.reshape((b, t, self.heads, dh))?.transpose(1, 2)?.contiguous() };
+            let (q, k, v) = (split(l.q.forward(&x)?)?, split(l.k.forward(&x)?)?, split(l.v.forward(&x)?)?);
+            let att = (q.matmul(&k.t()?)? / (dh as f64).sqrt())?.broadcast_add(&mask)?;
+            let att = candle_nn::ops::softmax_last_dim(&att)?;
+            let y = att.matmul(&v)?.transpose(1, 2)?.reshape((b, t, dim))?;
+            x = l.attn_norm.forward(&(l.attn_out.forward(&y)? + &x)?)?;
+            let h = l.ff_in.forward(&x)?.gelu_erf()?;
+            x = l.ff_norm.forward(&(l.ff_out.forward(&h)? + &x)?)?;
+        }
+        Ok(x)
+    }
+
+    /// Piece ids of a sentence with [CLS]/[SEP], for training.
+    pub fn encode_sentence(&self, words: &[String]) -> Vec<u32> {
+        self.encode(words).0
+    }
+
+    pub fn vocab_len(&self) -> usize {
+        self.vocab.len()
+    }
+
+    /// Log-probabilities over the vocabulary at `positions` (row, column)
+    /// of the padded batch `rows`: [n, vocab]. The training objective.
+    pub fn masked_log_probs(&self, rows: &[Vec<u32>], positions: &[(usize, usize)]) -> Result<Tensor> {
+        let h = self.hidden(rows)?;
+        let (b, t, dim) = h.dims3()?;
+        let flat: Vec<u32> = positions.iter().map(|&(r, c)| (r * t + c) as u32).collect();
+        let picked = h.reshape((b * t, dim))?.index_select(&Tensor::new(flat.as_slice(), &self.device)?, 0)?;
+        self.log_probs(&picked)
+    }
+
+    /// Special-token id ([CLS], [SEP], [MASK], [PAD]=0, [UNK]).
+    pub fn special(&self, name: &str) -> u32 {
+        self.index.get(name).copied().unwrap_or(0)
+    }
+
+    fn log_probs(&self, hidden: &Tensor) -> Result<Tensor> {
+        let h = self.head_norm.forward(&self.head_dense.forward(hidden)?.gelu_erf()?)?;
+        candle_nn::ops::log_softmax(&self.decoder.forward(&h)?, D::Minus1)
+    }
+
+    /// Log-probability of each candidate (one or more words) filling `position`:
+    /// as many [MASK]s as the candidate has pieces, summed.
+    pub fn slot_scores(&self, words: &[String], position: usize, candidates: &[String]) -> Result<Vec<f32>> {
+        let mut cache: HashMap<usize, (Vec<Vec<f32>>, usize)> = HashMap::new();
+        let mut out = Vec::with_capacity(candidates.len());
+        for cand in candidates {
+            let pieces: Vec<String> = cand.split(' ').flat_map(|w| self.word_pieces(w)).collect();
+            let k = pieces.len();
+            if !cache.contains_key(&k) {
+                let mut seq: Vec<String> = words[..position].to_vec();
+                seq.extend(std::iter::repeat_n(MASK.to_string(), k));
+                seq.extend(words[position + 1..].iter().cloned());
+                let (ids, first) = self.encode(&seq);
+                let at = first.get(position).copied().unwrap_or(ids.len());
+                if at + k >= ids.len() {
+                    cache.insert(k, (vec![], at));
+                } else {
+                    let h = self.hidden(&[ids])?.squeeze(0)?.narrow(0, at, k)?;
+                    cache.insert(k, (self.log_probs(&h)?.to_vec2::<f32>()?, at));
+                }
+            }
+            let (lp, _) = &cache[&k];
+            if lp.is_empty() {
+                out.push(f32::NEG_INFINITY);
+                continue;
+            }
+            let unk = self.index[UNK];
+            out.push(pieces.iter().enumerate().map(|(i, p)| {
+                let id = self.index.get(p).copied().unwrap_or(unk);
+                lp[i][id as usize] - if id == unk { 5.0 } else { 0.0 }
+            }).sum());
+        }
+        Ok(out)
+    }
+
+    /// The `k` most likely whole words (single pieces with a letter) for `position`.
+    pub fn predict(&self, words: &[String], position: usize, k: usize, visible: bool) -> Result<Vec<(String, f32)>> {
+        let mut seq = words.to_vec();
+        if !visible {
+            seq[position] = MASK.into();
+        }
+        let (ids, first) = self.encode(&seq);
+        let Some(&at) = first.get(position).filter(|&&a| a < ids.len()) else { return Ok(vec![]) };
+        let lp = self.log_probs(&self.hidden(&[ids])?.squeeze(0)?.narrow(0, at, 1)?)?.squeeze(0)?.to_vec1::<f32>()?;
+        let mut order: Vec<usize> = (0..lp.len())
+            .filter(|&i| { let w = &self.vocab[i]; !w.starts_with("##") && !w.starts_with('[') && w.chars().any(char::is_alphabetic) })
+            .collect();
+        order.sort_by(|&a, &b| lp[b].total_cmp(&lp[a]));
+        Ok(order.into_iter().take(k).map(|i| (self.vocab[i].clone(), lp[i])).collect())
+    }
+
+    /// One vector per word (its first piece) for each sentence.
+    pub fn contextual_batch(&self, sentences: &[Vec<String>]) -> Result<Vec<Vec<Vec<f32>>>> {
+        let mut out = Vec::with_capacity(sentences.len());
+        for chunk in sentences.chunks(32) {
+            let enc: Vec<(Vec<u32>, Vec<usize>)> = chunk.iter().map(|s| self.encode(s)).collect();
+            let rows: Vec<Vec<u32>> = enc.iter().map(|(ids, _)| ids.clone()).collect();
+            let h = self.hidden(&rows)?;
+            for (i, (ids, first)) in enc.iter().enumerate() {
+                let m = h.get(i)?.to_vec2::<f32>()?;
+                out.push(first.iter().filter(|&&f| f < ids.len()).map(|&f| m[f].clone()).collect());
+            }
+        }
+        Ok(out)
+    }
+
+    /// Whether the word has its own vocabulary entry (not split, not unknown).
+    pub fn knows(&self, word: &str) -> bool {
+        self.index.contains_key(&word.to_lowercase())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn words(s: &str) -> Vec<String> {
+        s.split(' ').map(String::from).collect()
+    }
+
+    /// Runs only where the converted weights exist (data/bert-mini).
+    #[test]
+    fn fills_in_obvious_words() {
+        let dir = Path::new("data/bert-mini");
+        if !dir.join("model.safetensors").exists() { return }
+        let m = Bert::load(dir, Device::Cpu).unwrap();
+        let top: Vec<String> = m.predict(&words("paris is the capital of france ."), 5, 5, false).unwrap().into_iter().map(|x| x.0).collect();
+        eprintln!("paris is the capital of [MASK]: {top:?}");
+        assert!(top.contains(&"france".to_string()), "{top:?}");
+        let s = m.slot_scores(&words("she drank a cup of hot tea ."), 6, &words("tea gravel")).unwrap();
+        assert!(s[0] > s[1], "{s:?}");
+        assert_eq!(m.word_pieces("unaffable").concat().replace("##", ""), "unaffable");
+        let v = m.contextual_batch(&[words("the bank of the river"), words("a bank loan")]).unwrap();
+        assert_eq!((v[0].len(), v[1].len(), v[0][0].len()), (5, 3, 256));
+        // The trainable copy computes the same thing.
+        let (t, vars) = Bert::load_trainable(dir, Device::Cpu).unwrap();
+        assert!(vars.all_vars().len() >= 70);
+        let a = m.slot_scores(&words("she drank a cup of hot tea ."), 6, &words("tea")).unwrap()[0];
+        let b = t.slot_scores(&words("she drank a cup of hot tea ."), 6, &words("tea")).unwrap()[0];
+        assert!((a - b).abs() < 1e-4, "{a} vs {b}");
+        let rows = vec![t.encode_sentence(&words("the cat sat ."))];
+        assert_eq!(t.masked_log_probs(&rows, &[(0, 2)]).unwrap().dims(), &[1, t.vocab_len()]);
+    }
+}

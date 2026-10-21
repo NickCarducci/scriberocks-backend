@@ -11,6 +11,8 @@
 //! are dropped first). Published (test): humans F@10 48.8 / GAP 66.2;
 //! GPT-3 F@10 34.6; BERT F@10 31.7 / GAP 56.9; thesaurus alone F@10 12.0.
 //! Data: data/swords/swords-v1.1_{dev,test}.json from github.com/p-lambda/swords.
+//! LM=bert or USAGE=<models dir> swaps the language model; POS=ADJ|NOUN|VERB|ADV
+//! and LIMIT=n score a subset (quick pilots).
 //!
 //! The judge combines fit (the usage model's log-probability of the
 //! candidate in the masked slot) with closeness to the original word, as
@@ -62,8 +64,11 @@ fn load(split: &str) -> Vec<Target> {
         words.push(word.to_string());
         words.extend(scribe::text::tokenize(&after));
         let pos = match t["pos"].as_str().unwrap() { "NOUN" => Some(Pos::Noun), "VERB" => Some(Pos::Verb), "ADJ" => Some(Pos::Adj), "ADV" => Some(Pos::Adv), _ => None };
+        if std::env::var("POS").is_ok_and(|want| t["pos"].as_str() != Some(want.as_str())) { continue }
         out.push(Target { words, at, pos, rated: rated.remove(tid.as_str()).unwrap_or_default() });
     }
+    // LIMIT=n: the first n targets (ids are hashes, so effectively a random sample).
+    if let Some(n) = std::env::var("LIMIT").ok().and_then(|v| v.parse().ok()) { out.truncate(n) }
     out
 }
 
@@ -84,13 +89,41 @@ fn members(e: &Engine, synsets: &[u32], with_similar: bool, lemma: &str) -> Vec<
     out
 }
 
+/// The language model under test: the shipped usage model by default;
+/// USAGE=<models/ dir name> for another usage model (pilots); LM=bert for
+/// BERT-mini (data/bert-mini). The engine's own tagging and meanings stay
+/// as shipped either way.
+trait Lm: Send + Sync {
+    fn fit(&self, context: &[String], at: usize, forms: &[String]) -> Option<Vec<f32>>;
+    fn vectors(&self, sentences: &[Vec<String>]) -> Option<Vec<Vec<Vec<f32>>>>;
+    fn top(&self, words: &[String], at: usize, k: usize, visible: bool) -> Vec<(String, f32)>;
+    fn unknown(&self, word: &str) -> bool;
+}
+
+impl Lm for scribe::usage::model::UsageModel {
+    fn fit(&self, context: &[String], at: usize, forms: &[String]) -> Option<Vec<f32>> { self.candidate_scores(context, at, forms).ok() }
+    fn vectors(&self, sentences: &[Vec<String>]) -> Option<Vec<Vec<Vec<f32>>>> { self.contextual_batch(sentences).ok() }
+    fn top(&self, words: &[String], at: usize, k: usize, visible: bool) -> Vec<(String, f32)> { self.predict(words, at, k, visible).unwrap_or_default() }
+    fn unknown(&self, word: &str) -> bool { self.encode_words(&word.split(' ').map(String::from).collect::<Vec<_>>()).0.contains(&scribe::usage::vocab::UNK) }
+}
+
+impl Lm for scribe::bert::Bert {
+    fn fit(&self, context: &[String], at: usize, forms: &[String]) -> Option<Vec<f32>> { self.slot_scores(context, at, forms).ok() }
+    fn vectors(&self, sentences: &[Vec<String>]) -> Option<Vec<Vec<Vec<f32>>>> { self.contextual_batch(sentences).ok() }
+    fn top(&self, words: &[String], at: usize, k: usize, visible: bool) -> Vec<(String, f32)> { self.predict(words, at, k, visible).unwrap_or_default() }
+    fn unknown(&self, word: &str) -> bool { word.split(' ').any(|w| self.word_pieces(w).iter().any(|p| p == "[UNK]")) }
+}
+
+static LM: std::sync::OnceLock<Box<dyn Lm>> = std::sync::OnceLock::new();
+fn lm() -> &'static dyn Lm { LM.get().expect("language model loaded").as_ref() }
+
 /// Lemmas ordered by the usage model's fit in the slot (inflected like the word), best first, with scores.
 fn judged(e: &Engine, words: &[String], at: usize, xpos: &str, upos: &str, lemmas: &[String]) -> Vec<(String, f32)> {
-    let Some(scorer) = e.slot_scorer() else { return lemmas.iter().map(|l| (l.clone(), 0.0)).collect() };
+    let scorer = lm();
     if lemmas.is_empty() { return vec![] }
     let context: Vec<String> = words.iter().map(|w| w.to_lowercase()).collect();
     let forms: Vec<String> = lemmas.iter().map(|l| if CONTENT.contains(&upos) { e.inflector.inflect(l, xpos) } else { l.clone() }.to_lowercase()).collect();
-    let Some(scores) = scorer.slot_scores(&context, at, &forms) else { return vec![] };
+    let Some(scores) = scorer.fit(&context, at, &forms) else { return vec![] };
     let mut out: Vec<(String, f32)> = lemmas.iter().cloned().zip(scores).collect();
     out.sort_by(|a, b| b.1.total_cmp(&a.1));
     out
@@ -104,18 +137,18 @@ fn cosine(a: &[f32], b: &[f32]) -> f32 {
 
 /// Per candidate: (fit, closeness at the slot, closeness over the rest of the sentence).
 fn components(e: &Engine, words: &[String], at: usize, xpos: &str, upos: &str, lemmas: &[String]) -> Vec<(f32, f32, f32)> {
-    let (Some(u), Some(scorer)) = (e.usage.as_ref(), e.slot_scorer()) else { return vec![(0.0, 0.0, 0.0); lemmas.len()] };
+    let (u, scorer) = (lm(), lm());
     if lemmas.is_empty() { return vec![] }
     let lower: Vec<String> = words.iter().map(|w| w.to_lowercase()).collect();
     let forms: Vec<String> = lemmas.iter().map(|l| if CONTENT.contains(&upos) { e.inflector.inflect(l, xpos) } else { l.clone() }.to_lowercase()).collect();
-    let fit = scorer.slot_scores(&lower, at, &forms).unwrap_or_else(|| vec![0.0; forms.len()]);
+    let fit = scorer.fit(&lower, at, &forms).unwrap_or_else(|| vec![0.0; forms.len()]);
     let mut sentences = vec![lower.clone()];
     for f in &forms {
         let mut s = lower.clone();
         s.splice(at..at + 1, f.split(' ').map(String::from));
         sentences.push(s);
     }
-    let Ok(vectors) = u.contextual_batch(&sentences) else { return fit.into_iter().map(|f| (f, 0.0, 0.0)).collect() };
+    let Some(vectors) = u.vectors(&sentences) else { return fit.into_iter().map(|f| (f, 0.0, 0.0)).collect() };
     let original = &vectors[0];
     forms.iter().enumerate().map(|(k, f)| {
         let v = &vectors[k + 1];
@@ -171,6 +204,12 @@ const WEIGHTS: &[f32] = &[0.0, 5.0, 20.0, 50.0, 100.0, 200.0, 500.0, 1000.0];
 fn main() {
     let split = std::env::args().nth(1).unwrap_or_else(|| "test".into());
     let e = Engine::load(Path::new("models")).unwrap();
+    let model: Box<dyn Lm> = match (std::env::var("LM").as_deref(), std::env::var("USAGE")) {
+        (Ok("bert"), _) => Box::new(scribe::bert::Bert::load(Path::new("data/bert-mini"), scribe::usage::model::Device::Cpu).unwrap()),
+        (_, Ok(dir)) => Box::new(scribe::usage::model::UsageModel::load(&Path::new("models").join(dir), scribe::usage::model::Device::Cpu).unwrap()),
+        _ => Box::new(scribe::usage::model::UsageModel::load(Path::new("models/usage"), scribe::usage::model::Device::Cpu).unwrap()),
+    };
+    let _ = LM.set(model);
     let targets = load(&split);
     eprintln!("SWORDS {split}: {} targets", targets.len());
 
@@ -187,9 +226,10 @@ fn main() {
     };
     let (combined, closeness) = (best(true), best(false));
     // Candidates the usage model can't spell from known pieces (judged blind).
-    if let Some(u) = e.usage.as_ref() {
+    {
+        let u = lm();
         let all: Vec<&String> = targets.iter().flat_map(|t| t.rated.iter().map(|(s, _)| s)).collect();
-        let unknown = all.iter().filter(|s| u.encode_words(&s.split(' ').map(String::from).collect::<Vec<_>>()).0.contains(&scribe::usage::vocab::UNK)).count();
+        let unknown = all.iter().filter(|s| u.unknown(s)).count();
         println!("candidates with a piece unknown to the usage model: {:.1}% of {}", 100.0 * unknown as f64 / all.len() as f64, all.len());
     }
     println!("ranking (stage 7), GAP on {split}:");
@@ -265,9 +305,9 @@ fn main() {
         // Generated: the usage model's own top words for the slot, as lemmas
         // usable in the word's part of speech.
         let generated_by = |mode: u8, k: usize| -> Vec<String> {
-            let (Some(u), Some(p)) = (e.usage.as_ref(), Pos::from_upos(&tok.upos)) else { return vec![] };
+            let (u, Some(p)) = (lm(), Pos::from_upos(&tok.upos)) else { return vec![] };
             let lower: Vec<String> = t.words.iter().map(|w| w.to_lowercase()).collect();
-            let all = |visible: bool| -> HashMap<String, f32> { u.predict(&lower, t.at, usize::MAX, visible).unwrap_or_default().into_iter().collect() };
+            let all = |visible: bool| -> HashMap<String, f32> { u.top(&lower, t.at, usize::MAX, visible).into_iter().collect() };
             let mut scored: Vec<(String, f32)> = match mode {
                 0 => all(false).into_iter().collect(),
                 1 => all(true).into_iter().collect(),
