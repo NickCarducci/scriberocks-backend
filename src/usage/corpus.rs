@@ -89,6 +89,16 @@ pub fn usage_sentences(lexicon: &Lexicon, treebank: &[Vec<String>], wiktionary: 
     out
 }
 
+/// One sentence per line from an extra corpus file (scripts/extract_corpus.py
+/// output), tokenized and lowercased like the rest of the usage corpus.
+/// Blank lines and lines over `max_words` tokens are skipped.
+pub fn plain_sentences(text: &str, max_words: usize) -> Vec<Vec<String>> {
+    text.lines()
+        .map(|l| crate::text::tokenize(l.trim()).into_iter().map(|w| w.to_lowercase()).collect::<Vec<_>>())
+        .filter(|t| !t.is_empty() && t.len() <= max_words)
+        .collect()
+}
+
 /// Index of the token that is `word` (or an inflection of it, via `lemmas`).
 pub fn find_word(tokens: &[String], word: &str, lemmas: impl Fn(&str) -> Vec<String>) -> Option<usize> {
     let word = word.to_lowercase();
@@ -122,6 +132,15 @@ mod pipeline_tests {
         assert_eq!(find_word(&toks("she ran home"), "run", lemmas), Some(1));
         assert_eq!(find_word(&toks("Run fast"), "run", lemmas), Some(0));
         assert_eq!(find_word(&toks("walk home"), "run", lemmas), None);
+    }
+
+    #[test]
+    fn plain_sentences_tokenize_lowercase_and_skip_blank_or_long_lines() {
+        // "doesn't" and "Mary's" tokenize to two pieces each; the stop counts.
+        let got = plain_sentences("Tom doesn't want Mary's pity.\n\n  It lives in tall grass.  \none two three four five six seven eight nine\n", 8);
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[1], vec!["it", "lives", "in", "tall", "grass", "."]);
+        assert!(got[0].iter().all(|w| w.chars().all(|c| !c.is_uppercase())));
     }
 
     #[test]

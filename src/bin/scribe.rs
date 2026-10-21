@@ -3,7 +3,9 @@
 //! scribe frames <models-dir>                stdin → one JSON frame per clause
 //! scribe variants <models-dir> [limit]      stdin → one JSON variant per line
 //! scribe train-usage <data-dir> <models-dir> [steps] [--morph]   usage model + sense index (build with --features metal);
-//!                                                       --morph splits words into base + ending → models/usage-morph
+//!                                                       --morph splits words into base + ending → models/usage-morph;
+//!                                                       --extra <file> (repeatable) adds one-sentence-per-line text
+//!                                                       (scripts/extract_corpus.py); --name <dir> names the output
 //! scribe build-senses <models-dir> [usage-dir-name]     rebuild the sense index from a trained usage model
 //! scribe train-senses <data-dir> <models-dir> [steps]   sense modeling: continue models/usage with a supersense
 //!                                                       objective (dictionary-allowed sets + SemCor gold) → models/usage-sense;
@@ -15,7 +17,7 @@
 
 use scribe::{conllu, inflect::Inflector, lm::LanguageModel, parser::Parser, tagger::{Column, Tagger}, text, Engine, Lexicon};
 use std::io::Read;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -132,7 +134,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some("train-usage") => {
             let steps = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(20_000);
             let morph = args.iter().any(|a| a == "--morph");
-            train_usage(Path::new(arg(2)?), Path::new(arg(3)?), steps, morph)?
+            let extra: Vec<PathBuf> = args.windows(2).filter(|w| w[0] == "--extra").map(|w| PathBuf::from(&w[1])).collect();
+            let name = args.windows(2).find(|w| w[0] == "--name").map(|w| w[1].clone());
+            train_usage(Path::new(arg(2)?), Path::new(arg(3)?), steps, morph, &extra, name)?
         }
         _ => eprintln!("usage: scribe build-lexicon | train | frames | variants | train-usage (see source header)"),
     }
@@ -236,7 +240,7 @@ fn train_senses(data: &Path, models: &Path, steps: usize, control: bool) -> Resu
     Ok(())
 }
 
-fn train_usage(data: &Path, models: &Path, steps: usize, morph: bool) -> Result<(), Box<dyn std::error::Error>> {
+fn train_usage(data: &Path, models: &Path, steps: usize, morph: bool, extra: &[PathBuf], name: Option<String>) -> Result<(), Box<dyn std::error::Error>> {
     use scribe::usage::{corpus, model::{Config, Device, TrainOptions, UsageModel}, vocab::Vocab};
     use std::io::{BufRead, Write};
 
@@ -266,6 +270,11 @@ fn train_usage(data: &Path, models: &Path, steps: usize, morph: bool) -> Result<
     let examples = corpus::wordnet_examples(&lex);
     let (held, train_ex): (Vec<_>, Vec<_>) = examples.into_iter().partition(|e| corpus::is_held_out(e.synset, &e.sentence, 10));
     sentences.extend(train_ex.iter().map(|e| tokenize(&e.sentence)));
+    for file in extra {
+        let more = corpus::plain_sentences(&std::fs::read_to_string(file)?, 40);
+        eprintln!("extra corpus {}: {} sentences", file.display(), more.len());
+        sentences.extend(more);
+    }
     let tokens: usize = sentences.iter().map(Vec::len).sum();
     eprintln!(
         "corpus: {} sentences, {} tokens (wiktionary {wiktionary}, treebank {}, wordnet {} train / {} held out)",
@@ -277,15 +286,19 @@ fn train_usage(data: &Path, models: &Path, steps: usize, morph: bool) -> Result<
     #[cfg(not(feature = "metal"))]
     let device = Device::Cpu;
 
-    let name = if morph { "usage-morph" } else { "usage" };
+    let name = name.unwrap_or_else(|| if morph { "usage-morph" } else { "usage" }.to_string());
+    let name = name.as_str();
     // Base + ending pieces: split table built from every word in the corpus.
     let morphology = morph.then(|| {
         scribe::usage::morph::Morphology::build(sentences.iter().flatten().cloned(), |w| lex.lemmatize(w, None))
     });
+    // Without morphology the pieces are the words: move, don't copy (the
+    // corpus can be tens of millions of tokens).
     let pieces: Vec<Vec<String>> = match &morphology {
         Some(m) => sentences.iter().map(|s| m.split_sentence(s).0).collect(),
-        None => sentences.clone(),
+        None => std::mem::take(&mut sentences),
     };
+    drop(sentences);
     if let Some(m) = &morphology {
         eprintln!("morphology: {} inflected word forms split into base + ending", m.len());
     }
