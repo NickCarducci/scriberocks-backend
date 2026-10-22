@@ -160,3 +160,21 @@ fn generate_enhances_every_proposal_without_reordering_them() {
     }
     assert!(engine.variants(rock, 10).iter().all(|v| v.enhanced.is_none()), "still off by default");
 }
+
+/// Rejects every candidate but the original word.
+struct OnlyOriginal;
+impl scribe::engine::SlotScorer for OnlyOriginal {
+    fn slot_scores(&self, context: &[String], slot: usize, candidates: &[String]) -> Option<Vec<f32>> {
+        Some(candidates.iter().map(|c| if *c == context[slot] { 0.0 } else { -100.0 }).collect())
+    }
+}
+
+/// A judge can replace the usage model's (to compare models on the same rocks).
+#[test]
+fn a_replacement_judge_decides_which_swaps_survive() {
+    let Some(mut engine) = engine() else { return };
+    let rock = "The river bank was quiet in the morning.";
+    assert!(!swaps(&engine, rock).is_empty(), "the usage model keeps some swaps");
+    engine.judge = Some(Box::new(OnlyOriginal));
+    assert!(swaps(&engine, rock).is_empty(), "{:?}", swaps(&engine, rock));
+}

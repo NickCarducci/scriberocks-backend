@@ -86,6 +86,9 @@ pub struct Engine {
     /// ScribeIE's enhancer, if one is loaded (used only when a request turns
     /// Generate on; see scribe_ie.rs).
     pub enhancer: Option<Box<dyn crate::scribe_ie::Enhancer>>,
+    /// Replaces the usage model as the judge of swaps when set (e.g. a
+    /// BERT-format model, to compare judges on the same rocks).
+    pub judge: Option<Box<dyn SlotScorer + Send + Sync>>,
 }
 
 pub const CONTENT: &[&str] = &["NOUN", "VERB", "ADJ", "ADV"];
@@ -98,6 +101,12 @@ pub const CONTENT: &[&str] = &["NOUN", "VERB", "ADJ", "ADV"];
 pub trait SlotScorer {
     /// `context[slot]` is replaced by each candidate (which may be several words).
     fn slot_scores(&self, context: &[String], slot: usize, candidates: &[String]) -> Option<Vec<f32>>;
+}
+
+impl SlotScorer for crate::bert::Bert {
+    fn slot_scores(&self, context: &[String], slot: usize, candidates: &[String]) -> Option<Vec<f32>> {
+        crate::bert::Bert::slot_scores(self, context, slot, candidates).ok()
+    }
 }
 
 impl SlotScorer for UsageModel {
@@ -152,6 +161,7 @@ impl Engine {
                 false => None,
             },
             enhancer: None,
+            judge: None,
             lexicon,
             sense_margin: SENSE_MARGIN,
             head_margin: HEAD_MARGIN,
@@ -164,7 +174,10 @@ impl Engine {
 
     /// The learned head used to judge closed-set candidates, if any.
     pub fn slot_scorer(&self) -> Option<&dyn SlotScorer> {
-        self.usage.as_ref().map(|u| u as &dyn SlotScorer)
+        match &self.judge {
+            Some(j) => Some(j.as_ref() as &dyn SlotScorer),
+            None => self.usage.as_ref().map(|u| u as &dyn SlotScorer),
+        }
     }
 
     pub fn parse(&self, input: &str) -> Vec<Sentence> {
