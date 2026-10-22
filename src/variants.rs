@@ -36,6 +36,10 @@ pub struct Variant {
     pub fluency_delta: f64,
     /// Byte ranges in `text` of words that aren't in the original.
     pub changed: Vec<(usize, usize)>,
+    /// ScribeIE's enhanced version of this proposal (Generate on, model loaded).
+    pub enhanced: Option<String>,
+    /// Byte ranges in `enhanced` of the words ScribeIE added.
+    pub enhanced_changed: Vec<(usize, usize)>,
 }
 
 struct Candidate {
@@ -112,7 +116,7 @@ impl Engine {
         self.variants_with(rock, limit, &crate::scribe_ie::EditOptions::default())
     }
 
-    /// As `variants`, with per-request options (ScribeIE's clarity re-ranking).
+    /// As `variants`, with per-request options (Generate: ScribeIE enhances each proposal).
     pub fn variants_with(&self, rock: &str, limit: usize, options: &crate::scribe_ie::EditOptions) -> Vec<Variant> {
         let sentences = self.parse(rock);
         if sentences.is_empty() {
@@ -130,7 +134,7 @@ impl Engine {
                 return;
             }
             let changed = changed_ranges(&all_original, &sents.concat(), &offsets);
-            out.push(Variant { text, ops, fluency_delta: delta, changed });
+            out.push(Variant { text, ops, fluency_delta: delta, changed, enhanced: None, enhanced_changed: vec![] });
         };
 
         // Whole-sentence cuts for multi-sentence rocks.
@@ -175,15 +179,18 @@ impl Engine {
             }
         }
 
-        // ScribeIE (opt-in): clarity joins fluency in the ranking.
-        if let (true, Some(scorer)) = (options.scribe_ie, self.clarity.as_ref()) {
-            for v in &mut out {
-                if let Some(c) = scorer.clarity(&original_text, &v.text) {
-                    v.fluency_delta += options.clarity_weight * c;
+        let mut picked = diversify(out, limit);
+        // Generate (ScribeIE, opt-in): an enhanced version rides alongside each
+        // proposal; ScribeSLM's text and order stay as they are.
+        if let (true, Some(enhancer)) = (options.generate, self.enhancer.as_ref()) {
+            for v in &mut picked {
+                if let Some(e) = enhancer.enhance(&original_text, &v.text).filter(|e| *e != v.text) {
+                    v.enhanced_changed = crate::scribe_ie::added_words(&v.text, &e);
+                    v.enhanced = Some(e);
                 }
             }
         }
-        diversify(out, limit)
+        picked
     }
 
     /// The sentence with accepted marks inserted: gaps come from the parse

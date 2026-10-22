@@ -116,35 +116,47 @@ fn cant_reframe_turns_but_into_because() {
     assert!(got.iter().any(|v| v.contains("need to come to the party but")), "{got:?}");
 }
 
-/// ScribeIE (optional clarity re-ranking, off by default) must never change
-/// suggestions unless it is switched on and has a scorer.
+/// Generate (ScribeIE, off by default): never changes ScribeSLM's proposals,
+/// their order or text; without an enhancer it adds nothing.
 #[test]
-fn scribe_ie_is_off_by_default_and_inert_without_a_model() {
+fn generate_is_off_by_default_and_inert_without_a_model() {
     let Some(engine) = engine() else { return };
     let rock = "I want to come to the party but I have to work late.";
-    let texts = |v: Vec<scribe::Variant>| -> Vec<String> { v.into_iter().map(|x| x.text).collect() };
-    let base = texts(engine.variants(rock, 10));
-    assert_eq!(texts(engine.variants_with(rock, 10, &scribe::scribe_ie::EditOptions::default())), base, "off = today");
-    let on = scribe::scribe_ie::EditOptions { scribe_ie: true, ..Default::default() };
-    assert!(engine.clarity.is_none());
-    assert_eq!(texts(engine.variants_with(rock, 10, &on)), base, "on without a model = today");
+    let texts = |v: &[scribe::Variant]| -> Vec<String> { v.iter().map(|x| x.text.clone()).collect() };
+    let base = engine.variants(rock, 10);
+    assert!(base.iter().all(|v| v.enhanced.is_none()), "off by default");
+    let on = scribe::scribe_ie::EditOptions { generate: true };
+    assert!(engine.enhancer.is_none());
+    let got = engine.variants_with(rock, 10, &on);
+    assert_eq!(texts(&got), texts(&base));
+    assert!(got.iter().all(|v| v.enhanced.is_none()), "on without a model adds nothing");
 }
 
-struct PrefersBecause;
-impl scribe::scribe_ie::ClarityScorer for PrefersBecause {
-    fn clarity(&self, _before: &str, after: &str) -> Option<f64> {
-        Some(if after.contains("because") { 10.0 } else { 0.0 })
+/// A stand-in enhancer: ScribeIE's rewrite of each proposal.
+struct Celebrate;
+impl scribe::scribe_ie::Enhancer for Celebrate {
+    fn enhance(&self, _rock: &str, proposal: &str) -> Option<String> {
+        proposal.contains("party").then(|| proposal.replace("party", "celebration"))
     }
 }
 
 #[test]
-fn scribe_ie_reranks_by_clarity_when_on() {
+fn generate_enhances_every_proposal_without_reordering_them() {
     let Some(mut engine) = engine() else { return };
     let rock = "I want to come to the party but I have to work late.";
-    engine.clarity = Some(Box::new(PrefersBecause));
-    let on = scribe::scribe_ie::EditOptions { scribe_ie: true, ..Default::default() };
-    let got = engine.variants_with(rock, 10, &on);
-    assert!(got[0].text.contains("because"), "{:?}", got.iter().map(|v| &v.text).collect::<Vec<_>>());
-    // Still off by default even with a scorer loaded.
-    assert!(!engine.variants(rock, 10)[0].text.contains("because") || engine.variants(rock, 10)[0].text == got[0].text);
+    let base: Vec<String> = engine.variants(rock, 10).into_iter().map(|v| v.text).collect();
+    engine.enhancer = Some(Box::new(Celebrate));
+    let got = engine.variants_with(rock, 10, &scribe::scribe_ie::EditOptions { generate: true });
+    assert_eq!(got.iter().map(|v| v.text.clone()).collect::<Vec<_>>(), base, "ScribeSLM's proposals and order untouched");
+    for v in &got {
+        match &v.enhanced {
+            Some(e) => {
+                assert_eq!(*e, v.text.replace("party", "celebration"));
+                let marked: Vec<&str> = v.enhanced_changed.iter().map(|&(a, b)| &e[a..b]).collect();
+                assert_eq!(marked, vec!["celebration"], "marks only what ScribeIE changed");
+            }
+            None => assert!(!v.text.contains("party")),
+        }
+    }
+    assert!(engine.variants(rock, 10).iter().all(|v| v.enhanced.is_none()), "still off by default");
 }

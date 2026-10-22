@@ -61,15 +61,20 @@ everything added is curated usage. No definitions in usage training.
 | Judge | Keeps edits that fit the sentence; ranks how natural each version reads | Usage model (fit in the slot) + Kneser–Ney trigram fluency (scores, never generates) | SWORDS GAP 37.1 (with closeness to the original, not shipped: 42.4; BERT-mini 48.1) |
 | Choose and order | Drops near-duplicates, orders for variety | Rules | — |
 
-### 5. ScribeIE — Intent-conditioned Editing (optional, off by default)
+### 5. ScribeIE — Intent-conditioned Editing (optional: the "Generate" toggle, off by default)
 
-Re-ranks the judged suggestions by the writer's chosen intent — clarity
-first (later fluency, coherence, style: IteraTeR's intent labels) — by how
-much better each version serves it than the original. Its scorer will learn from editors' revisions (IteraTeR's clarity
-edits) — a different kind of source from the standards above, so it is
-opt-in: `EditOptions { scribe_ie: true }` in Rust, `setScribeIe(true)` from
-Swift. Without a loaded scorer it changes nothing (`scribe_ie.rs`; tested in
-tests/acceptance.rs). Status: switch built; clarity model not yet trained.
+With Generate on, every proposal ScribeSLM made is enhanced: ScribeIE rewrites
+it toward the writer's intent (clarity first; later fluency, coherence, style,
+IteraTeR's intent labels). ScribeSLM's proposals, text and order never
+change; the enhanced version rides alongside each (`Variant::enhanced`), its
+added words marked (`enhanced_changed`; in the app a red underline over a
+semi-transparent highlight), and the writer saves whichever they like.
+Planned model: GECToR-style edit tagging ("tag, not rewrite", Grammarly
+research) on the flagship encoder, trained on IteraTeR's revisions — editors,
+a different source from the standards above, which is why it is opt-in.
+`EditOptions { generate: true }` in Rust, `setGenerate(true)` from Swift;
+without a model it adds nothing (`scribe_ie.rs`; tests/acceptance.rs).
+Status: plumbing built; model not yet trained.
 
 The boundary between proposing and judging is `SlotScorer` (engine.rs): any
 scorer (the from-scratch usage model today; BERT-mini adapted to usage, FidelityAI or a classical head

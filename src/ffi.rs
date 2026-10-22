@@ -32,6 +32,10 @@ pub struct RockVariant {
     pub fluency_delta: f64,
     /// Words not in the original, as UTF-8 byte ranges into `text`.
     pub changed: Vec<ByteRange>,
+    /// ScribeIE's enhanced version (Generate on and a model loaded), else nil.
+    pub enhanced: Option<String>,
+    /// Words ScribeIE added, as UTF-8 byte ranges into `enhanced`.
+    pub enhanced_changed: Vec<ByteRange>,
 }
 
 #[derive(uniffi::Record)]
@@ -51,8 +55,8 @@ pub struct RockFrame {
 #[derive(uniffi::Object)]
 pub struct ScribeEngine {
     engine: Engine,
-    /// ScribeIE switch (off by default), set from the app's settings.
-    scribe_ie: std::sync::atomic::AtomicBool,
+    /// The Generate toggle (ScribeIE; off by default), set from the app.
+    generate: std::sync::atomic::AtomicBool,
 }
 
 fn name<T: serde::Serialize>(v: &T) -> String {
@@ -65,22 +69,22 @@ impl ScribeEngine {
     #[uniffi::constructor]
     pub fn new(models_dir: String) -> Result<Arc<Self>, ScribeError> {
         Engine::load(Path::new(&models_dir))
-            .map(|engine| Arc::new(ScribeEngine { engine, scribe_ie: std::sync::atomic::AtomicBool::new(false) }))
+            .map(|engine| Arc::new(ScribeEngine { engine, generate: std::sync::atomic::AtomicBool::new(false) }))
             .map_err(|e| ScribeError::ModelsUnavailable { message: e.to_string() })
     }
 
-    /// Turns ScribeIE (clarity re-ranking) on or off. Off by default.
-    pub fn set_scribe_ie(&self, enabled: bool) {
-        self.scribe_ie.store(enabled, std::sync::atomic::Ordering::Relaxed);
+    /// The Generate toggle: ScribeIE enhances every proposal. Off by default.
+    pub fn set_generate(&self, enabled: bool) {
+        self.generate.store(enabled, std::sync::atomic::Ordering::Relaxed);
     }
 
-    /// Whether a ScribeIE clarity model is loaded (the setting does nothing without one).
-    pub fn scribe_ie_available(&self) -> bool {
-        self.engine.clarity.is_some()
+    /// Whether a ScribeIE model is loaded (the toggle does nothing without one).
+    pub fn generate_available(&self) -> bool {
+        self.engine.enhancer.is_some()
     }
 
     pub fn variants(&self, rock: String, limit: u32) -> Vec<RockVariant> {
-        let options = crate::scribe_ie::EditOptions { scribe_ie: self.scribe_ie.load(std::sync::atomic::Ordering::Relaxed), ..Default::default() };
+        let options = crate::scribe_ie::EditOptions { generate: self.generate.load(std::sync::atomic::Ordering::Relaxed) };
         self.engine
             .variants_with(&rock, limit as usize, &options)
             .into_iter()
@@ -89,6 +93,8 @@ impl ScribeEngine {
                 ops: v.ops.iter().map(name).collect(),
                 fluency_delta: v.fluency_delta,
                 changed: v.changed.into_iter().map(|(a, b)| ByteRange { start: a as u32, end: b as u32 }).collect(),
+                enhanced: v.enhanced,
+                enhanced_changed: v.enhanced_changed.into_iter().map(|(a, b)| ByteRange { start: a as u32, end: b as u32 }).collect(),
             })
             .collect()
     }

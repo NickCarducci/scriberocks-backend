@@ -1,27 +1,60 @@
-//! ScribeIE (Intent-conditioned Editing): an optional fifth stage of ScribeSLM, off by default. After
-//! proposing and judging, it re-ranks the judged suggestions by clarity: how
-//! much clearer each version reads than the original. Its scorer learns from
-//! editors' revisions (IteraTeR's clarity edits), a different kind of source
-//! from ScribeSLM's standards, which is why it is opt-in. It never proposes;
-//! it only reorders what ScribeSLM already judged.
+//! ScribeIE (Intent-conditioned Editing): ScribeSLM's optional generative
+//! stage, behind the app's "Generate" toggle (off by default). When on, every
+//! proposal ScribeSLM made is enhanced: ScribeIE rewrites it toward the
+//! writer's intent (clarity first), and the writer may save either version.
+//! ScribeSLM's proposals, text and order are never changed; the enhanced
+//! version rides alongside each one (`Variant::enhanced`), with the words
+//! ScribeIE added marked (`Variant::enhanced_changed`). Its model will learn
+//! from editors' revisions (IteraTeR) — a different source from ScribeSLM's
+//! standards, which is why it is opt-in.
 
-/// Says how much clearer `after` is than `before` (any scale; 0 = no change).
-/// None when it can't judge, which leaves the order alone.
-pub trait ClarityScorer: Send + Sync {
-    fn clarity(&self, before: &str, after: &str) -> Option<f64>;
+/// ScribeIE's rewrite of one proposal of `rock`; None leaves it as is.
+pub trait Enhancer: Send + Sync {
+    fn enhance(&self, rock: &str, proposal: &str) -> Option<String>;
 }
 
-/// Options for one request for suggestions. Default: ScribeIE off.
-#[derive(Clone, Debug)]
+/// Options for one request for suggestions. Default: Generate off.
+#[derive(Clone, Debug, Default)]
 pub struct EditOptions {
-    /// Re-rank by clarity (needs a loaded scorer; otherwise no effect).
-    pub scribe_ie: bool,
-    /// Weight of clarity against fluency in the ranking.
-    pub clarity_weight: f64,
+    /// Enhance every proposal with ScribeIE (needs a loaded enhancer; otherwise no effect).
+    pub generate: bool,
 }
 
-impl Default for EditOptions {
-    fn default() -> Self {
-        EditOptions { scribe_ie: false, clarity_weight: 1.0 }
+/// Byte ranges of the words in `enhanced` that the plain `proposal` doesn't
+/// have (case-insensitive, counting repeats), for marking ScribeIE's part.
+pub fn added_words(proposal: &str, enhanced: &str) -> Vec<(usize, usize)> {
+    let norm = |w: &str| w.trim_matches(|c: char| !c.is_alphanumeric() && c != '\'').to_lowercase();
+    let mut have: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for w in proposal.split_whitespace() { *have.entry(norm(w)).or_default() += 1 }
+    let mut out = Vec::new();
+    let mut at = 0;
+    for w in enhanced.split_whitespace() {
+        let start = at + enhanced[at..].find(w).unwrap_or(0);
+        at = start + w.len();
+        let key = norm(w);
+        match have.get_mut(&key) {
+            Some(n) if *n > 0 => *n -= 1,
+            _ if !key.is_empty() => {
+                let lead = w.len() - w.trim_start_matches(|c: char| !c.is_alphanumeric()).len();
+                let core = w.trim_matches(|c: char| !c.is_alphanumeric() && c != '\'');
+                out.push((start + lead, start + lead + core.len()));
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn added_words_marks_only_new_words_with_their_punctuation_trimmed() {
+        let e = "I can't come to the celebration, sadly.";
+        let r = added_words("I can't come to the party.", e);
+        let got: Vec<&str> = r.iter().map(|&(a, b)| &e[a..b]).collect();
+        assert_eq!(got, vec!["celebration", "sadly"]);
+        assert!(added_words("same words here", "Same words here").is_empty());
     }
 }
