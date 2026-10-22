@@ -34,6 +34,7 @@ use scribe::{conllu, text, wordpiece, Lexicon, Pos};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
+/// Default sentences per step (--batch to change).
 const BATCH: usize = 128;
 const HELD_OUT: usize = 2000;
 const WARMUP: usize = 2000;
@@ -77,6 +78,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let value = |name: &str| args.windows(2).find(|w| w[0] == name).map(|w| w[1].clone());
     let n: Option<usize> = value("--sample").and_then(|v| v.parse().ok()).or(quick.then_some(5_000));
     let vocab_size: usize = value("--vocab").and_then(|v| v.parse().ok()).unwrap_or(if quick { 8_000 } else { 30_000 });
+    let batch_size: usize = value("--batch").and_then(|v| v.parse().ok()).unwrap_or(BATCH);
     let every: usize = value("--every").and_then(|v| v.parse().ok()).unwrap_or(if quick { 250 } else { 2_000 });
     let joint: f32 = value("--joint").and_then(|v| v.parse().ok()).unwrap_or(1.0);
     let out = PathBuf::from(value("--out").unwrap_or_else(|| "models/curated-scratch".into()));
@@ -159,7 +161,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let unk = bert.special("[UNK]");
     let unknown = data.iter().flat_map(|e| &e.ids).filter(|&&i| i == unk).count();
     eprintln!("corpus: {} sentences, {pieces} pieces ({:.2}% [UNK]); ~{:.1} passes over {steps} steps",
-              data.len(), 100.0 * unknown as f64 / pieces as f64, (steps * BATCH) as f64 / data.len() as f64);
+              data.len(), 100.0 * unknown as f64 / pieces as f64, (steps * batch_size) as f64 / data.len() as f64);
 
     let dict = if joint > 0.0 { dictionary_examples(&bert, &lex, SEMCOR, Path::new("data/oewn"))? } else { vec![] };
     let (dict_train, dict_held) = dict.split_at(dict.len().saturating_sub(1000));
@@ -168,7 +170,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let evaluate = || -> candle_core::Result<(f32, f32)> {
         let mut rng = Rng(99);
         let refs: Vec<&Encoded> = held.iter().collect();
-        let chunks: Vec<&[&Encoded]> = refs.chunks(BATCH).collect();
+        let chunks: Vec<&[&Encoded]> = refs.chunks(batch_size).collect();
         let mut m = 0.0;
         for c in &chunks {
             let (rows, at, gold) = mask_whole_words(&bert, c, &mut rng);
@@ -176,7 +178,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         let mut d = 0.0;
         let drefs: Vec<&DictExample> = dict_held.iter().collect();
-        let dchunks: Vec<&[&DictExample]> = drefs.chunks(BATCH).collect();
+        let dchunks: Vec<&[&DictExample]> = drefs.chunks(batch_size).collect();
         for c in &dchunks { d += dictionary_loss(&bert, c, &dev)?.to_scalar::<f32>()? }
         Ok((m / chunks.len() as f32, if dchunks.is_empty() { 0.0 } else { d / dchunks.len() as f32 }))
     };
@@ -187,27 +189,40 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut opt = AdamW::new(vars.all_vars(), ParamsAdamW { lr: LR, weight_decay: 0.01, ..Default::default() })?;
     let mut rng = Rng(0x2545F4914F6CDD1D);
     let t0 = std::time::Instant::now();
-    let mut window = 0.0f32;
+    // Length buckets: sentences sorted by length, cut into batches, batch order
+    // shuffled each pass, so padding stays small (lengths range ~5 to 128 pieces).
+    let mut by_length: Vec<usize> = (0..data.len()).collect();
+    by_length.sort_by_key(|&i| data[i].ids.len());
+    let mut batches: Vec<Vec<usize>> = by_length.chunks(batch_size).map(|c| c.to_vec()).collect();
+    let mut next_batch = batches.len();
+    // Training loss stays on the GPU until a checkpoint (no per-step sync).
+    let mut window: Option<candle_core::Tensor> = None;
     for step in 0..steps {
         let lr = if step < WARMUP { LR * (step + 1) as f64 / WARMUP as f64 } else { LR * (steps - step) as f64 / (steps - WARMUP).max(1) as f64 };
         opt.set_learning_rate(lr);
-        let batch: Vec<&Encoded> = (0..BATCH).map(|_| &data[(rng.next() % data.len() as u64) as usize]).collect();
+        if next_batch == batches.len() {
+            for i in (1..batches.len()).rev() { batches.swap(i, (rng.next() % (i as u64 + 1)) as usize) }
+            next_batch = 0;
+        }
+        let batch: Vec<&Encoded> = batches[next_batch].iter().map(|&i| &data[i]).collect();
+        next_batch += 1;
         let (rows, at, gold) = mask_whole_words(&bert, &batch, &mut rng);
         if at.is_empty() { continue }
         let mut loss = masked_loss(&bert, &rows, &at, &gold, &dev)?;
         if joint > 0.0 && !dict_train.is_empty() {
-            let b: Vec<&DictExample> = (0..BATCH / 2).map(|_| &dict_train[(rng.next() % dict_train.len() as u64) as usize]).collect();
+            let b: Vec<&DictExample> = (0..batch_size / 2).map(|_| &dict_train[(rng.next() % dict_train.len() as u64) as usize]).collect();
             loss = (loss + (dictionary_loss(&bert, &b, &dev)? * joint as f64)?)?;
         }
-        window += loss.to_scalar::<f32>()?;
+        let l = loss.detach();
+        window = Some(match window.take() { Some(w) => (w + l)?, None => l });
         opt.backward_step(&loss)?;
         if (step + 1) % every == 0 || step + 1 == steps {
             let (m, d) = evaluate()?;
             let h = m + joint * d;
             let saved = if h < best { best = h; vars.save(out.join("model.safetensors"))?; " saved" } else { "" };
             let span = if (step + 1) % every == 0 { every as f32 } else { ((step + 1) % every) as f32 };
-            eprintln!("  step {:>7}  train {:.3}  held-out masked {m:.3} dictionary {d:.3}  ({:.0?}){saved}", step + 1, window / span, t0.elapsed());
-            window = 0.0;
+            let train = window.take().map(|w| w.to_scalar::<f32>()).transpose()?.unwrap_or(0.0) / span;
+            eprintln!("  step {:>7}  train {train:.3}  held-out masked {m:.3} dictionary {d:.3}  ({:.0?}){saved}", step + 1, t0.elapsed());
         }
     }
     eprintln!("best held-out {best:.3}; model in {}", out.display());
