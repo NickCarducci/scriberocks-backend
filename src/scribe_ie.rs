@@ -1,4 +1,4 @@
-//! ScribeIE: an optional fifth stage of ScribeSLM, off by default. After
+//! ScribeIE (Intent-conditioned Editing): an optional fifth stage of ScribeSLM, off by default. After
 //! proposing and judging, it re-ranks the judged suggestions by clarity: how
 //! much clearer each version reads than the original. Its scorer learns from
 //! editors' revisions (IteraTeR's clarity edits), a different kind of source
