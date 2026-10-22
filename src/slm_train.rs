@@ -107,6 +107,42 @@ pub fn dictionary_loss(bert: &Bert, batch: &[&DictExample], dev: &Device) -> Res
 mod tests {
     use super::*;
 
+    /// A tiny model must memorize a handful of sentences (the standard
+    /// "can it overfit?" bug check), in both layouts.
+    fn overfits(pre_ln: bool) -> f32 {
+        use candle_nn::{AdamW, Optimizer, ParamsAdamW};
+        let lines = ["the cat sat on the mat .", "a dog ran in the park .", "she drank hot tea today .", "we built a small boat .",
+                     "the old man read a book .", "birds sang in the tall tree .", "he painted the red door .", "they sold fresh bread ."];
+        let sents: Vec<Vec<String>> = lines.iter().map(|l| l.split(' ').map(String::from).collect()).collect();
+        let mut vocab: Vec<String> = crate::wordpiece::SPECIALS.iter().map(|s| s.to_string()).collect();
+        for w in sents.iter().flatten() { if !vocab.contains(w) { vocab.push(w.clone()) } }
+        let dir = std::env::temp_dir().join(format!("scribe-overfit-{pre_ln}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("vocab.txt"), vocab.join("\n")).unwrap();
+        std::fs::write(dir.join("config.json"), serde_json::json!({"hidden_size": 32, "num_hidden_layers": 2, "num_attention_heads": 2,
+            "intermediate_size": 64, "max_position_embeddings": 16, "layer_norm_eps": 1e-12, "pre_layer_norm": pre_ln}).to_string()).unwrap();
+        let (bert, vars) = Bert::new_random(&dir, Device::Cpu).unwrap();
+        let data: Vec<Encoded> = sents.iter().map(|s| { let (ids, first) = bert.encode_words(s); Encoded { ids, first: first.iter().map(|&f| f as u16).collect() } }).collect();
+        let mut opt = AdamW::new(vars.all_vars(), ParamsAdamW { lr: 3e-3, weight_decay: 0.0, ..Default::default() }).unwrap();
+        let mut rng = Rng(5);
+        let refs: Vec<&Encoded> = data.iter().collect();
+        let mut last = 0.0;
+        for step in 0..600 {
+            let (rows, at, gold) = mask_whole_words(&bert, &refs, &mut rng);
+            if at.is_empty() { continue }
+            let loss = masked_loss(&bert, &rows, &at, &gold, &Device::Cpu).unwrap();
+            if step >= 550 { last += loss.to_scalar::<f32>().unwrap() / 50.0 }
+            opt.backward_step(&loss).unwrap();
+        }
+        last
+    }
+
+    #[test]
+    fn a_tiny_model_memorizes_a_few_sentences() {
+        let (post, pre) = (overfits(false), overfits(true));
+        assert!(pre < 1.0 && post < 1.0, "loss after 600 steps: pre-LN {pre:.3}, post-LN {post:.3} (unigram ≈ 3.3)");
+    }
+
     #[test]
     fn whole_word_masking_masks_all_pieces_of_a_word_and_never_specials() {
         let dir = Path::new("data/bert-mini");
@@ -130,5 +166,38 @@ mod tests {
         }
         let rate = masked as f64 / total as f64;
         assert!((0.08..0.25).contains(&rate), "masking rate {rate}");
+    }
+}
+
+#[cfg(test)]
+mod gradient_tests {
+    use super::*;
+
+    /// Every weight, in both layouts, must receive a gradient from the
+    /// masked-word loss (a fused op without a backward pass once cut the
+    /// encoder off silently, leaving only the output layer training).
+    #[test]
+    fn every_weight_gets_a_gradient() {
+        for pre_ln in [false, true] {
+            let sents: Vec<Vec<String>> = ["the cat sat on the mat .", "a dog ran in the park ."].iter().map(|l| l.split(' ').map(String::from).collect()).collect();
+            let mut vocab: Vec<String> = crate::wordpiece::SPECIALS.iter().map(|s| s.to_string()).collect();
+            for w in sents.iter().flatten() { if !vocab.contains(w) { vocab.push(w.clone()) } }
+            let dir = std::env::temp_dir().join(format!("scribe-grad-{pre_ln}"));
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("vocab.txt"), vocab.join("\n")).unwrap();
+            std::fs::write(dir.join("config.json"), serde_json::json!({"hidden_size": 16, "num_hidden_layers": 2, "num_attention_heads": 2,
+                "intermediate_size": 32, "max_position_embeddings": 16, "layer_norm_eps": 1e-12, "pre_layer_norm": pre_ln}).to_string()).unwrap();
+            let (bert, vars) = Bert::new_random(&dir, Device::Cpu).unwrap();
+            let rows: Vec<Vec<u32>> = sents.iter().map(|s| bert.encode_sentence(s)).collect();
+            let at: Vec<(usize, usize)> = vec![(0, 2), (1, 3)];
+            let gold: Vec<u32> = at.iter().map(|&(r, c)| rows[r][c]).collect();
+            let mut masked = rows.clone();
+            for &(r, c) in &at { masked[r][c] = bert.special("[MASK]") }
+            let grads = masked_loss(&bert, &masked, &at, &gold, &Device::Cpu).unwrap().backward().unwrap();
+            let missing: Vec<String> = vars.data().lock().unwrap().iter()
+                .filter(|(n, v)| !n.contains("token_type") && grads.get(v.as_tensor()).is_none())
+                .map(|(n, _)| n.clone()).collect();
+            assert!(missing.is_empty(), "pre_ln={pre_ln}: no gradient for {missing:?}");
+        }
     }
 }

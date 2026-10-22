@@ -4,7 +4,28 @@
 //! BertForPreTraining: `bert.*`, `cls.predictions.*`) plus its `vocab.txt`
 //! and `config.json`. Uncased WordPiece; inputs are already-tokenized words.
 use candle_core::{DType, Device, Module, Result, Tensor, D};
-use candle_nn::{embedding, layer_norm, linear, Embedding, LayerNorm, Linear, VarBuilder, VarMap};
+use candle_nn::{embedding, linear, Embedding, Linear, VarBuilder, VarMap};
+
+/// LayerNorm written out from differentiable ops. candle_nn's LayerNorm runs a
+/// fused kernel with no backward pass, so gradients silently stop at it.
+struct LayerNorm {
+    weight: Tensor,
+    bias: Tensor,
+    eps: f64,
+}
+
+fn layer_norm(dim: usize, eps: f64, vb: VarBuilder) -> Result<LayerNorm> {
+    Ok(LayerNorm { weight: vb.get(dim, "weight")?, bias: vb.get(dim, "bias")?, eps })
+}
+
+impl LayerNorm {
+    fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        let mean = x.mean_keepdim(D::Minus1)?;
+        let centered = x.broadcast_sub(&mean)?;
+        let var = centered.sqr()?.mean_keepdim(D::Minus1)?;
+        centered.broadcast_div(&(var + self.eps)?.sqrt()?)?.broadcast_mul(&self.weight)?.broadcast_add(&self.bias)
+    }
+}
 use std::collections::HashMap;
 use std::path::Path;
 
@@ -68,7 +89,7 @@ impl Bert {
         let bert = Bert::build(dir, VarBuilder::from_varmap(&vars, DType::F32, &device), device.clone())?;
         for (name, var) in vars.data().lock().unwrap().iter() {
             let shape = var.shape().clone();
-            let value = if name.contains("LayerNorm") {
+            let value = if name.contains("LayerNorm") || name.contains("final_norm") {
                 if name.ends_with("bias") { Tensor::zeros(shape, DType::F32, &device)? } else { Tensor::ones(shape, DType::F32, &device)? }
             } else if name.ends_with("bias") {
                 Tensor::zeros(shape, DType::F32, &device)?
@@ -189,7 +210,7 @@ impl Bert {
             let a = if pre { l.attn_norm.forward(&x)? } else { x.clone() };
             let (q, k, v) = (split(l.q.forward(&a)?)?, split(l.k.forward(&a)?)?, split(l.v.forward(&a)?)?);
             let att = (q.matmul(&k.t()?)? / (dh as f64).sqrt())?.broadcast_add(&mask)?;
-            let att = candle_nn::ops::softmax_last_dim(&att)?;
+            let att = candle_nn::ops::softmax(&att, D::Minus1)?; // not softmax_last_dim: its fused kernel has no backward pass
             let y = l.attn_out.forward(&att.matmul(&v)?.transpose(1, 2)?.reshape((b, t, dim))?)?;
             x = if pre { (y + &x)? } else { l.attn_norm.forward(&(y + &x)?)? };
             let f = if pre { l.ff_norm.forward(&x)? } else { x.clone() };
@@ -340,7 +361,7 @@ mod tests {
         for (name, v) in fresh.data().lock().unwrap().iter() {
             let t = v.as_tensor().flatten_all().unwrap();
             let std = t.sqr().unwrap().mean_all().unwrap().to_scalar::<f32>().unwrap().sqrt();
-            if name.contains("LayerNorm") && name.ends_with("weight") { assert!((std - 1.0).abs() < 1e-5, "{name}") }
+            if (name.contains("LayerNorm") || name.contains("final_norm")) && name.ends_with("weight") { assert!((std - 1.0).abs() < 1e-5, "{name}") }
             else if name.ends_with("bias") { assert!(std < 1e-6, "{name}") }
             else { assert!((0.015..0.025).contains(&std), "{name}: {std}") }
         }
