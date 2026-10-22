@@ -13,7 +13,11 @@
 //! - Pre-LayerNorm layout (trains reliably from scratch; --post-ln for BERT's).
 //! - Whole-word masking, many passes, and (--joint) the dictionary objective:
 //!   a hidden SemCor word's slot should accept its labelled meaning's synonyms.
-//! - --sample N: N sentences per source (smoke tests).
+//! - --sample N: N sentences per source (smoke tests). --every N: held-out
+//!   check every N steps (default 2,000).
+//! - --quick: a ~3-minute recipe check (1,500 steps on 5,000 sentences per
+//!   source, 8,000-piece vocabulary, a reading every 250 steps). For "does this
+//!   recipe learn, and how fast?", not for scores.
 //! - --focus-swords ADJ|NOUN|VERB|ADV [--cap 300000]: a topic slice for quick
 //!   recipe tests. Focus words are the SWORDS test's target words of that part
 //!   of speech (never its answer lists) plus their WordNet synonyms and similar
@@ -68,10 +72,12 @@ fn sample<T: Clone>(v: Vec<T>, n: Option<usize>) -> Vec<T> {
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().collect();
-    let steps: usize = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(200_000);
+    let quick = args.iter().any(|a| a == "--quick");
+    let steps: usize = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(if quick { 1_500 } else { 200_000 });
     let value = |name: &str| args.windows(2).find(|w| w[0] == name).map(|w| w[1].clone());
-    let n: Option<usize> = value("--sample").and_then(|v| v.parse().ok());
-    let vocab_size: usize = value("--vocab").and_then(|v| v.parse().ok()).unwrap_or(30_000);
+    let n: Option<usize> = value("--sample").and_then(|v| v.parse().ok()).or(quick.then_some(5_000));
+    let vocab_size: usize = value("--vocab").and_then(|v| v.parse().ok()).unwrap_or(if quick { 8_000 } else { 30_000 });
+    let every: usize = value("--every").and_then(|v| v.parse().ok()).unwrap_or(if quick { 250 } else { 2_000 });
     let joint: f32 = value("--joint").and_then(|v| v.parse().ok()).unwrap_or(1.0);
     let out = PathBuf::from(value("--out").unwrap_or_else(|| "models/curated-scratch".into()));
     let resume = args.iter().any(|a| a == "--resume");
@@ -195,12 +201,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         window += loss.to_scalar::<f32>()?;
         opt.backward_step(&loss)?;
-        if (step + 1) % 2000 == 0 || step + 1 == steps {
+        if (step + 1) % every == 0 || step + 1 == steps {
             let (m, d) = evaluate()?;
             let h = m + joint * d;
             let saved = if h < best { best = h; vars.save(out.join("model.safetensors"))?; " saved" } else { "" };
-            let every = if (step + 1) % 2000 == 0 { 2000.0 } else { ((step + 1) % 2000) as f32 };
-            eprintln!("  step {:>7}  train {:.3}  held-out masked {m:.3} dictionary {d:.3}  ({:.0?}){saved}", step + 1, window / every, t0.elapsed());
+            let span = if (step + 1) % every == 0 { every as f32 } else { ((step + 1) % every) as f32 };
+            eprintln!("  step {:>7}  train {:.3}  held-out masked {m:.3} dictionary {d:.3}  ({:.0?}){saved}", step + 1, window / span, t0.elapsed());
             window = 0.0;
         }
     }

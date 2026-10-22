@@ -1,0 +1,7 @@
+# ScribeSLM acceptance rocks: rock <TAB> must offer (| separated) <TAB> must never offer (| separated).
+# Matching is case-insensitive substring on each suggestion's text. Edit freely.
+i think the meeting was really kind of long and we didnt decide anything	The meeting was long|didn't decide	daylong
+The river bank was quiet in the morning. The water looked cold.	still in the morning|seemed cold|morning and the water	depository|financial
+She gave a brilliant speech about the future of small towns	superb speech|small towns.	superior speech|futurity|smaller towns
+I want to finish the book but I keep getting distracted	the book, but|complete the book	finish the record
+the old house needs a new roof before winter comes	winter comes.	hot roof
