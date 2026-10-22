@@ -109,6 +109,11 @@ pub fn keep_fitting(original: f32, mut scored: Vec<(String, f32)>, margin: f32, 
 impl Engine {
     /// Up to `limit` variants of `rock`, best first, adjacent ones kept dissimilar.
     pub fn variants(&self, rock: &str, limit: usize) -> Vec<Variant> {
+        self.variants_with(rock, limit, &crate::scribe_ie::EditOptions::default())
+    }
+
+    /// As `variants`, with per-request options (ScribeIE's clarity re-ranking).
+    pub fn variants_with(&self, rock: &str, limit: usize, options: &crate::scribe_ie::EditOptions) -> Vec<Variant> {
         let sentences = self.parse(rock);
         if sentences.is_empty() {
             return vec![];
@@ -170,6 +175,14 @@ impl Engine {
             }
         }
 
+        // ScribeIE (opt-in): clarity joins fluency in the ranking.
+        if let (true, Some(scorer)) = (options.scribe_ie, self.clarity.as_ref()) {
+            for v in &mut out {
+                if let Some(c) = scorer.clarity(&original_text, &v.text) {
+                    v.fluency_delta += options.clarity_weight * c;
+                }
+            }
+        }
         diversify(out, limit)
     }
 

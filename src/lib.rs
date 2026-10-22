@@ -19,6 +19,7 @@ pub mod lm;
 pub mod parser;
 pub mod punctuate;
 pub mod roles;
+pub mod scribe_ie;
 pub mod semcor;
 pub mod slm_train;
 pub mod syntax;

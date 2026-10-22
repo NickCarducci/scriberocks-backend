@@ -61,6 +61,15 @@ everything added is curated usage. No definitions in usage training.
 | Judge | Keeps edits that fit the sentence; ranks how natural each version reads | Usage model (fit in the slot) + Kneser–Ney trigram fluency (scores, never generates) | SWORDS GAP 37.1 (with closeness to the original, not shipped: 42.4; BERT-mini 48.1) |
 | Choose and order | Drops near-duplicates, orders for variety | Rules | — |
 
+### 5. ScribeIE (optional, off by default) — clarity
+
+Re-ranks the judged suggestions by how much clearer each reads than the
+original. Its scorer will learn from editors' revisions (IteraTeR's clarity
+edits) — a different kind of source from the standards above, so it is
+opt-in: `EditOptions { scribe_ie: true }` in Rust, `setScribeIe(true)` from
+Swift. Without a loaded scorer it changes nothing (`scribe_ie.rs`; tested in
+tests/acceptance.rs). Status: switch built; clarity model not yet trained.
+
 The boundary between proposing and judging is `SlotScorer` (engine.rs): any
 scorer (the from-scratch usage model today; BERT-mini adapted to usage, FidelityAI or a classical head
 later) is judged by the same tests (`examples/swords_eval.rs`,

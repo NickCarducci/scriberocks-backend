@@ -115,3 +115,36 @@ fn cant_reframe_turns_but_into_because() {
     // Other reframes keep "but".
     assert!(got.iter().any(|v| v.contains("need to come to the party but")), "{got:?}");
 }
+
+/// ScribeIE (optional clarity re-ranking, off by default) must never change
+/// suggestions unless it is switched on and has a scorer.
+#[test]
+fn scribe_ie_is_off_by_default_and_inert_without_a_model() {
+    let Some(engine) = engine() else { return };
+    let rock = "I want to come to the party but I have to work late.";
+    let texts = |v: Vec<scribe::Variant>| -> Vec<String> { v.into_iter().map(|x| x.text).collect() };
+    let base = texts(engine.variants(rock, 10));
+    assert_eq!(texts(engine.variants_with(rock, 10, &scribe::scribe_ie::EditOptions::default())), base, "off = today");
+    let on = scribe::scribe_ie::EditOptions { scribe_ie: true, ..Default::default() };
+    assert!(engine.clarity.is_none());
+    assert_eq!(texts(engine.variants_with(rock, 10, &on)), base, "on without a model = today");
+}
+
+struct PrefersBecause;
+impl scribe::scribe_ie::ClarityScorer for PrefersBecause {
+    fn clarity(&self, _before: &str, after: &str) -> Option<f64> {
+        Some(if after.contains("because") { 10.0 } else { 0.0 })
+    }
+}
+
+#[test]
+fn scribe_ie_reranks_by_clarity_when_on() {
+    let Some(mut engine) = engine() else { return };
+    let rock = "I want to come to the party but I have to work late.";
+    engine.clarity = Some(Box::new(PrefersBecause));
+    let on = scribe::scribe_ie::EditOptions { scribe_ie: true, ..Default::default() };
+    let got = engine.variants_with(rock, 10, &on);
+    assert!(got[0].text.contains("because"), "{:?}", got.iter().map(|v| &v.text).collect::<Vec<_>>());
+    // Still off by default even with a scorer loaded.
+    assert!(!engine.variants(rock, 10)[0].text.contains("because") || engine.variants(rock, 10)[0].text == got[0].text);
+}

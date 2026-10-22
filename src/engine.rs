@@ -83,6 +83,9 @@ pub struct Engine {
     /// Optional neural syntax (`syntax/`, from examples/parse_finetune.rs):
     /// refines the perceptron's UPOS tags and the transition parser's arcs.
     pub syntax: Option<crate::syntax::SyntaxModel>,
+    /// ScribeIE's clarity scorer, if one is loaded (used only when a request
+    /// switches ScribeIE on; see scribe_ie.rs).
+    pub clarity: Option<Box<dyn crate::scribe_ie::ClarityScorer>>,
 }
 
 pub const CONTENT: &[&str] = &["NOUN", "VERB", "ADJ", "ADV"];
@@ -148,6 +151,7 @@ impl Engine {
                 true => Some(crate::syntax::SyntaxModel::load(&dir.join("syntax"))?),
                 false => None,
             },
+            clarity: None,
             lexicon,
             sense_margin: SENSE_MARGIN,
             head_margin: HEAD_MARGIN,
