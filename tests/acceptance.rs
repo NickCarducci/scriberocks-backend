@@ -99,3 +99,19 @@ fn punctuate_only_ever_adds_punctuation() {
         }
     }
 }
+
+fn reframes(engine: &Engine, rock: &str) -> Vec<String> {
+    engine.variants(rock, 200).into_iter().filter(|v| v.ops.contains(&scribe::Op::Reframe)).map(|v| v.text).collect()
+}
+
+/// "I want to X but Y" is often a polite no: the can't reframe turns the
+/// "but" clause into the reason ("I can't X because Y").
+#[test]
+fn cant_reframe_turns_but_into_because() {
+    let Some(engine) = engine() else { return };
+    let got = reframes(&engine, "I want to come to the party but I have to work late.");
+    assert!(got.iter().any(|v| v.contains("can't come to the party because I have to work late")), "{got:?}");
+    assert!(!got.iter().any(|v| v.contains("can't come to the party but")), "{got:?}");
+    // Other reframes keep "but".
+    assert!(got.iter().any(|v| v.contains("need to come to the party but")), "{got:?}");
+}

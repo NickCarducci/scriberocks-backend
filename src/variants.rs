@@ -473,9 +473,16 @@ fn reframes(s: &Sentence, kept: &[usize]) -> Vec<Vec<String>> {
                 continue;
             }
             let first = remove[0];
+            // "I want to X but Y" is often a polite no: as "can't", the
+            // "but" clause becomes the reason ("I can't X because Y").
+            let reason = (name == "can't" && current == "want")
+                .then(|| kept.iter().copied().find(|&i| i > v && t[i].form.eq_ignore_ascii_case("but") && t[i].deprel == "cc"))
+                .flatten();
             let mut tokens = Vec::new();
             for &i in kept {
-                if i == first {
+                if Some(i) == reason {
+                    tokens.push("because".to_string());
+                } else if i == first {
                     let cap = t[i].form.chars().next().is_some_and(char::is_uppercase);
                     tokens.extend(phrase.iter().enumerate().map(|(j, w)| if j == 0 && cap { capitalize(w) } else { w.to_string() }));
                 } else if !remove.contains(&i) {
