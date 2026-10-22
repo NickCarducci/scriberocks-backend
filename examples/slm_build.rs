@@ -10,6 +10,7 @@
 //! - A WordPiece vocabulary learned from this corpus (src/wordpiece.rs).
 //! - Same shape as BERT-mini (4 layers × 256, 4 heads, 1,024 feed-forward), so it
 //!   runs wherever BERT-mini does; loads with bert::Bert.
+//! - Pre-LayerNorm layout (trains reliably from scratch; --post-ln for BERT's).
 //! - Whole-word masking, many passes, and (--joint) the dictionary objective:
 //!   a hidden SemCor word's slot should accept its labelled meaning's synonyms.
 //! - --sample N: N sentences per source (smoke tests).
@@ -133,6 +134,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "model_type": "bert", "hidden_size": 256, "num_hidden_layers": 4, "num_attention_heads": 4,
             "intermediate_size": 1024, "max_position_embeddings": MAX_LEN, "vocab_size": vocab.len(),
             "layer_norm_eps": 1e-12, "hidden_act": "gelu", "type_vocab_size": 2, "pad_token_id": 0,
+            "pre_layer_norm": !args.iter().any(|a| a == "--post-ln"),
             "trained_on": "standards: Wiktionary + WordNet examples, EWT train, Tatoeba, Simple English Wikipedia; SemCor meanings (joint)"
         });
         std::fs::write(out.join("config.json"), serde_json::to_string_pretty(&config)?)?;

@@ -32,6 +32,9 @@ pub struct Bert {
     vocab: Vec<String>,
     index: HashMap<String, u32>,
     max_len: usize,
+    /// Pre-LayerNorm layout (normalize each sublayer's input; one final norm):
+    /// trains reliably from scratch. BERT checkpoints are post-LN (false).
+    pre_ln: Option<LayerNorm>,
     device: Device,
 }
 
@@ -106,6 +109,10 @@ impl Bert {
             types: embedding(2, dim, e.pp("token_type_embeddings"))?,
             norm: layer_norm(dim, eps, e.pp("LayerNorm"))?,
             layers: (0..layers).map(layer).collect::<Result<_>>()?,
+            pre_ln: match config["pre_layer_norm"].as_bool().unwrap_or(false) {
+                true => Some(layer_norm(dim, eps, b.pp("encoder.final_norm"))?),
+                false => None,
+            },
             head_dense: linear(dim, dim, p.pp("transform.dense"))?,
             head_norm: layer_norm(dim, eps, p.pp("transform.LayerNorm"))?,
             decoder: linear(dim, vocab.len(), p.pp("decoder"))?,
@@ -178,15 +185,21 @@ impl Bert {
         let dh = dim / self.heads;
         for l in &self.layers {
             let split = |y: Tensor| -> Result<Tensor> { y.reshape((b, t, self.heads, dh))?.transpose(1, 2)?.contiguous() };
-            let (q, k, v) = (split(l.q.forward(&x)?)?, split(l.k.forward(&x)?)?, split(l.v.forward(&x)?)?);
+            let pre = self.pre_ln.is_some();
+            let a = if pre { l.attn_norm.forward(&x)? } else { x.clone() };
+            let (q, k, v) = (split(l.q.forward(&a)?)?, split(l.k.forward(&a)?)?, split(l.v.forward(&a)?)?);
             let att = (q.matmul(&k.t()?)? / (dh as f64).sqrt())?.broadcast_add(&mask)?;
             let att = candle_nn::ops::softmax_last_dim(&att)?;
-            let y = att.matmul(&v)?.transpose(1, 2)?.reshape((b, t, dim))?;
-            x = l.attn_norm.forward(&(l.attn_out.forward(&y)? + &x)?)?;
-            let h = l.ff_in.forward(&x)?.gelu_erf()?;
-            x = l.ff_norm.forward(&(l.ff_out.forward(&h)? + &x)?)?;
+            let y = l.attn_out.forward(&att.matmul(&v)?.transpose(1, 2)?.reshape((b, t, dim))?)?;
+            x = if pre { (y + &x)? } else { l.attn_norm.forward(&(y + &x)?)? };
+            let f = if pre { l.ff_norm.forward(&x)? } else { x.clone() };
+            let h = l.ff_out.forward(&l.ff_in.forward(&f)?.gelu_erf()?)?;
+            x = if pre { (h + &x)? } else { l.ff_norm.forward(&(h + &x)?)? };
         }
-        Ok(x)
+        match &self.pre_ln {
+            Some(norm) => norm.forward(&x),
+            None => Ok(x),
+        }
     }
 
     /// Piece ids of a sentence with [CLS]/[SEP], for training.
@@ -331,6 +344,16 @@ mod tests {
             else if name.ends_with("bias") { assert!(std < 1e-6, "{name}") }
             else { assert!((0.015..0.025).contains(&std), "{name}: {std}") }
         }
+        // The pre-LayerNorm layout builds, has its final norm, and runs.
+        let tmp = std::env::temp_dir().join("scribe-bert-preln-test");
+        std::fs::create_dir_all(&tmp).unwrap();
+        let mut cfg: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(dir.join("config.json")).unwrap()).unwrap();
+        cfg["pre_layer_norm"] = serde_json::Value::Bool(true);
+        std::fs::write(tmp.join("config.json"), cfg.to_string()).unwrap();
+        std::fs::copy(dir.join("vocab.txt"), tmp.join("vocab.txt")).unwrap();
+        let (pre, pv) = Bert::new_random(&tmp, Device::Cpu).unwrap();
+        assert!(pv.data().lock().unwrap().keys().any(|k| k.contains("final_norm")));
+        assert_eq!(pre.contextual_batch(&[words("a cup of tea")]).unwrap()[0].len(), 4);
         // The trainable copy computes the same thing.
         let (t, vars) = Bert::load_trainable(dir, Device::Cpu).unwrap();
         assert!(vars.all_vars().len() >= 70);
