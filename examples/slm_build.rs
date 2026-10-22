@@ -13,6 +13,13 @@
 //! - Pre-LayerNorm layout (trains reliably from scratch; --post-ln for BERT's).
 //! - Whole-word masking, many passes, and (--joint) the dictionary objective:
 //!   a hidden SemCor word's slot should accept its labelled meaning's synonyms.
+//! - --extra <file> [--extra-repeat N]: add a one-sentence-per-line corpus
+//!   (e.g. data/corpus/oanc_written.txt for a published-prose model), N times.
+//! - --max-pieces N (memory-bounded mode; dictionary batches get N/2): cap each
+//!   batch at N padded pieces as well as --batch; sentences are never cut
+//!   sentences (bounds memory: 128 × 128-piece batches needed ~8.6 GB on the
+//!   CPU vs ~2.8 GB at 32 × 128). Off unless given, so earlier runs resume unchanged.
+//! - --sync-every N: wait for the GPU every N steps (bounds queued work; 0 = never).
 //! - --sample N: N sentences per source (smoke tests). --every N: held-out
 //!   check every N steps (default 2,000).
 //! - --quick: a ~3-minute recipe check (1,500 steps on 5,000 sentences per
@@ -28,7 +35,7 @@
 use candle_core::Device;
 use candle_nn::{AdamW, Optimizer, ParamsAdamW};
 use scribe::bert::Bert;
-use scribe::slm_train::{dictionary_examples, dictionary_loss, mask_whole_words, masked_loss, DictExample, Encoded, Rng};
+use scribe::slm_train::{dictionary_batch, dictionary_examples, dictionary_loss, mask_whole_words, masked_loss, token_batches, DictExample, Encoded, Rng};
 use scribe::usage::corpus;
 use scribe::{conllu, text, wordpiece, Lexicon, Pos};
 use std::collections::{HashMap, HashSet};
@@ -79,6 +86,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let n: Option<usize> = value("--sample").and_then(|v| v.parse().ok()).or(quick.then_some(5_000));
     let vocab_size: usize = value("--vocab").and_then(|v| v.parse().ok()).unwrap_or(if quick { 8_000 } else { 30_000 });
     let batch_size: usize = value("--batch").and_then(|v| v.parse().ok()).unwrap_or(BATCH);
+    let max_pieces: usize = value("--max-pieces").and_then(|v| v.parse().ok()).unwrap_or(0);
     let every: usize = value("--every").and_then(|v| v.parse().ok()).unwrap_or(if quick { 250 } else { 2_000 });
     let joint: f32 = value("--joint").and_then(|v| v.parse().ok()).unwrap_or(1.0);
     let out = PathBuf::from(value("--out").unwrap_or_else(|| "models/curated-scratch".into()));
@@ -102,6 +110,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ("Tatoeba", tatoeba),
         ("Simple English Wikipedia", lines("data/corpus/simplewiki.txt")?),
     ];
+    let mut full = full;
+    if let Some(extra) = value("--extra") {
+        let repeat: usize = value("--extra-repeat").and_then(|v| v.parse().ok()).unwrap_or(1);
+        let once = lines(&extra)?;
+        let mut all = Vec::with_capacity(once.len() * repeat);
+        for _ in 0..repeat { all.extend(once.iter().cloned()) }
+        eprintln!("  extra corpus {extra}: {} sentences × {repeat}", once.len());
+        full.push(("extra", all));
+    }
     // Topic slice: sentences holding a focus word (capped), plus the background sample.
     let focus = match &focus_pos { Some(p) => Some(focus_words(&lex, p)?), None => None };
     let mut focused: Vec<Vec<String>> = Vec::new();
@@ -178,8 +195,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             m += masked_loss(&bert, &rows, &at, &gold, &dev)?.to_scalar::<f32>()?;
         }
         let mut d = 0.0;
-        let drefs: Vec<&DictExample> = dict_held.iter().collect();
-        let dchunks: Vec<&[&DictExample]> = drefs.chunks(batch_size).collect();
+        // Held-out dictionary examples in length-capped batches (whole sentences).
+        let dlens: Vec<usize> = dict_held.iter().map(|e| e.ids.len()).collect();
+        let dbatches: Vec<Vec<&DictExample>> = if max_pieces > 0 {
+            token_batches(&dlens, batch_size, max_pieces).into_iter().map(|b| b.into_iter().map(|i| &dict_held[i]).collect()).collect()
+        } else {
+            dict_held.iter().collect::<Vec<_>>().chunks(batch_size).map(|c| c.to_vec()).collect()
+        };
+        let dchunks: Vec<&[&DictExample]> = dbatches.iter().map(|b| b.as_slice()).collect();
         for c in &dchunks { d += dictionary_loss(&bert, c, &dev)?.to_scalar::<f32>()? }
         Ok((m / chunks.len() as f32, if dchunks.is_empty() { 0.0 } else { d / dchunks.len() as f32 }))
     };
@@ -193,9 +216,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let t0 = std::time::Instant::now();
     // Length buckets: sentences sorted by length, cut into batches, batch order
     // shuffled each pass, so padding stays small (lengths range ~5 to 128 pieces).
-    let mut by_length: Vec<usize> = (0..data.len()).collect();
-    by_length.sort_by_key(|&i| data[i].ids.len());
-    let mut batches: Vec<Vec<usize>> = by_length.chunks(batch_size).map(|c| c.to_vec()).collect();
+    let sync_every: usize = value("--sync-every").and_then(|v| v.parse().ok()).unwrap_or(0);
+    let mut batches: Vec<Vec<usize>> = if max_pieces > 0 {
+        token_batches(&data.iter().map(|e| e.ids.len()).collect::<Vec<_>>(), batch_size, max_pieces)
+    } else {
+        let mut by_length: Vec<usize> = (0..data.len()).collect();
+        by_length.sort_by_key(|&i| data[i].ids.len());
+        by_length.chunks(batch_size).map(|c| c.to_vec()).collect()
+    };
+    if max_pieces > 0 { eprintln!("batches: {} (at most {batch_size} sentences or {max_pieces} padded pieces each)", batches.len()) }
     let mut next_batch = batches.len();
     // Training loss stays on the GPU until a checkpoint (no per-step sync).
     let mut window: Option<candle_core::Tensor> = None;
@@ -212,12 +241,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if at.is_empty() { continue }
         let mut loss = masked_loss(&bert, &rows, &at, &gold, &dev)?;
         if joint > 0.0 && !dict_train.is_empty() {
-            let b: Vec<&DictExample> = (0..batch_size / 2).map(|_| &dict_train[(rng.next() % dict_train.len() as u64) as usize]).collect();
+            let b: Vec<&DictExample> = dictionary_batch(dict_train, batch_size / 2, max_pieces / 2, &mut rng);
             loss = (loss + (dictionary_loss(&bert, &b, &dev)? * joint as f64)?)?;
         }
         let l = loss.detach();
         window = Some(match window.take() { Some(w) => (w + l)?, None => l });
         opt.backward_step(&loss)?;
+        // Let the GPU catch up every `sync_every` steps: unsynced, the CPU queues
+        // step after step, each holding its buffers until the GPU reaches it.
+        if sync_every > 0 && (step + 1) % sync_every == 0 { dev.synchronize()? }
         if (step + 1) % every == 0 || step + 1 == steps {
             let (m, d) = evaluate()?;
             let h = m + joint * d;

@@ -1,6 +1,7 @@
 //! Times one training step of the flagship's shape (30,000-piece vocabulary,
 //! 4 × 256 pre-LN, batch 128) on the Metal GPU, to find where step time goes.
-//! SCRIBE_BENCH_FORWARD_ONLY / SCRIBE_BENCH_NO_STEP split forward, backward
+//! SCRIBE_BENCH_CPU runs on the CPU (memory measurable with /usr/bin/time -l);
+//! SCRIBE_BENCH_BATCH, SCRIBE_BENCH_STEPS. SCRIBE_BENCH_FORWARD_ONLY / SCRIBE_BENCH_NO_STEP split forward, backward
 //! and optimizer; SCRIBE_BENCH_VOCAB sets the vocabulary size.
 //! Findings (Oct 22 2026, M5 Pro, 128 × 26 pieces): forward 38 ms, backward
 //! 154 ms, AdamW 4 ms. Hand-written LayerNorm ≈ 25% of a step; vocabulary-sized
@@ -15,7 +16,7 @@ use scribe::slm_train::{masked_loss, Rng};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let len: usize = std::env::args().nth(1).and_then(|v| v.parse().ok()).unwrap_or(24);
-    let dev = Device::new_metal(0)?;
+    let dev = if std::env::var_os("SCRIBE_BENCH_CPU").is_some() { Device::Cpu } else { Device::new_metal(0)? };
     let dir = std::env::temp_dir().join("scribe-bench");
     std::fs::create_dir_all(&dir)?;
     let vsize: usize = std::env::var("SCRIBE_BENCH_VOCAB").ok().and_then(|v| v.parse().ok()).unwrap_or(30_000);
@@ -26,8 +27,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (bert, vars) = Bert::new_random(&dir, dev.clone())?;
     let mut opt = AdamW::new(vars.all_vars(), ParamsAdamW { lr: 1e-4, ..Default::default() })?;
     let mut rng = Rng(1);
-    let rows: Vec<Vec<u32>> = (0..128).map(|_| { let mut r = vec![2u32]; r.extend((0..len).map(|_| 5 + (rng.next() % (vsize as u64 - 5)) as u32)); r.push(3); r }).collect();
-    let at: Vec<(usize, usize)> = (0..128).flat_map(|r| (1..=len).filter(move |c| c % 7 == 0).map(move |c| (r, c))).collect();
+    let batch: usize = std::env::var("SCRIBE_BENCH_BATCH").ok().and_then(|v| v.parse().ok()).unwrap_or(128);
+    let rows: Vec<Vec<u32>> = (0..batch).map(|_| { let mut r = vec![2u32]; r.extend((0..len).map(|_| 5 + (rng.next() % (vsize as u64 - 5)) as u32)); r.push(3); r }).collect();
+    let at: Vec<(usize, usize)> = (0..batch).flat_map(|r| (1..=len).filter(move |c| c % 7 == 0).map(move |c| (r, c))).collect();
     let gold: Vec<u32> = at.iter().map(|&(r, c)| rows[r][c]).collect();
     let forward_only = std::env::var_os("SCRIBE_BENCH_FORWARD_ONLY").is_some();
     let mut step = || -> candle_core::Result<()> {
@@ -42,7 +44,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     for _ in 0..3 { step()? }
     dev.synchronize()?;
     let t = std::time::Instant::now();
-    let n = 15;
+    let n: usize = std::env::var("SCRIBE_BENCH_STEPS").ok().and_then(|v| v.parse().ok()).unwrap_or(15);
     for _ in 0..n { step()? }
     dev.synchronize()?;
     println!("{:.0} ms per step (batch 128 × {} pieces, {} masked)", t.elapsed().as_secs_f64() * 1000.0 / n as f64, len + 2, at.len());

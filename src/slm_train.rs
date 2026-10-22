@@ -14,6 +14,27 @@ impl Rng {
     pub fn unit(&mut self) -> f64 { (self.next() >> 11) as f64 / (1u64 << 53) as f64 }
 }
 
+/// Batches of sentence indices, by length (shortest first), each holding at
+/// most `max_sentences` and at most `max_pieces` padded pieces (sentences ×
+/// longest length in the batch). Bounds memory and time per step: a fixed
+/// sentence count lets batches of the longest sentences cost ~5× the rest.
+pub fn token_batches(lengths: &[usize], max_sentences: usize, max_pieces: usize) -> Vec<Vec<usize>> {
+    let mut order: Vec<usize> = (0..lengths.len()).collect();
+    order.sort_by_key(|&i| lengths[i]);
+    let mut out: Vec<Vec<usize>> = Vec::new();
+    let mut current: Vec<usize> = Vec::new();
+    for i in order {
+        // Sorted, so this sentence is the longest so far in the batch.
+        let padded = (current.len() + 1) * lengths[i];
+        if !current.is_empty() && (current.len() == max_sentences || padded > max_pieces) {
+            out.push(std::mem::take(&mut current));
+        }
+        current.push(i);
+    }
+    if !current.is_empty() { out.push(current) }
+    out
+}
+
 /// A training sentence: piece ids ([CLS] … [SEP]) and each word's first piece.
 pub struct Encoded {
     pub ids: Vec<u32>,
@@ -44,10 +65,24 @@ pub fn mask_whole_words(bert: &Bert, batch: &[&Encoded], rng: &mut Rng) -> (Vec<
     (rows, at, gold)
 }
 
+/// Hidden positions are padded up to a multiple of this (zero-weight dummies),
+/// so the [positions × vocabulary] prediction table comes in few sizes: candle's
+/// Metal backend reuses buffers only of an exact size, and a new size every
+/// step (each batch hides a different number of words) piled up ~10 GB.
+pub const POSITION_BUCKET: usize = 128;
+
 /// Mean negative log-probability of the original pieces at the masked positions.
 pub fn masked_loss(bert: &Bert, rows: &[Vec<u32>], at: &[(usize, usize)], gold: &[u32], dev: &Device) -> Result<Tensor> {
-    let lp = bert.masked_log_probs(rows, at)?;
-    lp.gather(&Tensor::new(gold, dev)?.unsqueeze(1)?, 1)?.neg()?.mean_all()
+    let n = at.len();
+    let padded = n.div_ceil(POSITION_BUCKET) * POSITION_BUCKET;
+    let mut at_p = at.to_vec();
+    at_p.resize(padded, (0, 0));
+    let mut gold_p = gold.to_vec();
+    gold_p.resize(padded, 0);
+    let weight: Vec<f32> = (0..padded).map(|i| if i < n { 1.0 / n as f32 } else { 0.0 }).collect();
+    let lp = bert.masked_log_probs(rows, &at_p)?;
+    let picked = lp.gather(&Tensor::new(gold_p.as_slice(), dev)?.unsqueeze(1)?, 1)?.squeeze(1)?;
+    (picked * Tensor::from_vec(weight, padded, dev)?)?.sum_all()?.neg()
 }
 
 /// A SemCor word (in base form) whose hidden slot should accept `accept`.
@@ -82,6 +117,22 @@ pub fn dictionary_examples(bert: &Bert, lex: &Lexicon, semcor_base: &str, oewn: 
     Ok(out)
 }
 
+/// A random dictionary batch of whole sentences: up to `max_examples`, and (when
+/// `max_pieces` > 0) at most `max_pieces` padded pieces, so long SemCor sentences
+/// come in smaller batches rather than being cropped.
+pub fn dictionary_batch<'a>(pool: &'a [DictExample], max_examples: usize, max_pieces: usize, rng: &mut Rng) -> Vec<&'a DictExample> {
+    let mut out: Vec<&DictExample> = Vec::new();
+    let mut longest = 0;
+    while out.len() < max_examples {
+        let e = &pool[(rng.next() % pool.len() as u64) as usize];
+        let l = longest.max(e.ids.len());
+        if max_pieces > 0 && !out.is_empty() && (out.len() + 1) * l > max_pieces { break }
+        longest = l;
+        out.push(e);
+    }
+    out
+}
+
 /// −log of the probability mass each hidden slot puts on its acceptable words.
 pub fn dictionary_loss(bert: &Bert, batch: &[&DictExample], dev: &Device) -> Result<Tensor> {
     let m = bert.special("[MASK]");
@@ -101,6 +152,61 @@ pub fn dictionary_loss(bert: &Bert, batch: &[&DictExample], dev: &Device) -> Res
     let max = picked.max_keepdim(1)?;
     let lse = (picked.broadcast_sub(&max)?.exp()?.sum_keepdim(1)?.log()? + max)?;
     lse.neg()?.mean_all()
+}
+
+#[cfg(test)]
+mod batching_tests {
+    use super::*;
+
+    #[test]
+    fn token_batches_cover_every_sentence_once_within_both_limits() {
+        let lengths: Vec<usize> = (0..1000).map(|i| 5 + (i * 37) % 124).collect();
+        let batches = token_batches(&lengths, 128, 4096);
+        let mut seen: Vec<usize> = batches.concat();
+        seen.sort();
+        assert_eq!(seen, (0..1000).collect::<Vec<_>>());
+        for b in &batches {
+            let longest = b.iter().map(|&i| lengths[i]).max().unwrap();
+            assert!(b.len() <= 128 && b.len() * longest <= 4096, "{} × {longest}", b.len());
+        }
+        // Short sentences still fill whole batches.
+        assert_eq!(token_batches(&[10; 300], 128, 4096)[0].len(), 128);
+    }
+
+    /// Padding the hidden positions must not change the loss.
+    #[test]
+    fn padded_masked_loss_equals_the_plain_mean() {
+        let dir = Path::new("data/bert-mini");
+        if !dir.join("model.safetensors").exists() { return }
+        let bert = Bert::load(dir, Device::Cpu).unwrap();
+        let words: Vec<String> = "the cat sat on the mat and the dog sat on a rug".split(' ').map(String::from).collect();
+        let rows = vec![bert.encode_sentence(&words)];
+        let at: Vec<(usize, usize)> = vec![(0, 2), (0, 5), (0, 9)];
+        let gold: Vec<u32> = at.iter().map(|&(r, c)| rows[r][c]).collect();
+        let lp = bert.masked_log_probs(&rows, &at).unwrap().to_vec2::<f32>().unwrap();
+        let plain = -(0..3).map(|i| lp[i][gold[i] as usize]).sum::<f32>() / 3.0;
+        let padded = masked_loss(&bert, &rows, &at, &gold, &Device::Cpu).unwrap().to_scalar::<f32>().unwrap();
+        assert!((plain - padded).abs() < 1e-4, "{plain} vs {padded}");
+    }
+
+    #[test]
+    fn dictionary_batches_keep_whole_sentences_within_the_piece_budget() {
+        let pool: Vec<DictExample> = (0..50).map(|i| DictExample { ids: vec![1; if i % 5 == 0 { 120 } else { 20 }], at: 1, accept: vec![1, 2] }).collect();
+        let mut rng = Rng(9);
+        for _ in 0..200 {
+            let b = dictionary_batch(&pool, 64, 2048, &mut rng);
+            let longest = b.iter().map(|e| e.ids.len()).max().unwrap();
+            assert!(!b.is_empty() && b.len() <= 64 && (b.len() == 1 || b.len() * longest <= 2048));
+            assert!(b.iter().all(|e| e.ids.len() == 120 || e.ids.len() == 20), "never cropped");
+        }
+        assert_eq!(dictionary_batch(&pool, 64, 0, &mut rng).len(), 64, "no budget: fixed size");
+    }
+
+    #[test]
+    fn a_sentence_longer_than_the_budget_gets_a_batch_of_its_own() {
+        let b = token_batches(&[5, 5000, 6], 128, 4096);
+        assert!(b.iter().any(|x| x == &vec![1]));
+    }
 }
 
 #[cfg(test)]
