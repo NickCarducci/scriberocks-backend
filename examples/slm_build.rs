@@ -147,12 +147,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
         std::fs::write(out.join("config.json"), serde_json::to_string_pretty(&config)?)?;
     }
-    let (bert, vars) = if resume && out.join("model.safetensors").exists() {
-        eprintln!("resuming from {}", out.display());
-        Bert::load_trainable(&out, dev.clone())?
-    } else {
-        Bert::new_random(&out, dev.clone())?
-    };
+    // Resume from the last checkpoint's exact state (state.json + last.safetensors).
+    let state: Option<serde_json::Value> = if resume { std::fs::read_to_string(out.join("state.json")).ok().and_then(|t| serde_json::from_str(&t).ok()) } else { None };
+    let (bert, mut vars) = Bert::new_random(&out, dev.clone())?;
+    if let Some(st) = &state {
+        vars.load(out.join("last.safetensors"))?;
+        eprintln!("resuming {} at step {} (best held-out {:.3})", out.display(), st["step"], st["best"].as_f64().unwrap_or(0.0));
+    }
     let encode = |s: &Vec<String>| { let (ids, first) = bert.encode_words(s); Encoded { first: first.into_iter().filter(|&f| f < ids.len()).map(|f| f as u16).collect(), ids } };
     let data: Vec<Encoded> = sentences.iter().map(encode).collect();
     let held: Vec<Encoded> = held.iter().map(encode).collect();
@@ -183,11 +184,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Ok((m / chunks.len() as f32, if dchunks.is_empty() { 0.0 } else { d / dchunks.len() as f32 }))
     };
     let (m0, d0) = evaluate()?;
-    let mut best = m0 + joint * d0;
+    let mut best = state.as_ref().and_then(|st| st["best"].as_f64()).map(|b| b as f32).unwrap_or(m0 + joint * d0);
+    let start = state.as_ref().and_then(|st| st["step"].as_u64()).unwrap_or(0) as usize;
     eprintln!("held-out before training: masked words {m0:.3}, dictionary {d0:.3}");
 
     let mut opt = AdamW::new(vars.all_vars(), ParamsAdamW { lr: LR, weight_decay: 0.01, ..Default::default() })?;
-    let mut rng = Rng(0x2545F4914F6CDD1D);
+    let mut rng = Rng(state.as_ref().and_then(|st| st["rng"].as_u64()).unwrap_or(0x2545F4914F6CDD1D));
     let t0 = std::time::Instant::now();
     // Length buckets: sentences sorted by length, cut into batches, batch order
     // shuffled each pass, so padding stays small (lengths range ~5 to 128 pieces).
@@ -197,7 +199,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut next_batch = batches.len();
     // Training loss stays on the GPU until a checkpoint (no per-step sync).
     let mut window: Option<candle_core::Tensor> = None;
-    for step in 0..steps {
+    for step in start..steps {
         let lr = if step < WARMUP { LR * (step + 1) as f64 / WARMUP as f64 } else { LR * (steps - step) as f64 / (steps - WARMUP).max(1) as f64 };
         opt.set_learning_rate(lr);
         if next_batch == batches.len() {
@@ -220,6 +222,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let (m, d) = evaluate()?;
             let h = m + joint * d;
             let saved = if h < best { best = h; vars.save(out.join("model.safetensors"))?; " saved" } else { "" };
+            // Everything needed to continue exactly here after a stop.
+            vars.save(out.join("last.safetensors"))?;
+            std::fs::write(out.join("state.json"), serde_json::json!({"step": step + 1, "steps": steps, "best": best, "rng": rng.0}).to_string())?;
             let span = if (step + 1) % every == 0 { every as f32 } else { ((step + 1) % every) as f32 };
             let train = window.take().map(|w| w.to_scalar::<f32>()).transpose()?.unwrap_or(0.0) / span;
             eprintln!("  step {:>7}  train {train:.3}  held-out masked {m:.3} dictionary {d:.3}  ({:.0?}){saved}", step + 1, t0.elapsed());
