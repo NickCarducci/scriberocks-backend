@@ -481,6 +481,22 @@ fileprivate struct FfiConverterUInt32: FfiConverterPrimitive {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterFloat: FfiConverterPrimitive {
+    typealias FfiType = Float
+    typealias SwiftType = Float
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> Float {
+        return try lift(readFloat(&buf))
+    }
+
+    public static func write(_ value: Float, into buf: inout [UInt8]) {
+        writeFloat(&buf, lower(value))
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterDouble: FfiConverterPrimitive {
     typealias FfiType = Double
     typealias SwiftType = Double
@@ -569,7 +585,35 @@ fileprivate struct FfiConverterString: FfiConverter {
 
 public protocol ScribeEngineProtocol: AnyObject, Sendable {
     
+    /**
+     * Prose styles whose judge models are loaded ("casual", "publishable").
+     */
+    func availableStyles()  -> [String]
+    
     func frames(rock: String)  -> [RockFrame]
+    
+    /**
+     * Whether a ScribeIE model is loaded (the toggle does nothing without one).
+     */
+    func generateAvailable()  -> Bool
+    
+    /**
+     * The Generate toggle: ScribeIE enhances every proposal. Off by default.
+     */
+    func setGenerate(enabled: Bool) 
+    
+    /**
+     * Sets the writer's prose style ("casual" or "publishable"); "" clears it.
+     * Returns false (and keeps the default judge) when that style's model
+     * isn't loaded, so the app only offers styles in `available_styles`.
+     */
+    func setStyle(name: String)  -> Bool
+    
+    /**
+     * The variety slider: 0 = fewer, safer swaps … 1 = more, bolder ones.
+     * Values outside 0..1 are clamped; a negative value resets to the default.
+     */
+    func setVariety(value: Float) 
     
     func variants(rock: String, limit: UInt32)  -> [RockVariant]
     
@@ -639,6 +683,18 @@ public convenience init(modelsDir: String)throws  {
     
 
     
+    /**
+     * Prose styles whose judge models are loaded ("casual", "publishable").
+     */
+open func availableStyles() -> [String]  {
+    return try!  FfiConverterSequenceString.lift(try! rustCall() {
+        uniffiCallStatus in
+    uniffi_scribe_fn_method_scribeengine_available_styles(
+            self.uniffiCloneHandle(),uniffiCallStatus
+    )
+})
+}
+    
 open func frames(rock: String) -> [RockFrame]  {
     return try!  FfiConverterSequenceTypeRockFrame.lift(try! rustCall() {
         uniffiCallStatus in
@@ -647,6 +703,58 @@ open func frames(rock: String) -> [RockFrame]  {
         FfiConverterString.lower(rock),uniffiCallStatus
     )
 })
+}
+    
+    /**
+     * Whether a ScribeIE model is loaded (the toggle does nothing without one).
+     */
+open func generateAvailable() -> Bool  {
+    return try!  FfiConverterBool.lift(try! rustCall() {
+        uniffiCallStatus in
+    uniffi_scribe_fn_method_scribeengine_generate_available(
+            self.uniffiCloneHandle(),uniffiCallStatus
+    )
+})
+}
+    
+    /**
+     * The Generate toggle: ScribeIE enhances every proposal. Off by default.
+     */
+open func setGenerate(enabled: Bool)  {try! rustCall() {
+        uniffiCallStatus in
+    uniffi_scribe_fn_method_scribeengine_set_generate(
+            self.uniffiCloneHandle(),
+        FfiConverterBool.lower(enabled),uniffiCallStatus
+    )
+}
+}
+    
+    /**
+     * Sets the writer's prose style ("casual" or "publishable"); "" clears it.
+     * Returns false (and keeps the default judge) when that style's model
+     * isn't loaded, so the app only offers styles in `available_styles`.
+     */
+open func setStyle(name: String) -> Bool  {
+    return try!  FfiConverterBool.lift(try! rustCall() {
+        uniffiCallStatus in
+    uniffi_scribe_fn_method_scribeengine_set_style(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(name),uniffiCallStatus
+    )
+})
+}
+    
+    /**
+     * The variety slider: 0 = fewer, safer swaps … 1 = more, bolder ones.
+     * Values outside 0..1 are clamped; a negative value resets to the default.
+     */
+open func setVariety(value: Float)  {try! rustCall() {
+        uniffiCallStatus in
+    uniffi_scribe_fn_method_scribeengine_set_variety(
+            self.uniffiCloneHandle(),
+        FfiConverterFloat.lower(value),uniffiCallStatus
+    )
+}
 }
     
 open func variants(rock: String, limit: UInt32) -> [RockVariant]  {
@@ -862,6 +970,14 @@ public struct RockVariant: Equatable, Hashable {
      * Words not in the original, as UTF-8 byte ranges into `text`.
      */
     public var changed: [ByteRange]
+    /**
+     * ScribeIE's enhanced version (Generate on and a model loaded), else nil.
+     */
+    public var enhanced: String?
+    /**
+     * Words ScribeIE added, as UTF-8 byte ranges into `enhanced`.
+     */
+    public var enhancedChanged: [ByteRange]
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
@@ -871,11 +987,19 @@ public struct RockVariant: Equatable, Hashable {
          */ops: [String], fluencyDelta: Double, 
         /**
          * Words not in the original, as UTF-8 byte ranges into `text`.
-         */changed: [ByteRange]) {
+         */changed: [ByteRange], 
+        /**
+         * ScribeIE's enhanced version (Generate on and a model loaded), else nil.
+         */enhanced: String?, 
+        /**
+         * Words ScribeIE added, as UTF-8 byte ranges into `enhanced`.
+         */enhancedChanged: [ByteRange]) {
         self.text = text
         self.ops = ops
         self.fluencyDelta = fluencyDelta
         self.changed = changed
+        self.enhanced = enhanced
+        self.enhancedChanged = enhancedChanged
     }
 
     
@@ -897,7 +1021,9 @@ public struct FfiConverterTypeRockVariant: FfiConverterRustBuffer {
                 text: FfiConverterString.read(from: &buf), 
                 ops: FfiConverterSequenceString.read(from: &buf), 
                 fluencyDelta: FfiConverterDouble.read(from: &buf), 
-                changed: FfiConverterSequenceTypeByteRange.read(from: &buf)
+                changed: FfiConverterSequenceTypeByteRange.read(from: &buf), 
+                enhanced: FfiConverterOptionString.read(from: &buf), 
+                enhancedChanged: FfiConverterSequenceTypeByteRange.read(from: &buf)
         )
     }
 
@@ -906,6 +1032,8 @@ public struct FfiConverterTypeRockVariant: FfiConverterRustBuffer {
         FfiConverterSequenceString.write(value.ops, into: &buf)
         FfiConverterDouble.write(value.fluencyDelta, into: &buf)
         FfiConverterSequenceTypeByteRange.write(value.changed, into: &buf)
+        FfiConverterOptionString.write(value.enhanced, into: &buf)
+        FfiConverterSequenceTypeByteRange.write(value.enhancedChanged, into: &buf)
     }
 }
 
@@ -1138,7 +1266,22 @@ private let initializationResult: InitializationResult = {
     if bindings_contract_version != scaffolding_contract_version {
         return InitializationResult.contractVersionMismatch
     }
+    if (uniffi_scribe_checksum_method_scribeengine_available_styles() != 44984) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_scribe_checksum_method_scribeengine_frames() != 13055) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scribe_checksum_method_scribeengine_generate_available() != 39986) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scribe_checksum_method_scribeengine_set_generate() != 42950) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scribe_checksum_method_scribeengine_set_style() != 128) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scribe_checksum_method_scribeengine_set_variety() != 27822) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scribe_checksum_method_scribeengine_variants() != 53245) {
