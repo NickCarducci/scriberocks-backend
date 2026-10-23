@@ -89,9 +89,30 @@ pub struct Engine {
     /// Replaces the usage model as the judge of swaps when set (e.g. a
     /// BERT-format model, to compare judges on the same rocks).
     pub judge: Option<Box<dyn SlotScorer + Send + Sync>>,
+    /// One judge per prose style the writer can choose (see `ProseStyle`).
+    pub style_judges: Vec<(ProseStyle, Box<dyn SlotScorer + Send + Sync>)>,
 }
 
 pub const CONTENT: &[&str] = &["NOUN", "VERB", "ADJ", "ADV"];
+
+/// The writer's prose style, each with its own judge model: casual (trained on
+/// standards: lexicographers, annotators, learners) or publishable (the same
+/// plus published prose). Loaded from `<models>/judges/<name>/` when present.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProseStyle {
+    Casual,
+    Publishable,
+}
+
+impl ProseStyle {
+    pub const ALL: [ProseStyle; 2] = [ProseStyle::Casual, ProseStyle::Publishable];
+    pub fn name(self) -> &'static str {
+        match self { ProseStyle::Casual => "casual", ProseStyle::Publishable => "publishable" }
+    }
+    pub fn from_name(name: &str) -> Option<ProseStyle> {
+        ProseStyle::ALL.into_iter().find(|s| s.name() == name)
+    }
+}
 
 /// The boundary between the classical head start and a learned head: the
 /// classical stages propose a closed set of candidates for a slot; a scorer
@@ -162,6 +183,13 @@ impl Engine {
             },
             enhancer: None,
             judge: None,
+            style_judges: ProseStyle::ALL
+                .into_iter()
+                .filter_map(|st| {
+                    let d = dir.join("judges").join(st.name());
+                    d.join("config.json").exists().then(|| crate::bert::Bert::load(&d, Device::Cpu).map(|b| (st, Box::new(b) as Box<dyn SlotScorer + Send + Sync>)))
+                })
+                .collect::<Result<_, _>>()?,
             lexicon,
             sense_margin: SENSE_MARGIN,
             head_margin: HEAD_MARGIN,
@@ -173,6 +201,19 @@ impl Engine {
     }
 
     /// The learned head used to judge closed-set candidates, if any.
+    /// The styles whose judges are loaded (what the app may offer).
+    pub fn available_styles(&self) -> Vec<ProseStyle> {
+        self.style_judges.iter().map(|(s, _)| *s).collect()
+    }
+
+    /// The judge for a request: its style's model if loaded, else the default.
+    pub fn judge_for(&self, options: &crate::scribe_ie::EditOptions) -> Option<&dyn SlotScorer> {
+        match options.style.and_then(|st| self.style_judges.iter().find(|(s, _)| *s == st)) {
+            Some((_, j)) => Some(j.as_ref() as &dyn SlotScorer),
+            None => self.slot_scorer(),
+        }
+    }
+
     pub fn slot_scorer(&self) -> Option<&dyn SlotScorer> {
         match &self.judge {
             Some(j) => Some(j.as_ref() as &dyn SlotScorer),

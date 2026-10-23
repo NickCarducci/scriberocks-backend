@@ -125,7 +125,7 @@ fn generate_is_off_by_default_and_inert_without_a_model() {
     let texts = |v: &[scribe::Variant]| -> Vec<String> { v.iter().map(|x| x.text.clone()).collect() };
     let base = engine.variants(rock, 10);
     assert!(base.iter().all(|v| v.enhanced.is_none()), "off by default");
-    let on = scribe::scribe_ie::EditOptions { generate: true };
+    let on = scribe::scribe_ie::EditOptions { generate: true, ..Default::default() };
     assert!(engine.enhancer.is_none());
     let got = engine.variants_with(rock, 10, &on);
     assert_eq!(texts(&got), texts(&base));
@@ -146,7 +146,7 @@ fn generate_enhances_every_proposal_without_reordering_them() {
     let rock = "I want to come to the party but I have to work late.";
     let base: Vec<String> = engine.variants(rock, 10).into_iter().map(|v| v.text).collect();
     engine.enhancer = Some(Box::new(Celebrate));
-    let got = engine.variants_with(rock, 10, &scribe::scribe_ie::EditOptions { generate: true });
+    let got = engine.variants_with(rock, 10, &scribe::scribe_ie::EditOptions { generate: true, ..Default::default() });
     assert_eq!(got.iter().map(|v| v.text.clone()).collect::<Vec<_>>(), base, "ScribeSLM's proposals and order untouched");
     for v in &got {
         match &v.enhanced {
@@ -177,4 +177,28 @@ fn a_replacement_judge_decides_which_swaps_survive() {
     assert!(!swaps(&engine, rock).is_empty(), "the usage model keeps some swaps");
     engine.judge = Some(Box::new(OnlyOriginal));
     assert!(swaps(&engine, rock).is_empty(), "{:?}", swaps(&engine, rock));
+}
+
+fn swaps_with(engine: &Engine, rock: &str, options: &scribe::scribe_ie::EditOptions) -> Vec<String> {
+    engine.variants_with(rock, 200, options).into_iter().filter(|v| v.ops.contains(&scribe::Op::Swap)).map(|v| v.text).collect()
+}
+
+/// The prose-style switch: a request in a style uses that style's judge; a
+/// style with no judge loaded (or no style) leaves suggestions as they are.
+#[test]
+fn a_prose_style_uses_its_own_judge_and_only_its_own() {
+    use scribe::engine::ProseStyle;
+    use scribe::scribe_ie::EditOptions;
+    let Some(mut engine) = engine() else { return };
+    let rock = "The river bank was quiet in the morning.";
+    let plain = swaps(&engine, rock);
+    assert!(!plain.is_empty());
+    let casual = EditOptions { style: Some(ProseStyle::Casual), ..Default::default() };
+    assert_eq!(swaps_with(&engine, rock, &casual), plain, "no casual judge loaded: unchanged");
+    engine.style_judges.push((ProseStyle::Casual, Box::new(OnlyOriginal)));
+    assert!(swaps_with(&engine, rock, &casual).is_empty(), "the casual judge decides");
+    assert_eq!(swaps(&engine, rock), plain, "no style chosen: unchanged");
+    let publishable = EditOptions { style: Some(ProseStyle::Publishable), ..Default::default() };
+    assert_eq!(swaps_with(&engine, rock, &publishable), plain, "another style's judge is never used");
+    assert_eq!(engine.available_styles(), vec![ProseStyle::Casual]);
 }

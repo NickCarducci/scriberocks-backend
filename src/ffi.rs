@@ -57,6 +57,8 @@ pub struct ScribeEngine {
     engine: Engine,
     /// The Generate toggle (ScribeIE; off by default), set from the app.
     generate: std::sync::atomic::AtomicBool,
+    /// The writer's prose style (casual / publishable), set from the app.
+    style: std::sync::Mutex<Option<crate::engine::ProseStyle>>,
 }
 
 fn name<T: serde::Serialize>(v: &T) -> String {
@@ -69,7 +71,7 @@ impl ScribeEngine {
     #[uniffi::constructor]
     pub fn new(models_dir: String) -> Result<Arc<Self>, ScribeError> {
         Engine::load(Path::new(&models_dir))
-            .map(|engine| Arc::new(ScribeEngine { engine, generate: std::sync::atomic::AtomicBool::new(false) }))
+            .map(|engine| Arc::new(ScribeEngine { engine, generate: std::sync::atomic::AtomicBool::new(false), style: std::sync::Mutex::new(None) }))
             .map_err(|e| ScribeError::ModelsUnavailable { message: e.to_string() })
     }
 
@@ -83,8 +85,25 @@ impl ScribeEngine {
         self.engine.enhancer.is_some()
     }
 
+    /// Sets the writer's prose style ("casual" or "publishable"); "" clears it.
+    /// Returns false (and keeps the default judge) when that style's model
+    /// isn't loaded, so the app only offers styles in `available_styles`.
+    pub fn set_style(&self, name: String) -> bool {
+        let style = crate::engine::ProseStyle::from_name(&name).filter(|s| self.engine.available_styles().contains(s));
+        *self.style.lock().unwrap() = style;
+        style.is_some() || name.is_empty()
+    }
+
+    /// Prose styles whose judge models are loaded ("casual", "publishable").
+    pub fn available_styles(&self) -> Vec<String> {
+        self.engine.available_styles().into_iter().map(|s| s.name().to_string()).collect()
+    }
+
     pub fn variants(&self, rock: String, limit: u32) -> Vec<RockVariant> {
-        let options = crate::scribe_ie::EditOptions { generate: self.generate.load(std::sync::atomic::Ordering::Relaxed) };
+        let options = crate::scribe_ie::EditOptions {
+            generate: self.generate.load(std::sync::atomic::Ordering::Relaxed),
+            style: *self.style.lock().unwrap(),
+        };
         self.engine
             .variants_with(&rock, limit as usize, &options)
             .into_iter()

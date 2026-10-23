@@ -13,11 +13,14 @@ pub trait Enhancer: Send + Sync {
     fn enhance(&self, rock: &str, proposal: &str) -> Option<String>;
 }
 
-/// Options for one request for suggestions. Default: Generate off.
+/// Options for one request for suggestions. Default: Generate off, no style.
 #[derive(Clone, Debug, Default)]
 pub struct EditOptions {
     /// Enhance every proposal with ScribeIE (needs a loaded enhancer; otherwise no effect).
     pub generate: bool,
+    /// The writer's prose style: suggestions are judged by that style's model
+    /// (if loaded); otherwise by the default judge. Another style's judge is never used.
+    pub style: Option<crate::engine::ProseStyle>,
 }
 
 /// Byte ranges of the words in `enhanced` that the plain `proposal` doesn't

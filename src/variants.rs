@@ -118,6 +118,7 @@ impl Engine {
 
     /// As `variants`, with per-request options (Generate: ScribeIE enhances each proposal).
     pub fn variants_with(&self, rock: &str, limit: usize, options: &crate::scribe_ie::EditOptions) -> Vec<Variant> {
+        let judge = self.judge_for(options);
         let sentences = self.parse(rock);
         if sentences.is_empty() {
             return vec![];
@@ -149,7 +150,7 @@ impl Engine {
         }
 
         // Joins between adjacent sentences (needs the usage model to judge fit).
-        for (i, connective) in self.connections(&originals) {
+        for (i, connective) in self.connections(&originals, judge) {
             let keep_case = sentences[i + 1].tokens.first().is_some_and(|t| t.upos == "PROPN");
             let joined = join_with(&originals[i], &originals[i + 1], connective, keep_case);
             let base = self.fluency(&[originals[i].clone(), originals[i + 1].clone()].concat());
@@ -161,7 +162,7 @@ impl Engine {
 
         // Punctuation: each sentence with the marks the scorer accepts.
         for (si, s) in sentences.iter().enumerate() {
-            if let Some(tokens) = self.punctuated(s) {
+            if let Some(tokens) = self.punctuated(s, judge) {
                 let delta = self.fluency(&tokens) - self.fluency(&originals[si]);
                 let mut sents = originals.clone();
                 sents[si] = tokens;
@@ -171,7 +172,7 @@ impl Engine {
 
         for (si, s) in sentences.iter().enumerate() {
             let base = self.fluency(&originals[si]);
-            for c in self.sentence_candidates(s) {
+            for c in self.sentence_candidates(s, judge) {
                 let delta = self.fluency(&c.tokens) - base;
                 let mut sents = originals.clone();
                 sents[si] = c.tokens;
@@ -196,12 +197,12 @@ impl Engine {
     /// The sentence with accepted marks inserted: gaps come from the parse
     /// (classical), "," / "." from the scorer (learned); a missing end mark
     /// is added by rule. None if nothing would change.
-    fn punctuated(&self, s: &Sentence) -> Option<Vec<String>> {
+    fn punctuated(&self, s: &Sentence, judge: Option<&dyn crate::engine::SlotScorer>) -> Option<Vec<String>> {
         use crate::punctuate::{end_mark, fix_spelling, gaps, insert, GapKind, MIN_MARK_LOGP};
         let original: Vec<String> = s.tokens.iter().map(|t| t.form.clone()).collect();
         let words = fix_spelling(&original);
         let mut marks: Vec<(usize, &str)> = Vec::new();
-        if let Some(scorer) = self.slot_scorer() {
+        if let Some(scorer) = judge {
             let lower: Vec<String> = words.iter().map(|w| w.to_lowercase()).collect();
             for gap in gaps(s) {
                 let options: &[&str] = if gap.kind == GapKind::RunOn { &[",", "."] } else { &[","] };
@@ -228,8 +229,8 @@ impl Engine {
 
     /// (sentence index, connective) pairs where joining sentence i and i+1
     /// reads about as naturally as the existing break.
-    fn connections(&self, originals: &[Vec<String>]) -> Vec<(usize, &'static str)> {
-        let Some(scorer) = self.slot_scorer() else { return vec![] };
+    fn connections(&self, originals: &[Vec<String>], judge: Option<&dyn crate::engine::SlotScorer>) -> Vec<(usize, &'static str)> {
+        let Some(scorer) = judge else { return vec![] };
         let mut out = Vec::new();
         for i in 0..originals.len().saturating_sub(1) {
             let (a, b) = (&originals[i], &originals[i + 1]);
@@ -254,7 +255,7 @@ impl Engine {
         out
     }
 
-    fn sentence_candidates(&self, s: &Sentence) -> Vec<Candidate> {
+    fn sentence_candidates(&self, s: &Sentence, judge: Option<&dyn crate::engine::SlotScorer>) -> Vec<Candidate> {
         let all: Vec<usize> = (0..s.tokens.len()).collect();
         // Trimmed view first, so a result reachable both ways is labeled "trim".
         let mut views = Vec::new();
@@ -274,7 +275,7 @@ impl Engine {
             if let Some(tokens) = reorder(s, &kept) {
                 out.push(Candidate { tokens, ops: with(Op::Reorder) });
             }
-            for tokens in self.swaps(s, &kept) {
+            for tokens in self.swaps(s, &kept, judge) {
                 out.push(Candidate { tokens, ops: with(Op::Swap) });
             }
             for tokens in reframes(s, &kept) {
@@ -284,7 +285,7 @@ impl Engine {
         out
     }
 
-    fn swaps(&self, s: &Sentence, kept: &[usize]) -> Vec<Vec<String>> {
+    fn swaps(&self, s: &Sentence, kept: &[usize], judge: Option<&dyn crate::engine::SlotScorer>) -> Vec<Vec<String>> {
         let mut out = Vec::new();
         for (pos, &i) in kept.iter().enumerate() {
             let t = &s.tokens[i];
@@ -317,7 +318,7 @@ impl Engine {
                 forms.push(form);
             }
             // With the usage model, keep only words that fit this sentence.
-            if let Some(scorer) = self.slot_scorer() {
+            if let Some(scorer) = judge {
                 let context: Vec<String> = words(s, kept).iter().map(|w| w.to_lowercase()).collect();
                 let mut all = vec![t.form.to_lowercase()];
                 all.extend(forms.iter().map(|f| f.to_lowercase()));
