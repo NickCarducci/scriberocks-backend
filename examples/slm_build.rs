@@ -24,7 +24,8 @@
 //!   so learning is unchanged (same batches, masks and gradients) while a long
 //!   batch's working set shrinks. Safe to switch on when resuming any run.
 //! - --dict-corpus semcor,wngc: meanings data (default semcor); --dict-every N:
-//!   a dictionary batch only every N-th step (less repetition of the examples).
+//!   a dictionary batch only every N-th step; --dict-passes N: exactly N
+//!   shuffled passes over the meanings pool, spread evenly over the run.
 //! - Every checkpoint is archived to <out>/checkpoints/step-NNNNNN/ (weights,
 //!   optimizer moments, state); --resume restores the optimizer too.
 //! - --sync-every N: wait for the GPU every N steps (bounds queued work; 0 = never).
@@ -218,7 +219,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let dict_every: usize = value("--dict-every").and_then(|v| v.parse().ok()).unwrap_or(1).max(1);
     let dict_train: &[DictExample] = &dict_pool;
-    eprintln!("dictionary objective: weight {joint}, every {dict_every} step(s), pool {} examples", dict_train.len());
+    // --dict-passes N: exactly N shuffled passes over the pool, spread evenly
+    // over the whole run (replaces random draws and --dict-every).
+    let dict_passes: Option<usize> = value("--dict-passes").and_then(|v| v.parse().ok());
+    let schedule = dict_passes.map(|p| scribe::slm_train::PassSchedule::new(dict_train.len(), p, steps, 0x5EED));
+    match &schedule {
+        Some(sc) => eprintln!("dictionary objective: weight {joint}, {} passes over {} examples, {} per step", dict_passes.unwrap(), dict_train.len(), sc.per_step()),
+        None => eprintln!("dictionary objective: weight {joint}, every {dict_every} step(s), pool {} examples", dict_train.len()),
+    }
 
     let evaluate = || -> candle_core::Result<(f32, Vec<f32>)> {
         let mut rng = Rng(99);
@@ -286,7 +294,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         next_batch += 1;
         let (rows, at, gold) = mask_whole_words(&bert, &batch, &mut rng);
         if at.is_empty() { continue }
-        let b: Vec<&DictExample> = if joint > 0.0 && !dict_train.is_empty() && step % dict_every == 0 { dictionary_batch(dict_train, batch_size / 2, max_pieces / 2, &mut rng) } else { vec![] };
+        let b: Vec<&DictExample> = if let (true, Some(sc)) = (joint > 0.0, &schedule) {
+            sc.batch(step).into_iter().map(|i| &dict_train[i]).collect()
+        } else if joint > 0.0 && !dict_train.is_empty() && step % dict_every == 0 { dictionary_batch(dict_train, batch_size / 2, max_pieces / 2, &mut rng) } else { vec![] };
         // Gradient accumulation over micro-batches (--micro-pieces): the same
         // gradients as the whole batch, with a smaller working set.
         let (grads, loss) = accumulated_grads(&bert, &all_vars, &rows, &at, &gold, &b, joint as f64, micro_pieces, &dev)?;

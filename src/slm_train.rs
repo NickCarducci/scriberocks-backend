@@ -255,6 +255,46 @@ pub fn dictionary_batch<'a>(pool: &'a [DictExample], max_examples: usize, max_pi
     out
 }
 
+/// Spreads `passes` full passes over a small pool (the meanings examples)
+/// evenly across `steps` training steps: each pass is a fresh shuffle (seeded by
+/// the pass number), and step `s` always gets the same examples, so a resumed
+/// run continues exactly. Each example is seen `passes` times — no random
+/// over- or under-sampling.
+pub struct PassSchedule {
+    pool: usize,
+    per_step: usize,
+    seed: u64,
+}
+
+impl PassSchedule {
+    pub fn new(pool: usize, passes: usize, steps: usize, seed: u64) -> PassSchedule {
+        PassSchedule { pool, per_step: (passes * pool).div_ceil(steps.max(1)), seed }
+    }
+
+    pub fn per_step(&self) -> usize { self.per_step }
+
+    fn order(&self, pass: usize) -> Vec<usize> {
+        let mut v: Vec<usize> = (0..self.pool).collect();
+        let mut rng = Rng(self.seed ^ (pass as u64).wrapping_mul(0x9E3779B97F4A7C15) ^ 0xD1B54A32D192ED03);
+        for i in (1..v.len()).rev() { v.swap(i, (rng.next() % (i as u64 + 1)) as usize) }
+        v
+    }
+
+    /// Pool indices for training step `step`.
+    pub fn batch(&self, step: usize) -> Vec<usize> {
+        if self.pool == 0 { return vec![] }
+        let start = step * self.per_step;
+        let mut out = Vec::with_capacity(self.per_step);
+        let mut cache: Option<(usize, Vec<usize>)> = None;
+        for k in start..start + self.per_step {
+            let (pass, at) = (k / self.pool, k % self.pool);
+            if cache.as_ref().is_none_or(|c| c.0 != pass) { cache = Some((pass, self.order(pass))) }
+            out.push(cache.as_ref().unwrap().1[at]);
+        }
+        out
+    }
+}
+
 /// Mean −log of the probability mass each hidden slot puts on its acceptable words.
 pub fn dictionary_loss(bert: &Bert, batch: &[&DictExample], dev: &Device) -> Result<Tensor> {
     dictionary_loss_sum(bert, batch, dev)? / batch.len().max(1) as f64
@@ -279,6 +319,34 @@ pub fn dictionary_loss_sum(bert: &Bert, batch: &[&DictExample], dev: &Device) ->
     let max = picked.max_keepdim(1)?;
     let lse = (picked.broadcast_sub(&max)?.exp()?.sum_keepdim(1)?.log()? + max)?;
     lse.neg()?.sum_all()
+}
+
+#[cfg(test)]
+mod pass_schedule_tests {
+    use super::*;
+
+    #[test]
+    fn every_example_is_seen_exactly_passes_times_spread_evenly() {
+        let (pool, passes, steps) = (97, 10, 1000);
+        let s = PassSchedule::new(pool, passes, steps, 7);
+        let mut seen = vec![0usize; pool];
+        let mut first_half = vec![0usize; pool];
+        for step in 0..steps {
+            for i in s.batch(step) { seen[i] += 1; if step < steps / 2 { first_half[i] += 1 } }
+        }
+        let total = s.per_step() * steps;
+        assert!(seen.iter().all(|&c| c == total / pool || c == total / pool + 1), "{seen:?}");
+        assert!(seen.iter().all(|&c| c >= passes));
+        assert!(first_half.iter().all(|&c| (4..=6).contains(&c)), "evenly spread: {first_half:?}");
+    }
+
+    #[test]
+    fn a_resumed_run_gets_the_same_batches() {
+        let a = PassSchedule::new(500, 10, 2000, 3);
+        let b = PassSchedule::new(500, 10, 2000, 3);
+        assert_eq!(a.batch(1234), b.batch(1234));
+        assert_ne!(a.batch(0), a.batch(1));
+    }
 }
 
 #[cfg(test)]
