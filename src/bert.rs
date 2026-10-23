@@ -29,6 +29,48 @@ impl LayerNorm {
 use std::collections::HashMap;
 use std::path::Path;
 
+/// 8-bit storage for shipping: every matrix row as bytes (value + 128) with
+/// one f32 scale (largest magnitude / 127); vectors (biases, norms) stay f32.
+/// About a quarter of the full-precision size; decompressed once on load.
+pub fn quantize_q8(weights: &HashMap<String, Tensor>) -> Result<HashMap<String, Tensor>> {
+    let mut out = HashMap::new();
+    for (name, t) in weights {
+        let t = t.to_dtype(DType::F32)?.to_device(&Device::Cpu)?;
+        if t.rank() != 2 {
+            out.insert(name.clone(), t);
+            continue;
+        }
+        let (rows, cols) = t.dims2()?;
+        let v = t.to_vec2::<f32>()?;
+        let mut bytes = Vec::with_capacity(rows * cols);
+        let mut scales = Vec::with_capacity(rows);
+        for row in &v {
+            let scale = row.iter().fold(0f32, |m, x| m.max(x.abs())) / 127.0;
+            let inv = if scale > 0.0 { 1.0 / scale } else { 0.0 };
+            bytes.extend(row.iter().map(|x| ((x * inv).round().clamp(-127.0, 127.0) as i32 + 128) as u8));
+            scales.push(scale);
+        }
+        out.insert(format!("{name}.q8"), Tensor::from_vec(bytes, (rows, cols), &Device::Cpu)?);
+        out.insert(format!("{name}.scale"), Tensor::from_vec(scales, (rows, 1), &Device::Cpu)?);
+    }
+    Ok(out)
+}
+
+/// Inverse of `quantize_q8`, to f32 tensors on `device`.
+pub fn dequantize_q8(stored: &HashMap<String, Tensor>, device: &Device) -> Result<HashMap<String, Tensor>> {
+    let mut out = HashMap::new();
+    for (name, t) in stored {
+        if let Some(base) = name.strip_suffix(".q8") {
+            let scale = &stored[&format!("{base}.scale")];
+            let w = (t.to_dtype(DType::F32)? - 128.0)?.broadcast_mul(scale)?;
+            out.insert(base.to_string(), w.to_device(device)?);
+        } else if !name.ends_with(".scale") {
+            out.insert(name.clone(), t.to_dtype(DType::F32)?.to_device(device)?);
+        }
+    }
+    Ok(out)
+}
+
 struct Layer {
     q: Linear,
     k: Linear,
@@ -65,7 +107,13 @@ const MASK: &str = "[MASK]";
 const UNK: &str = "[UNK]";
 
 impl Bert {
+    /// Loads `model.safetensors` (full or half precision), or else
+    /// `model.q8.safetensors` (8-bit, see `quantize_q8`), decompressed to f32.
     pub fn load(dir: &Path, device: Device) -> std::result::Result<Bert, Box<dyn std::error::Error>> {
+        if !dir.join("model.safetensors").exists() && dir.join("model.q8.safetensors").exists() {
+            let weights = dequantize_q8(&candle_core::safetensors::load(dir.join("model.q8.safetensors"), &Device::Cpu)?, &device)?;
+            return Bert::build(dir, VarBuilder::from_tensors(weights, DType::F32, &device), device);
+        }
         let vb = unsafe { VarBuilder::from_mmaped_safetensors(&[dir.join("model.safetensors")], DType::F32, &device)? };
         Bert::build(dir, vb, device)
     }
@@ -340,6 +388,36 @@ mod tests {
 
     fn words(s: &str) -> Vec<String> {
         s.split(' ').map(String::from).collect()
+    }
+
+    /// Compressed copies (half precision, 8-bit) score candidates almost exactly
+    /// like the original, and keep the same ranking.
+    #[test]
+    fn compressed_models_score_like_the_original() {
+        let dir = Path::new("data/bert-mini");
+        if !dir.join("model.safetensors").exists() { return }
+        let full = Bert::load(dir, Device::Cpu).unwrap();
+        let weights = candle_core::safetensors::load(dir.join("model.safetensors"), &Device::Cpu).unwrap();
+        let tmp = std::env::temp_dir().join("scribe-bert-compressed");
+        for kind in ["f16", "q8"] {
+            let d = tmp.join(kind);
+            std::fs::create_dir_all(&d).unwrap();
+            for f in ["vocab.txt", "config.json"] { std::fs::copy(dir.join(f), d.join(f)).unwrap(); }
+            let _ = std::fs::remove_file(d.join("model.safetensors"));
+            if kind == "f16" {
+                let half: HashMap<String, Tensor> = weights.iter().map(|(k, v)| (k.clone(), v.to_dtype(DType::F16).unwrap())).collect();
+                candle_core::safetensors::save(&half, d.join("model.safetensors")).unwrap();
+            } else {
+                candle_core::safetensors::save(&quantize_q8(&weights).unwrap(), d.join("model.q8.safetensors")).unwrap();
+            }
+            let small = Bert::load(&d, Device::Cpu).unwrap();
+            let s = words("she drank a cup of hot tea before bed .");
+            let cands = words("tea coffee gravel water soup");
+            let (a, b) = (full.slot_scores(&s, 6, &cands).unwrap(), small.slot_scores(&s, 6, &cands).unwrap());
+            for (x, y) in a.iter().zip(&b) { assert!((x - y).abs() < 0.25, "{kind}: {x} vs {y}") }
+            let order = |v: &[f32]| { let mut i: Vec<usize> = (0..v.len()).collect(); i.sort_by(|&p, &q| v[q].total_cmp(&v[p])); i };
+            assert_eq!(order(&a)[..2], order(&b)[..2], "{kind}: same top choices");
+        }
     }
 
     /// Runs only where the converted weights exist (data/bert-mini).
