@@ -19,6 +19,10 @@
 //!   batch at N padded pieces as well as --batch; sentences are never cut
 //!   sentences (bounds memory: 128 × 128-piece batches needed ~8.6 GB on the
 //!   CPU vs ~2.8 GB at 32 × 128). Off unless given, so earlier runs resume unchanged.
+//! - --micro-pieces N: gradient accumulation; each step's batch runs in
+//!   micro-batches of at most N padded pieces, normalized over the whole batch,
+//!   so learning is unchanged (same batches, masks and gradients) while a long
+//!   batch's working set shrinks. Safe to switch on when resuming any run.
 //! - --sync-every N: wait for the GPU every N steps (bounds queued work; 0 = never).
 //! - --sample N: N sentences per source (smoke tests). --every N: held-out
 //!   check every N steps (default 2,000).
@@ -35,7 +39,7 @@
 use candle_core::Device;
 use candle_nn::{AdamW, Optimizer, ParamsAdamW};
 use scribe::bert::Bert;
-use scribe::slm_train::{dictionary_batch, dictionary_examples, dictionary_loss, mask_whole_words, masked_loss, token_batches, DictExample, Encoded, Rng};
+use scribe::slm_train::{accumulated_grads, dictionary_batch, dictionary_examples, dictionary_loss, mask_whole_words, masked_loss, token_batches, DictExample, Encoded, Rng};
 use scribe::usage::corpus;
 use scribe::{conllu, text, wordpiece, Lexicon, Pos};
 use std::collections::{HashMap, HashSet};
@@ -86,6 +90,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let n: Option<usize> = value("--sample").and_then(|v| v.parse().ok()).or(quick.then_some(5_000));
     let vocab_size: usize = value("--vocab").and_then(|v| v.parse().ok()).unwrap_or(if quick { 8_000 } else { 30_000 });
     let batch_size: usize = value("--batch").and_then(|v| v.parse().ok()).unwrap_or(BATCH);
+    let micro_pieces: usize = value("--micro-pieces").and_then(|v| v.parse().ok()).unwrap_or(0);
     let max_pieces: usize = value("--max-pieces").and_then(|v| v.parse().ok()).unwrap_or(0);
     let every: usize = value("--every").and_then(|v| v.parse().ok()).unwrap_or(if quick { 250 } else { 2_000 });
     let joint: f32 = value("--joint").and_then(|v| v.parse().ok()).unwrap_or(1.0);
@@ -211,7 +216,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let start = state.as_ref().and_then(|st| st["step"].as_u64()).unwrap_or(0) as usize;
     eprintln!("held-out before training: masked words {m0:.3}, dictionary {d0:.3}");
 
-    let mut opt = AdamW::new(vars.all_vars(), ParamsAdamW { lr: LR, weight_decay: 0.01, ..Default::default() })?;
+    let all_vars = vars.all_vars();
+    let mut opt = AdamW::new(all_vars.clone(), ParamsAdamW { lr: LR, weight_decay: 0.01, ..Default::default() })?;
     let mut rng = Rng(state.as_ref().and_then(|st| st["rng"].as_u64()).unwrap_or(0x2545F4914F6CDD1D));
     let t0 = std::time::Instant::now();
     // Length buckets: sentences sorted by length, cut into batches, batch order
@@ -239,14 +245,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         next_batch += 1;
         let (rows, at, gold) = mask_whole_words(&bert, &batch, &mut rng);
         if at.is_empty() { continue }
-        let mut loss = masked_loss(&bert, &rows, &at, &gold, &dev)?;
-        if joint > 0.0 && !dict_train.is_empty() {
-            let b: Vec<&DictExample> = dictionary_batch(dict_train, batch_size / 2, max_pieces / 2, &mut rng);
-            loss = (loss + (dictionary_loss(&bert, &b, &dev)? * joint as f64)?)?;
-        }
-        let l = loss.detach();
-        window = Some(match window.take() { Some(w) => (w + l)?, None => l });
-        opt.backward_step(&loss)?;
+        let b: Vec<&DictExample> = if joint > 0.0 && !dict_train.is_empty() { dictionary_batch(dict_train, batch_size / 2, max_pieces / 2, &mut rng) } else { vec![] };
+        // Gradient accumulation over micro-batches (--micro-pieces): the same
+        // gradients as the whole batch, with a smaller working set.
+        let (grads, loss) = accumulated_grads(&bert, &all_vars, &rows, &at, &gold, &b, joint as f64, micro_pieces, &dev)?;
+        window = Some(match window.take() { Some(w) => (w + loss)?, None => loss });
+        opt.step(&grads)?;
         // Let the GPU catch up every `sync_every` steps: unsynced, the CPU queues
         // step after step, each holding its buffers until the GPU reaches it.
         if sync_every > 0 && (step + 1) % sync_every == 0 { dev.synchronize()? }
