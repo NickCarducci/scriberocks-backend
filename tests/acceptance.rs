@@ -190,6 +190,7 @@ fn a_prose_style_uses_its_own_judge_and_only_its_own() {
     use scribe::engine::ProseStyle;
     use scribe::scribe_ie::EditOptions;
     let Some(mut engine) = engine() else { return };
+    engine.style_judges.clear(); // independent of any judges installed in models/judges/
     let rock = "The river bank was quiet in the morning.";
     let plain = swaps(&engine, rock);
     assert!(!plain.is_empty());

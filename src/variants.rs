@@ -322,8 +322,15 @@ impl Engine {
                 let context: Vec<String> = words(s, kept).iter().map(|w| w.to_lowercase()).collect();
                 let mut all = vec![t.form.to_lowercase()];
                 all.extend(forms.iter().map(|f| f.to_lowercase()));
-                if let Some(scores) = scorer.slot_scores(&context, pos, &all) {
-                    let fitting = keep_fitting(scores[0], forms.iter().cloned().zip(scores[1..].iter().copied()).collect(), SWAP_MARGIN, SWAPS_PER_WORD);
+                if let Some(mut scores) = scorer.slot_scores(&context, pos, &all) {
+                    // Optionally reward candidates that keep the original meaning.
+                    if self.closeness_weight > 0.0 {
+                        if let Some(c) = scorer.closeness(&context, pos, &all[1..]) {
+                            for (k, x) in c.iter().enumerate() { scores[k + 1] += self.closeness_weight * x }
+                            scores[0] += self.closeness_weight; // the original is identical to itself
+                        }
+                    }
+                    let fitting = keep_fitting(scores[0], forms.iter().cloned().zip(scores[1..].iter().copied()).collect(), self.swap_margin, SWAPS_PER_WORD);
                     forms.retain(|f| fitting.contains(f));
                 }
             }

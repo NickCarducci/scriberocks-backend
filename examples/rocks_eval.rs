@@ -15,6 +15,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let dir = std::env::args().nth(1).unwrap_or_else(|| "models".into());
     let limit: usize = std::env::args().nth(2).and_then(|v| v.parse().ok()).unwrap_or(12);
     let mut e = Engine::load(Path::new(&dir))?;
+    // SWAP_MARGIN / CLOSENESS override the swap filter's cut-off and closeness weight.
+    if let Some(m) = std::env::var("SWAP_MARGIN").ok().and_then(|v| v.parse().ok()) { e.swap_margin = m }
+    if let Some(w) = std::env::var("CLOSENESS").ok().and_then(|v| v.parse().ok()) { e.closeness_weight = w }
     if let Ok(judge) = std::env::var("JUDGE_DIR") {
         e.judge = Some(Box::new(scribe::bert::Bert::load(Path::new(&judge), scribe::usage::model::Device::Cpu)?));
         println!("judge: {judge}");

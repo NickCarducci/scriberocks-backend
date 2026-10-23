@@ -80,6 +80,12 @@ pub struct Engine {
     pub sense_margin: f32,
     /// See `HEAD_MARGIN`.
     pub head_margin: f32,
+    /// Swaps are kept within this margin of the original word's score
+    /// (`SWAP_MARGIN` by default; each judge's scores have their own scale).
+    pub swap_margin: f32,
+    /// Weight of closeness to the original (`SlotScorer::closeness`) added to
+    /// a swap's score; 0 = fit alone (default).
+    pub closeness_weight: f32,
     /// Optional neural syntax (`syntax/`, from examples/parse_finetune.rs):
     /// refines the perceptron's UPOS tags and the transition parser's arcs.
     pub syntax: Option<crate::syntax::SyntaxModel>,
@@ -122,17 +128,46 @@ impl ProseStyle {
 pub trait SlotScorer {
     /// `context[slot]` is replaced by each candidate (which may be several words).
     fn slot_scores(&self, context: &[String], slot: usize, candidates: &[String]) -> Option<Vec<f32>>;
+
+    /// How close each candidate keeps the sentence's meaning: cosine between
+    /// the model's vector at the slot with the original word and with the
+    /// candidate in place (both visible). None if the judge can't tell.
+    fn closeness(&self, _context: &[String], _slot: usize, _candidates: &[String]) -> Option<Vec<f32>> {
+        None
+    }
+}
+
+/// Cosine at `slot` between `vectors[0]` (the original sentence) and each
+/// substituted sentence's vectors.
+fn slot_cosines(vectors: &[Vec<Vec<f32>>], slot: usize) -> Option<Vec<f32>> {
+    let original = vectors.first()?.get(slot)?;
+    let norm = |v: &[f32]| v.iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-6);
+    Some(vectors[1..].iter().map(|v| v.get(slot).map_or(0.0, |c| original.iter().zip(c).map(|(a, b)| a * b).sum::<f32>() / (norm(original) * norm(c)))).collect())
+}
+
+fn substituted(context: &[String], slot: usize, candidates: &[String]) -> Vec<Vec<String>> {
+    std::iter::once(context.to_vec()).chain(candidates.iter().map(|c| {
+        let mut s = context.to_vec();
+        s.splice(slot..slot + 1, c.split(' ').map(String::from));
+        s
+    })).collect()
 }
 
 impl SlotScorer for crate::bert::Bert {
     fn slot_scores(&self, context: &[String], slot: usize, candidates: &[String]) -> Option<Vec<f32>> {
         crate::bert::Bert::slot_scores(self, context, slot, candidates).ok()
     }
+    fn closeness(&self, context: &[String], slot: usize, candidates: &[String]) -> Option<Vec<f32>> {
+        slot_cosines(&self.contextual_batch(&substituted(context, slot, candidates)).ok()?, slot)
+    }
 }
 
 impl SlotScorer for UsageModel {
     fn slot_scores(&self, context: &[String], slot: usize, candidates: &[String]) -> Option<Vec<f32>> {
         self.candidate_scores(context, slot, candidates).ok()
+    }
+    fn closeness(&self, context: &[String], slot: usize, candidates: &[String]) -> Option<Vec<f32>> {
+        slot_cosines(&self.contextual_batch(&substituted(context, slot, candidates)).ok()?, slot)
     }
 }
 
@@ -193,6 +228,8 @@ impl Engine {
             lexicon,
             sense_margin: SENSE_MARGIN,
             head_margin: HEAD_MARGIN,
+            swap_margin: crate::variants::SWAP_MARGIN,
+            closeness_weight: 0.0,
         })
     }
 
