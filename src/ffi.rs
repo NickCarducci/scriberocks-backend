@@ -59,6 +59,8 @@ pub struct ScribeEngine {
     generate: std::sync::atomic::AtomicBool,
     /// The writer's prose style (casual / publishable), set from the app.
     style: std::sync::Mutex<Option<crate::engine::ProseStyle>>,
+    /// The writer's variety slider (0..1), or None for the default cut-off.
+    variety: std::sync::Mutex<Option<f32>>,
 }
 
 fn name<T: serde::Serialize>(v: &T) -> String {
@@ -71,7 +73,7 @@ impl ScribeEngine {
     #[uniffi::constructor]
     pub fn new(models_dir: String) -> Result<Arc<Self>, ScribeError> {
         Engine::load(Path::new(&models_dir))
-            .map(|engine| Arc::new(ScribeEngine { engine, generate: std::sync::atomic::AtomicBool::new(false), style: std::sync::Mutex::new(None) }))
+            .map(|engine| Arc::new(ScribeEngine { engine, generate: std::sync::atomic::AtomicBool::new(false), style: std::sync::Mutex::new(None), variety: std::sync::Mutex::new(None) }))
             .map_err(|e| ScribeError::ModelsUnavailable { message: e.to_string() })
     }
 
@@ -94,6 +96,12 @@ impl ScribeEngine {
         style.is_some() || name.is_empty()
     }
 
+    /// The variety slider: 0 = fewer, safer swaps … 1 = more, bolder ones.
+    /// Values outside 0..1 are clamped; a negative value resets to the default.
+    pub fn set_variety(&self, value: f32) {
+        *self.variety.lock().unwrap() = (value >= 0.0).then(|| value.min(1.0));
+    }
+
     /// Prose styles whose judge models are loaded ("casual", "publishable").
     pub fn available_styles(&self) -> Vec<String> {
         self.engine.available_styles().into_iter().map(|s| s.name().to_string()).collect()
@@ -103,6 +111,7 @@ impl ScribeEngine {
         let options = crate::scribe_ie::EditOptions {
             generate: self.generate.load(std::sync::atomic::Ordering::Relaxed),
             style: *self.style.lock().unwrap(),
+            variety: *self.variety.lock().unwrap(),
         };
         self.engine
             .variants_with(&rock, limit as usize, &options)

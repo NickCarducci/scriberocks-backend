@@ -101,6 +101,11 @@ pub struct Engine {
 
 pub const CONTENT: &[&str] = &["NOUN", "VERB", "ADJ", "ADV"];
 
+/// Cut-off range behind the variety slider (from 0 to 1): on the human-judged
+/// rocks, margins 1.0-4.0 span "few, mostly safe" to "many, some bold" for
+/// every judge tried (usage model, BERT-mini, casual, publishable).
+pub const VARIETY_MARGINS: (f32, f32) = (1.0, 4.0);
+
 /// The writer's prose style, each with its own judge model: casual (trained on
 /// standards: lexicographers, annotators, learners) or publishable (the same
 /// plus published prose). Loaded from `<models>/judges/<name>/` when present.
@@ -248,6 +253,17 @@ impl Engine {
         match options.style.and_then(|st| self.style_judges.iter().find(|(s, _)| *s == st)) {
             Some((_, j)) => Some(j.as_ref() as &dyn SlotScorer),
             None => self.slot_scorer(),
+        }
+    }
+
+    /// The swap cut-off for a request: the variety slider (0..1) spread over
+    /// `VARIETY_MARGINS`, the range measured on the human-judged rocks, so a
+    /// slider position means about the same strictness for every judge; else
+    /// `swap_margin`.
+    pub fn margin_for(&self, options: &crate::scribe_ie::EditOptions) -> f32 {
+        match options.variety {
+            Some(v) => VARIETY_MARGINS.0 + v.clamp(0.0, 1.0) * (VARIETY_MARGINS.1 - VARIETY_MARGINS.0),
+            None => self.swap_margin,
         }
     }
 

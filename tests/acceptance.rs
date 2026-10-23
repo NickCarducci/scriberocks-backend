@@ -203,3 +203,18 @@ fn a_prose_style_uses_its_own_judge_and_only_its_own() {
     assert_eq!(swaps_with(&engine, rock, &publishable), plain, "another style's judge is never used");
     assert_eq!(engine.available_styles(), vec![ProseStyle::Casual]);
 }
+
+/// The variety slider (0 = fewer, safer swaps; 1 = more, bolder): unset keeps
+/// today's suggestions; more variety never offers fewer swaps.
+#[test]
+fn variety_slider_widens_swaps_monotonically() {
+    use scribe::scribe_ie::EditOptions;
+    let Some(mut engine) = engine() else { return };
+    engine.style_judges.clear();
+    let rock = "She gave a brilliant speech about the future of small towns.";
+    let count = |v: Option<f32>| swaps_with(&engine, rock, &EditOptions { variety: v, ..Default::default() }).len();
+    assert_eq!(swaps_with(&engine, rock, &EditOptions::default()), swaps(&engine, rock), "unset = today");
+    let (low, mid, high) = (count(Some(0.0)), count(Some(0.5)), count(Some(1.0)));
+    assert!(low <= mid && mid <= high, "{low} {mid} {high}");
+    assert!(low < high, "the ends differ: {low} vs {high}");
+}

@@ -21,6 +21,9 @@ pub struct EditOptions {
     /// The writer's prose style: suggestions are judged by that style's model
     /// (if loaded); otherwise by the default judge. Another style's judge is never used.
     pub style: Option<crate::engine::ProseStyle>,
+    /// The writer's variety slider, 0 (fewer, safer swaps) to 1 (more, bolder):
+    /// maps onto the swap cut-off (`Engine::margin_for`). None = the engine's default.
+    pub variety: Option<f32>,
 }
 
 /// Byte ranges of the words in `enhanced` that the plain `proposal` doesn't

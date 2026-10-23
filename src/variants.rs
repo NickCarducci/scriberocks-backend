@@ -119,6 +119,7 @@ impl Engine {
     /// As `variants`, with per-request options (Generate: ScribeIE enhances each proposal).
     pub fn variants_with(&self, rock: &str, limit: usize, options: &crate::scribe_ie::EditOptions) -> Vec<Variant> {
         let judge = self.judge_for(options);
+        let margin = self.margin_for(options);
         let sentences = self.parse(rock);
         if sentences.is_empty() {
             return vec![];
@@ -172,7 +173,7 @@ impl Engine {
 
         for (si, s) in sentences.iter().enumerate() {
             let base = self.fluency(&originals[si]);
-            for c in self.sentence_candidates(s, judge) {
+            for c in self.sentence_candidates(s, judge, margin) {
                 let delta = self.fluency(&c.tokens) - base;
                 let mut sents = originals.clone();
                 sents[si] = c.tokens;
@@ -255,7 +256,7 @@ impl Engine {
         out
     }
 
-    fn sentence_candidates(&self, s: &Sentence, judge: Option<&dyn crate::engine::SlotScorer>) -> Vec<Candidate> {
+    fn sentence_candidates(&self, s: &Sentence, judge: Option<&dyn crate::engine::SlotScorer>, margin: f32) -> Vec<Candidate> {
         let all: Vec<usize> = (0..s.tokens.len()).collect();
         // Trimmed view first, so a result reachable both ways is labeled "trim".
         let mut views = Vec::new();
@@ -275,7 +276,7 @@ impl Engine {
             if let Some(tokens) = reorder(s, &kept) {
                 out.push(Candidate { tokens, ops: with(Op::Reorder) });
             }
-            for tokens in self.swaps(s, &kept, judge) {
+            for tokens in self.swaps(s, &kept, judge, margin) {
                 out.push(Candidate { tokens, ops: with(Op::Swap) });
             }
             for tokens in reframes(s, &kept) {
@@ -285,7 +286,7 @@ impl Engine {
         out
     }
 
-    fn swaps(&self, s: &Sentence, kept: &[usize], judge: Option<&dyn crate::engine::SlotScorer>) -> Vec<Vec<String>> {
+    fn swaps(&self, s: &Sentence, kept: &[usize], judge: Option<&dyn crate::engine::SlotScorer>, margin: f32) -> Vec<Vec<String>> {
         let mut out = Vec::new();
         for (pos, &i) in kept.iter().enumerate() {
             let t = &s.tokens[i];
@@ -330,7 +331,7 @@ impl Engine {
                             scores[0] += self.closeness_weight; // the original is identical to itself
                         }
                     }
-                    let fitting = keep_fitting(scores[0], forms.iter().cloned().zip(scores[1..].iter().copied()).collect(), self.swap_margin, SWAPS_PER_WORD);
+                    let fitting = keep_fitting(scores[0], forms.iter().cloned().zip(scores[1..].iter().copied()).collect(), margin, SWAPS_PER_WORD);
                     forms.retain(|f| fitting.contains(f));
                 }
             }
