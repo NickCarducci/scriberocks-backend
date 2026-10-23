@@ -100,6 +100,72 @@ pub fn accumulated_grads(bert: &Bert, vars: &[candle_core::Var], rows: &[Vec<u32
     Ok((grads, total))
 }
 
+/// AdamW with the same update as candle_nn's (which keeps its state private),
+/// plus saving and loading that state — first and second moments per weight
+/// and the step count — so a resumed run continues exactly.
+pub struct Adam {
+    vars: Vec<(String, candle_core::Var, candle_core::Var, candle_core::Var)>,
+    step_t: usize,
+    pub params: candle_nn::ParamsAdamW,
+}
+
+impl Adam {
+    /// Named weights (e.g. from a VarMap), float ones only, in name order.
+    pub fn new(mut named: Vec<(String, candle_core::Var)>, params: candle_nn::ParamsAdamW) -> Result<Adam> {
+        named.retain(|(_, v)| v.dtype().is_float());
+        named.sort_by(|a, b| a.0.cmp(&b.0));
+        let vars = named.into_iter().map(|(n, v)| {
+            let (m, s) = (candle_core::Var::zeros(v.shape(), v.dtype(), v.device())?, candle_core::Var::zeros(v.shape(), v.dtype(), v.device())?);
+            Ok((n, v, m, s))
+        }).collect::<Result<Vec<_>>>()?;
+        Ok(Adam { vars, step_t: 0, params })
+    }
+
+    pub fn set_learning_rate(&mut self, lr: f64) { self.params.lr = lr }
+    pub fn step_count(&self) -> usize { self.step_t }
+
+    pub fn step(&mut self, grads: &candle_core::backprop::GradStore) -> Result<()> {
+        self.step_t += 1;
+        let p = &self.params;
+        let (lr, beta1, beta2) = (p.lr, p.beta1, p.beta2);
+        let scale_m = 1f64 / (1f64 - beta1.powi(self.step_t as i32));
+        let scale_v = 1f64 / (1f64 - beta2.powi(self.step_t as i32));
+        for (_, theta, m, v) in &self.vars {
+            if let Some(g) = grads.get(theta) {
+                let next_m = ((m.as_tensor() * beta1)? + (g * (1.0 - beta1))?)?;
+                let next_v = ((v.as_tensor() * beta2)? + (g.sqr()? * (1.0 - beta2))?)?;
+                let adjusted = ((&next_m * scale_m)? / ((&next_v * scale_v)?.sqrt()? + p.eps)?)?;
+                let next_theta = ((theta.as_tensor() * (1f64 - lr * p.weight_decay))? - (adjusted * lr)?)?;
+                m.set(&next_m)?;
+                v.set(&next_v)?;
+                theta.set(&next_theta)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Saves the moments ("m.<name>", "v.<name>") and step count ("step_t").
+    pub fn save(&self, path: &Path) -> Result<()> {
+        let mut map: std::collections::HashMap<String, Tensor> = std::collections::HashMap::new();
+        for (n, _, m, v) in &self.vars {
+            map.insert(format!("m.{n}"), m.as_tensor().clone());
+            map.insert(format!("v.{n}"), v.as_tensor().clone());
+        }
+        map.insert("step_t".into(), Tensor::new(&[self.step_t as f32], &Device::Cpu)?);
+        candle_core::safetensors::save(&map, path)
+    }
+
+    pub fn load(&mut self, path: &Path) -> Result<()> {
+        let dev = self.vars.first().map(|x| x.1.device().clone()).unwrap_or(Device::Cpu);
+        let map = candle_core::safetensors::load(path, &dev)?;
+        for (n, _, m, v) in &self.vars {
+            if let (Some(a), Some(b)) = (map.get(&format!("m.{n}")), map.get(&format!("v.{n}"))) { m.set(a)?; v.set(b)? }
+        }
+        if let Some(t) = map.get("step_t") { self.step_t = t.to_vec1::<f32>()?[0] as usize }
+        Ok(())
+    }
+}
+
 /// A training sentence: piece ids ([CLS] … [SEP]) and each word's first piece.
 pub struct Encoded {
     pub ids: Vec<u32>,
@@ -213,6 +279,55 @@ pub fn dictionary_loss_sum(bert: &Bert, batch: &[&DictExample], dev: &Device) ->
     let max = picked.max_keepdim(1)?;
     let lse = (picked.broadcast_sub(&max)?.exp()?.sum_keepdim(1)?.log()? + max)?;
     lse.neg()?.sum_all()
+}
+
+#[cfg(test)]
+mod adam_tests {
+    use super::*;
+    use candle_nn::{Optimizer, ParamsAdamW};
+
+    fn setup() -> (Vec<(String, candle_core::Var)>, Tensor) {
+        let a = candle_core::Var::from_tensor(&Tensor::new(&[[0.5f32, -1.0], [2.0, 0.1]], &Device::Cpu).unwrap()).unwrap();
+        let b = candle_core::Var::from_tensor(&Tensor::new(&[0.3f32, -0.7], &Device::Cpu).unwrap()).unwrap();
+        let target = Tensor::new(&[1.0f32, 2.0], &Device::Cpu).unwrap();
+        (vec![("a".into(), a), ("b".into(), b)], target)
+    }
+    fn loss(vars: &[(String, candle_core::Var)], target: &Tensor) -> Tensor {
+        let y = vars[0].1.as_tensor().matmul(&vars[1].1.as_tensor().unsqueeze(1).unwrap()).unwrap().squeeze(1).unwrap();
+        (y - target).unwrap().sqr().unwrap().sum_all().unwrap()
+    }
+    fn params() -> ParamsAdamW { ParamsAdamW { lr: 0.05, weight_decay: 0.01, ..Default::default() } }
+    fn values(vars: &[(String, candle_core::Var)]) -> Vec<f32> { vars.iter().flat_map(|(_, v)| v.as_tensor().flatten_all().unwrap().to_vec1::<f32>().unwrap()).collect() }
+
+    #[test]
+    fn matches_candles_adamw_step_for_step() {
+        let (ours_vars, target) = setup();
+        let (theirs_vars, _) = setup();
+        let mut ours = Adam::new(ours_vars.clone(), params()).unwrap();
+        let mut theirs = candle_nn::AdamW::new(theirs_vars.iter().map(|x| x.1.clone()).collect(), params()).unwrap();
+        for _ in 0..6 {
+            ours.step(&loss(&ours_vars, &target).backward().unwrap()).unwrap();
+            theirs.step(&loss(&theirs_vars, &target).backward().unwrap()).unwrap();
+        }
+        for (x, y) in values(&ours_vars).iter().zip(values(&theirs_vars)) { assert!((x - y).abs() < 1e-6, "{x} vs {y}") }
+    }
+
+    #[test]
+    fn save_and_load_continue_exactly() {
+        let (straight_vars, target) = setup();
+        let mut straight = Adam::new(straight_vars.clone(), params()).unwrap();
+        for _ in 0..5 { straight.step(&loss(&straight_vars, &target).backward().unwrap()).unwrap() }
+        let (vars, _) = setup();
+        let mut first = Adam::new(vars.clone(), params()).unwrap();
+        for _ in 0..3 { first.step(&loss(&vars, &target).backward().unwrap()).unwrap() }
+        let path = std::env::temp_dir().join("scribe-adam-state.safetensors");
+        first.save(&path).unwrap();
+        let mut resumed = Adam::new(vars.clone(), params()).unwrap();
+        resumed.load(&path).unwrap();
+        assert_eq!(resumed.step_count(), 3);
+        for _ in 0..2 { resumed.step(&loss(&vars, &target).backward().unwrap()).unwrap() }
+        for (x, y) in values(&vars).iter().zip(values(&straight_vars)) { assert!((x - y).abs() < 1e-6, "{x} vs {y}") }
+    }
 }
 
 #[cfg(test)]

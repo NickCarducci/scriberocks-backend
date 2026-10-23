@@ -23,6 +23,10 @@
 //!   micro-batches of at most N padded pieces, normalized over the whole batch,
 //!   so learning is unchanged (same batches, masks and gradients) while a long
 //!   batch's working set shrinks. Safe to switch on when resuming any run.
+//! - --dict-corpus semcor,wngc: meanings data (default semcor); --dict-every N:
+//!   a dictionary batch only every N-th step (less repetition of the examples).
+//! - Every checkpoint is archived to <out>/checkpoints/step-NNNNNN/ (weights,
+//!   optimizer moments, state); --resume restores the optimizer too.
 //! - --sync-every N: wait for the GPU every N steps (bounds queued work; 0 = never).
 //! - --sample N: N sentences per source (smoke tests). --every N: held-out
 //!   check every N steps (default 2,000).
@@ -37,9 +41,9 @@
 //! Keeps the step with the lowest held-out loss: 2,000 Tatoeba sentences and
 //! 1,000 SemCor words never trained on.
 use candle_core::Device;
-use candle_nn::{AdamW, Optimizer, ParamsAdamW};
+use candle_nn::ParamsAdamW;
 use scribe::bert::Bert;
-use scribe::slm_train::{accumulated_grads, dictionary_batch, dictionary_examples, dictionary_loss, mask_whole_words, masked_loss, token_batches, DictExample, Encoded, Rng};
+use scribe::slm_train::{accumulated_grads, Adam, dictionary_batch, dictionary_examples, dictionary_loss, mask_whole_words, masked_loss, token_batches, DictExample, Encoded, Rng};
 use scribe::usage::corpus;
 use scribe::{conllu, text, wordpiece, Lexicon, Pos};
 use std::collections::{HashMap, HashSet};
@@ -52,6 +56,8 @@ const WARMUP: usize = 2000;
 const LR: f64 = 5e-4;
 const MAX_LEN: usize = 128;
 const SEMCOR: &str = "data/semcor/wsdeval/WSD_Evaluation_Framework/Training_Corpora/SemCor/semcor";
+/// The Princeton WordNet Gloss Corpus in the same format (scripts/convert_wngc.py).
+const WNGC: &str = "data/wngc/wngc";
 
 /// SWORDS test target words of one part of speech, with their WordNet
 /// synonyms (every meaning) and, for adjectives, similar words.
@@ -186,11 +192,35 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     eprintln!("corpus: {} sentences, {pieces} pieces ({:.2}% [UNK]); ~{:.1} passes over {steps} steps",
               data.len(), 100.0 * unknown as f64 / pieces as f64, (steps * batch_size) as f64 / data.len() as f64);
 
-    let dict = if joint > 0.0 { dictionary_examples(&bert, &lex, SEMCOR, Path::new("data/oewn"))? } else { vec![] };
-    let (dict_train, dict_held) = dict.split_at(dict.len().saturating_sub(1000));
-    eprintln!("dictionary objective: weight {joint}, {} SemCor words with synonyms ({} held out)", dict_train.len(), dict_held.len());
+    // Meanings data: SemCor (held out: its last 1,000, as before) and, with
+    // --dict-corpus semcor,wngc, the WordNet Gloss Corpus (held out: every n-th,
+    // since it is sorted by part of speech). One shared training pool.
+    let corpora: Vec<String> = value("--dict-corpus").unwrap_or_else(|| "semcor".into()).split(',').map(String::from).collect();
+    let mut dict_pool: Vec<DictExample> = Vec::new();
+    let mut dict_helds: Vec<(String, Vec<DictExample>)> = Vec::new();
+    if joint > 0.0 {
+        for c in &corpora {
+            let base = match c.as_str() { "semcor" => SEMCOR, "wngc" => WNGC, other => return Err(format!("unknown --dict-corpus {other}").into()) };
+            let mut ex = dictionary_examples(&bert, &lex, base, Path::new("data/oewn"))?;
+            let held: Vec<DictExample> = if c == "semcor" {
+                ex.split_off(ex.len().saturating_sub(1000))
+            } else {
+                let every = (ex.len() / 1000).max(1);
+                let (mut keep, mut held) = (Vec::new(), Vec::new());
+                for (i, e) in ex.into_iter().enumerate() { if i % every == 0 && held.len() < 1000 { held.push(e) } else { keep.push(e) } }
+                ex = keep;
+                held
+            };
+            eprintln!("dictionary corpus {c}: {} words with synonyms ({} held out)", ex.len(), held.len());
+            dict_pool.extend(ex);
+            dict_helds.push((c.clone(), held));
+        }
+    }
+    let dict_every: usize = value("--dict-every").and_then(|v| v.parse().ok()).unwrap_or(1).max(1);
+    let dict_train: &[DictExample] = &dict_pool;
+    eprintln!("dictionary objective: weight {joint}, every {dict_every} step(s), pool {} examples", dict_train.len());
 
-    let evaluate = || -> candle_core::Result<(f32, f32)> {
+    let evaluate = || -> candle_core::Result<(f32, Vec<f32>)> {
         let mut rng = Rng(99);
         let refs: Vec<&Encoded> = held.iter().collect();
         let chunks: Vec<&[&Encoded]> = refs.chunks(batch_size).collect();
@@ -199,26 +229,37 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let (rows, at, gold) = mask_whole_words(&bert, c, &mut rng);
             m += masked_loss(&bert, &rows, &at, &gold, &dev)?.to_scalar::<f32>()?;
         }
-        let mut d = 0.0;
-        // Held-out dictionary examples in length-capped batches (whole sentences).
-        let dlens: Vec<usize> = dict_held.iter().map(|e| e.ids.len()).collect();
-        let dbatches: Vec<Vec<&DictExample>> = if max_pieces > 0 {
-            token_batches(&dlens, batch_size, max_pieces).into_iter().map(|b| b.into_iter().map(|i| &dict_held[i]).collect()).collect()
-        } else {
-            dict_held.iter().collect::<Vec<_>>().chunks(batch_size).map(|c| c.to_vec()).collect()
-        };
-        let dchunks: Vec<&[&DictExample]> = dbatches.iter().map(|b| b.as_slice()).collect();
-        for c in &dchunks { d += dictionary_loss(&bert, c, &dev)?.to_scalar::<f32>()? }
-        Ok((m / chunks.len() as f32, if dchunks.is_empty() { 0.0 } else { d / dchunks.len() as f32 }))
+        // Held-out dictionary loss per corpus, in length-capped batches (whole sentences).
+        let mut ds = Vec::new();
+        for (_, dict_held) in &dict_helds {
+            let dlens: Vec<usize> = dict_held.iter().map(|e| e.ids.len()).collect();
+            let dbatches: Vec<Vec<&DictExample>> = if max_pieces > 0 {
+                token_batches(&dlens, batch_size, max_pieces).into_iter().map(|b| b.into_iter().map(|i| &dict_held[i]).collect()).collect()
+            } else {
+                dict_held.iter().collect::<Vec<_>>().chunks(batch_size).map(|c| c.to_vec()).collect()
+            };
+            let mut d = 0.0;
+            for c in &dbatches { d += dictionary_loss(&bert, c, &dev)?.to_scalar::<f32>()? }
+            ds.push(if dbatches.is_empty() { 0.0 } else { d / dbatches.len() as f32 });
+        }
+        Ok((m / chunks.len() as f32, ds))
     };
+    let mean = |v: &[f32]| if v.is_empty() { 0.0 } else { v.iter().sum::<f32>() / v.len() as f32 };
+    let show = |v: &[f32]| dict_helds.iter().zip(v).map(|((n, _), d)| format!("{n} {d:.3}")).collect::<Vec<_>>().join(", ");
     let (m0, d0) = evaluate()?;
-    let mut best = state.as_ref().and_then(|st| st["best"].as_f64()).map(|b| b as f32).unwrap_or(m0 + joint * d0);
+    let mut best = state.as_ref().and_then(|st| st["best"].as_f64()).map(|b| b as f32).unwrap_or(m0 + joint * mean(&d0));
     let start = state.as_ref().and_then(|st| st["step"].as_u64()).unwrap_or(0) as usize;
-    eprintln!("held-out before training: masked words {m0:.3}, dictionary {d0:.3}");
+    eprintln!("held-out before training: masked words {m0:.3}, dictionary {}", show(&d0));
 
     let all_vars = vars.all_vars();
-    let mut opt = AdamW::new(all_vars.clone(), ParamsAdamW { lr: LR, weight_decay: 0.01, ..Default::default() })?;
+    // Our AdamW (same update as candle's) so its state can be saved and resumed.
+    let named: Vec<(String, candle_core::Var)> = vars.data().lock().unwrap().iter().map(|(n, v)| (n.clone(), v.clone())).collect();
+    let mut opt = Adam::new(named, ParamsAdamW { lr: LR, weight_decay: 0.01, ..Default::default() })?;
     let mut rng = Rng(state.as_ref().and_then(|st| st["rng"].as_u64()).unwrap_or(0x2545F4914F6CDD1D));
+    if state.is_some() && out.join("last-optimizer.safetensors").exists() {
+        opt.load(&out.join("last-optimizer.safetensors"))?;
+        eprintln!("optimizer state restored (AdamW step {})", opt.step_count());
+    }
     let t0 = std::time::Instant::now();
     // Length buckets: sentences sorted by length, cut into batches, batch order
     // shuffled each pass, so padding stays small (lengths range ~5 to 128 pieces).
@@ -245,7 +286,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         next_batch += 1;
         let (rows, at, gold) = mask_whole_words(&bert, &batch, &mut rng);
         if at.is_empty() { continue }
-        let b: Vec<&DictExample> = if joint > 0.0 && !dict_train.is_empty() { dictionary_batch(dict_train, batch_size / 2, max_pieces / 2, &mut rng) } else { vec![] };
+        let b: Vec<&DictExample> = if joint > 0.0 && !dict_train.is_empty() && step % dict_every == 0 { dictionary_batch(dict_train, batch_size / 2, max_pieces / 2, &mut rng) } else { vec![] };
         // Gradient accumulation over micro-batches (--micro-pieces): the same
         // gradients as the whole batch, with a smaller working set.
         let (grads, loss) = accumulated_grads(&bert, &all_vars, &rows, &at, &gold, &b, joint as f64, micro_pieces, &dev)?;
@@ -256,14 +297,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if sync_every > 0 && (step + 1) % sync_every == 0 { dev.synchronize()? }
         if (step + 1) % every == 0 || step + 1 == steps {
             let (m, d) = evaluate()?;
-            let h = m + joint * d;
+            let h = m + joint * mean(&d);
             let saved = if h < best { best = h; vars.save(out.join("model.safetensors"))?; " saved" } else { "" };
-            // Everything needed to continue exactly here after a stop.
+            // Everything needed to continue exactly here after a stop, and an
+            // archive of every checkpoint (weights, optimizer, state) to return to.
+            let st = serde_json::json!({"step": step + 1, "steps": steps, "best": best, "rng": rng.0, "held_out": {"masked": m, "dictionary": show(&d)}}).to_string();
             vars.save(out.join("last.safetensors"))?;
-            std::fs::write(out.join("state.json"), serde_json::json!({"step": step + 1, "steps": steps, "best": best, "rng": rng.0}).to_string())?;
+            opt.save(&out.join("last-optimizer.safetensors"))?;
+            std::fs::write(out.join("state.json"), &st)?;
+            let archive = out.join("checkpoints").join(format!("step-{:06}", step + 1));
+            std::fs::create_dir_all(&archive)?;
+            std::fs::copy(out.join("last.safetensors"), archive.join("model.safetensors"))?;
+            std::fs::copy(out.join("last-optimizer.safetensors"), archive.join("optimizer.safetensors"))?;
+            std::fs::write(archive.join("state.json"), &st)?;
             let span = if (step + 1) % every == 0 { every as f32 } else { ((step + 1) % every) as f32 };
             let train = window.take().map(|w| w.to_scalar::<f32>()).transpose()?.unwrap_or(0.0) / span;
-            eprintln!("  step {:>7}  train {train:.3}  held-out masked {m:.3} dictionary {d:.3}  ({:.0?}){saved}", step + 1, t0.elapsed());
+            eprintln!("  step {:>7}  train {train:.3}  held-out masked {m:.3} dictionary {}  ({:.0?}){saved}", step + 1, show(&d), t0.elapsed());
         }
     }
     eprintln!("best held-out {best:.3}; model in {}", out.display());

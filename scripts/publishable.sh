@@ -1,0 +1,14 @@
+#!/bin/zsh
+# ScribeSLM publishable model (v2): the casual v2 recipe on the standards plus OANC written text (x3).
+# after any exit short of the last step it resumes from the last checkpoint
+# (examples/slm_build.rs --resume). caffeinate -is keeps the Mac awake on power;
+# if the lid closes it sleeps and the run continues on wake.
+cd "${0:A:h}/.."
+OUT=models/publishable-v2; STEPS=${STEPS:-60000}; LOG=$OUT.train.log
+mkdir -p $OUT
+for attempt in {1..20}; do
+  grep -q "\"step\":$STEPS," $OUT/state.json 2>/dev/null && { echo "finished $STEPS steps" >> $LOG; exit 0 }
+  echo "== attempt $attempt $(date)" >> $LOG
+  caffeinate -is /usr/bin/time -l ./target/release/examples/slm_build $STEPS --vocab 30000 --joint 0.1 --dict-corpus semcor,wngc --dict-every 4 --micro-pieces 1024 --sync-every 1 --extra data/corpus/oanc_written.txt --extra-repeat 3 --out $OUT --resume >> $LOG 2>&1
+  sleep 10
+done

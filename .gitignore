@@ -7,3 +7,4 @@
 /swift/ScribeCore/ScribeFFI.xcframework.zip
 /.build
 /.swiftpm
+/target-cpu
