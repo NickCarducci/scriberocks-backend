@@ -9,6 +9,6 @@ mkdir -p $OUT
 for attempt in {1..20}; do
   grep -q "\"step\":$STEPS," $OUT/state.json 2>/dev/null && { echo "finished $STEPS steps" >> $LOG; exit 0 }
   echo "== attempt $attempt $(date)" >> $LOG
-  caffeinate -is /usr/bin/time -l ./target/release/examples/slm_build $STEPS --vocab 30000 --joint 0.1 --out $OUT --resume >> $LOG 2>&1
+  caffeinate -is /usr/bin/time -l ./target/release/examples/slm_build $STEPS --vocab 30000 --joint 0.1 --micro-pieces 1024 --sync-every 1 --out $OUT --resume >> $LOG 2>&1
   sleep 10
 done
