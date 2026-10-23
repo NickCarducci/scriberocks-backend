@@ -10,7 +10,7 @@ while pgrep -f scripts/publishable.sh >/dev/null; do
   if (( free < 15 || now - start > 1024 )); then
     echo "$(date) stopping prose run: free ${free}%, swap ${now}M (started ${start}M)" >> models/publishable-v2.watchdog.log
     pkill -f scripts/publishable.sh; pkill -f scripts/publishable_quick_scores.sh
-    for p in $(pgrep -x slm_build); do ps -o command= -p $p | grep -q prose-v2 && kill $p; done
+    pkill -f "slm_build .*--out models/publishable-v2"  # the training process itself (matched by its output folder)
     exit 0
   fi
   sleep 30
