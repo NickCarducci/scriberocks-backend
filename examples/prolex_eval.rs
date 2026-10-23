@@ -4,7 +4,7 @@
 //! a sentence with substitutes judged acceptable or not. Test data only; the
 //! TOEFL-11 sentences are licensed by ETS, so never in training or shipped.
 //!
-//!   cargo run --release --example prolex_eval [usage | <BERT-format dir>]...
+//!   cargo run --release --example prolex_eval [usage | <BERT-format dir>]...   (PIECE_MEAN=1: average piece scores)
 //!
 //! Judging: rank each item's acceptable and unacceptable substitutes by the
 //! model's fit in the slot (inflected like the target); GAP with acceptable = 1.
@@ -26,7 +26,13 @@ impl Lm for scribe::usage::model::UsageModel {
     fn top(&self, w: &[String], at: usize, k: usize) -> Vec<String> { self.predict(w, at, k, true).unwrap_or_default().into_iter().map(|x| x.0).collect() }
 }
 impl Lm for scribe::bert::Bert {
-    fn fit(&self, w: &[String], at: usize, f: &[String]) -> Option<Vec<f32>> { self.slot_scores(w, at, f).ok() }
+    /// PIECE_MEAN=1: average a candidate's piece scores instead of summing them
+    /// (a sum penalizes candidates that split into several pieces).
+    fn fit(&self, w: &[String], at: usize, f: &[String]) -> Option<Vec<f32>> {
+        let s = self.slot_scores(w, at, f).ok()?;
+        if std::env::var_os("PIECE_MEAN").is_none() { return Some(s) }
+        Some(s.iter().zip(f).map(|(x, c)| x / c.split(' ').map(|p| self.word_pieces(p).len()).sum::<usize>().max(1) as f32).collect())
+    }
     fn top(&self, w: &[String], at: usize, k: usize) -> Vec<String> { self.predict(w, at, k, true).unwrap_or_default().into_iter().map(|x| x.0).collect() }
 }
 
