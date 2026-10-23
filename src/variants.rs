@@ -539,10 +539,24 @@ fn words(s: &Sentence, kept: &[usize]) -> Vec<String> {
             out.push(end.to_string());
         }
     }
+    drop_stranded_separators(&mut out);
     if let Some(first) = out.first_mut() {
         *first = capitalize(first);
     }
     out
+}
+
+/// A cut can leave a comma or semicolon right before other punctuation
+/// ("for me , ." after cutting "or help me with"); drop it.
+fn drop_stranded_separators(tokens: &mut Vec<String>) {
+    let mut i = 0;
+    while i + 1 < tokens.len() {
+        if matches!(tokens[i].as_str(), "," | ";") && matches!(tokens[i + 1].as_str(), "." | "!" | "?" | "," | ";" | ":") {
+            tokens.remove(i);
+        } else {
+            i += 1;
+        }
+    }
 }
 
 /// "a" / "an" before the word at `pos` (or the word after an adjective there).
@@ -708,6 +722,16 @@ mod tests {
         assert!(!can_join(&toks("Why did I stay ?"), &toks("It rained .")));
         assert!(!can_join(&toks("I stayed ."), &toks("Because it rained .")));
         assert!(!can_join(&toks("I stayed ."), &toks("But it rained .")));
+    }
+
+    #[test]
+    fn a_cut_leaves_no_comma_before_the_period() {
+        let mut t = toks("see what it can accomplish for me , .");
+        drop_stranded_separators(&mut t);
+        assert_eq!(t, toks("see what it can accomplish for me ."));
+        let mut t = toks("first , , then ; ?");
+        drop_stranded_separators(&mut t);
+        assert_eq!(t, toks("first , then ?"));
     }
 
     #[test]
