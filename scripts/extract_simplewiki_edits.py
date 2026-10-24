@@ -12,7 +12,6 @@ Writes train.tsv, dev.tsv, test.tsv (split by article): page id, before, after.
 """
 import collections, difflib, re, sys, xml.etree.ElementTree as ET
 
-out = sys.argv[1]
 GOOD = re.compile(r"^[A-Z0-9\"'(].*[.!?\"')]$")
 BAD = re.compile(r"[<>{}\[\]|=#*_]|https?:")
 REVERT = re.compile(r"\b(revert|reverted|rv|rvv|undo|undid|vandal)", re.I)
@@ -84,54 +83,61 @@ def edits(prev, cur):
     return out
 
 
-files = {k: open(f"{out}/{k}.tsv", "w") for k in ("train", "dev", "test")}
-seen = set()
-stats = collections.Counter()
-ns = None
-page_id = page_ns = None
-revs = []  # (sha1, comment, text) for the current page
+def main():
+    global files, seen, stats, page_id, page_ns, revs
+    out = sys.argv[1]
+    files = {k: open(f"{out}/{k}.tsv", "w") for k in ("train", "dev", "test")}
+    seen = set()
+    stats = collections.Counter()
+    ns = None
+    page_id = page_ns = None
+    revs = []  # (sha1, comment, text) for the current page
 
 
-def flush():
-    """Pairs from one article, leaving out reverted revisions and the reverts."""
-    if page_ns != "0" or len(revs) < 2: return
-    first_seen, bad = {}, set()
-    for i, (sha, comment, _) in enumerate(revs):
-        if sha in first_seen:
-            bad.update(range(first_seen[sha] + 1, i + 1))  # reverted revisions, and the revert
-        else:
-            first_seen[sha] = i
-        if REVERT.search(comment or ""): bad.add(i)
-    split = "test" if int(page_id) % 20 == 0 else "dev" if int(page_id) % 20 == 1 else "train"
-    for i in range(1, len(revs)):
-        stats["revisions"] += 1
-        if i in bad or (i - 1) in bad:
-            stats["skipped (vandalism or revert)"] += 1
+    def flush():
+        """Pairs from one article, leaving out reverted revisions and the reverts."""
+        if page_ns != "0" or len(revs) < 2: return
+        first_seen, bad = {}, set()
+        for i, (sha, comment, _) in enumerate(revs):
+            if sha in first_seen:
+                bad.update(range(first_seen[sha] + 1, i + 1))  # reverted revisions, and the revert
+            else:
+                first_seen[sha] = i
+            if REVERT.search(comment or ""): bad.add(i)
+        split = "test" if int(page_id) % 20 == 0 else "dev" if int(page_id) % 20 == 1 else "train"
+        for i in range(1, len(revs)):
+            stats["revisions"] += 1
+            if i in bad or (i - 1) in bad:
+                stats["skipped (vandalism or revert)"] += 1
+                continue
+            for s, t in edits(revs[i - 1][2], revs[i][2]):
+                if (s, t) in seen: continue
+                seen.add((s, t))
+                files[split].write(f"{page_id}\t{s}\t{t}\n")
+                stats[f"pairs {split}"] += 1
+
+
+    for ev, el in ET.iterparse(sys.stdin.buffer, events=("start", "end")):
+        tag = el.tag.rsplit("}", 1)[-1]
+        if ev == "start":
+            if tag == "page": revs, page_id, page_ns = [], None, None
             continue
-        for s, t in edits(revs[i - 1][2], revs[i][2]):
-            if (s, t) in seen: continue
-            seen.add((s, t))
-            files[split].write(f"{page_id}\t{s}\t{t}\n")
-            stats[f"pairs {split}"] += 1
+        if tag == "ns" and page_ns is None: page_ns = el.text
+        elif tag == "id" and page_id is None: page_id = el.text
+        elif tag == "revision":
+            g = lambda name: next((c.text for c in el if c.tag.endswith(name)), None)
+            if page_ns == "0":
+                revs.append((g("sha1") or "", g("comment") or "", g("text") or ""))
+            el.clear()
+        elif tag == "page":
+            flush()
+            stats["articles"] += page_ns == "0"
+            if stats["articles"] % 5000 == 0 and page_ns == "0":
+                print(dict(stats), file=sys.stderr, flush=True)
+            el.clear()
+    for f in files.values(): f.close()
+    print(dict(stats))
 
 
-for ev, el in ET.iterparse(sys.stdin.buffer, events=("start", "end")):
-    tag = el.tag.rsplit("}", 1)[-1]
-    if ev == "start":
-        if tag == "page": revs, page_id, page_ns = [], None, None
-        continue
-    if tag == "ns" and page_ns is None: page_ns = el.text
-    elif tag == "id" and page_id is None: page_id = el.text
-    elif tag == "revision":
-        g = lambda name: next((c.text for c in el if c.tag.endswith(name)), None)
-        if page_ns == "0":
-            revs.append((g("sha1") or "", g("comment") or "", g("text") or ""))
-        el.clear()
-    elif tag == "page":
-        flush()
-        stats["articles"] += page_ns == "0"
-        if stats["articles"] % 5000 == 0 and page_ns == "0":
-            print(dict(stats), file=sys.stderr, flush=True)
-        el.clear()
-for f in files.values(): f.close()
-print(dict(stats))
+if __name__ == "__main__":
+    main()
