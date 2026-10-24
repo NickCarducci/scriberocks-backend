@@ -6,9 +6,11 @@
 //! commercially reusable). Intent labels are IteraTeR's own classifier's.
 //! Tested on IteraTeR's test splits (test only, never trained on).
 //!
-//!   cargo run --release --example scribe_ie_train [style = publishable] [phrases = 500] [epochs = 4]
+//!   cargo run --release --example scribe_ie_train [style = publishable] [phrases = 500] [epochs = 4] [hidden = 0]
+//!   REWORDS=1 trains (and picks the threshold) on rewording edits only: no
+//!   name or number changed (`edit_tagger::rewords`). OUT names the model folder.
 use scribe::bert::Bert;
-use scribe::edit_tagger::{align, apply, sari, EditTagger, Example};
+use scribe::edit_tagger::{align, apply, rewords, sari, EditTagger, Example};
 use scribe::text::tokenize;
 use std::collections::HashMap;
 use std::path::Path;
@@ -39,11 +41,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let style = std::env::args().nth(1).unwrap_or_else(|| "publishable".into());
     let k: usize = std::env::args().nth(2).and_then(|v| v.parse().ok()).unwrap_or(500);
     let epochs: usize = std::env::args().nth(3).and_then(|v| v.parse().ok()).unwrap_or(4);
+    let hidden: usize = std::env::args().nth(4).and_then(|v| v.parse().ok()).unwrap_or(0);
+    let only_rewords = std::env::var_os("REWORDS").is_some();
+    let reworded = |v: Vec<Pair>| -> Vec<Pair> { if only_rewords { v.into_iter().filter(|p| rewords(&p.before, &p.after)).collect() } else { v } };
     let base = "data/iterater/IteraTeR";
     let bert = Bert::load(&Path::new("models/judges").join(&style), scribe::usage::model::Device::Cpu)?;
 
-    let train = read(&format!("{base}/full_sent_level/train.json"), true, true);
-    let dev = read(&format!("{base}/full_sent_level/dev.json"), true, true);
+    let train = reworded(read(&format!("{base}/full_sent_level/train.json"), true, true));
+    let dev = reworded(read(&format!("{base}/full_sent_level/dev.json"), true, true));
     // The phrases editors add most often (up to 4 words).
     let mut counts: HashMap<String, usize> = HashMap::new();
     for p in &train {
@@ -67,10 +72,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     println!("{style}: {} phrases; {} of {} training edits expressible ({:.0}%)", phrases.len(), examples.len(), train.len(), 100.0 * examples.len() as f64 / train.len().max(1) as f64);
     let t = std::time::Instant::now();
-    let tagger = EditTagger::train(&examples, phrases, 256, epochs, 1e-3, 11)?;
+    let tagger = EditTagger::train(&examples, phrases, 256, hidden, epochs, 1e-3, 11)?;
     println!("trained in {:.0?}", t.elapsed());
     drop(examples);
-    let out = Path::new("models/scribe-ie").join(&style);
+    let out = Path::new("models/scribe-ie").join(std::env::var("OUT").unwrap_or_else(|_| style.clone()));
     tagger.save(&out)?;
 
     // SARI against copying, on edits never trained on.
@@ -97,10 +102,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if s > best.1 { best = (c, s) }
     }
     let test = read(&format!("{base}/full_sent_level/test.json"), true, true);
+    let test_rewords: Vec<Pair> = read(&format!("{base}/full_sent_level/test.json"), true, true).into_iter().filter(|p| rewords(&p.before, &p.after)).collect();
+    let trv = vectors(&bert, &test_rewords);
     let human = read(&format!("{base}/human_sent_level/test.json"), true, false);
     let (tv, hv) = (vectors(&bert, &test), vectors(&bert, &human));
     println!("test, at the dev's best confidence:");
     score("test (clarity, Wikipedia + Wikinews)", &test, &tv, best.0);
+    score("test, rewording edits only", &test_rewords, &trv, best.0);
     score("human-labelled test (clarity, all sources)", &human, &hv, best.0);
     std::fs::write(out.join("confidence.txt"), format!("{}\n", best.0))?;
     println!("→ {}", out.display());

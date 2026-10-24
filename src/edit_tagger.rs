@@ -50,6 +50,17 @@ pub fn align(before: &[String], after: &[String]) -> (Vec<bool>, Vec<Vec<String>
     (keep, inserts)
 }
 
+/// Whether a revision only rewords: it changes no name (a capitalized word
+/// past the first) and no number. Fact edits (Wikinews trimming a name or a
+/// date) teach deleting details, not clearer phrasing.
+pub fn rewords(before: &[String], after: &[String]) -> bool {
+    let (keep, inserts) = align(before, after);
+    let facty = |i: usize, w: &str| w.chars().any(|c| c.is_ascii_digit()) || (i > 0 && w.chars().next().is_some_and(char::is_uppercase));
+    let deleted = before.iter().enumerate().filter(|(i, _)| !keep[*i]).any(|(i, w)| facty(i, w));
+    let added = inserts.iter().enumerate().any(|(g, ws)| ws.iter().enumerate().any(|(k, w)| facty(g + k, w)));
+    !deleted && !added
+}
+
 /// `before` with the tags applied.
 pub fn apply(before: &[String], keep: &[bool], inserts: &[Vec<String>]) -> Vec<String> {
     let mut out = Vec::new();
@@ -116,6 +127,8 @@ pub struct Example {
 pub struct EditTagger {
     pub phrases: Vec<String>,
     dim: usize,
+    /// Optional shared hidden layer ([3·dim, H] and [H], GELU) before both heads.
+    hidden: Option<(Tensor, Tensor)>,
     /// [3·dim, 2] and [2]: delete head (class 1 = delete).
     del_w: Tensor,
     del_b: Tensor,
@@ -125,18 +138,29 @@ pub struct EditTagger {
 }
 
 impl EditTagger {
-    /// Softmax regression for both heads, Adam, on the CPU.
-    pub fn train(examples: &[Example], phrases: Vec<String>, dim: usize, epochs: usize, lr: f64, seed: u64) -> candle_core::Result<EditTagger> {
+    /// Both heads (softmax), with a shared GELU hidden layer of `hidden`
+    /// units when nonzero; Adam, on the CPU.
+    pub fn train(examples: &[Example], phrases: Vec<String>, dim: usize, hidden: usize, epochs: usize, lr: f64, seed: u64) -> candle_core::Result<EditTagger> {
         let dev = Device::Cpu;
         let f = 3 * dim;
         let k = phrases.len() + 1;
+        let into = if hidden > 0 { hidden } else { f };
         let vars = [
-            ("del_w", Var::zeros((f, 2), DType::F32, &dev)?),
+            ("del_w", Var::zeros((into, 2), DType::F32, &dev)?),
             ("del_b", Var::zeros(2, DType::F32, &dev)?),
-            ("ins_w", Var::zeros((f, k), DType::F32, &dev)?),
+            ("ins_w", Var::zeros((into, k), DType::F32, &dev)?),
             ("ins_b", Var::zeros(k, DType::F32, &dev)?),
         ];
-        let mut opt = crate::slm_train::Adam::new(vars.iter().map(|(n, v)| (n.to_string(), v.clone())).collect(), candle_nn::ParamsAdamW { lr, weight_decay: 0.0, ..Default::default() })?;
+        let layer = match hidden {
+            0 => None,
+            h => Some((Var::from_tensor(&(Tensor::randn(0f32, 1.0, (f, h), &dev)? / (f as f64).sqrt())?)?, Var::zeros(h, DType::F32, &dev)?)),
+        };
+        let mut named: Vec<(String, Var)> = vars.iter().map(|(n, v)| (n.to_string(), v.clone())).collect();
+        if let Some((w, b)) = &layer { named.extend([("h_w".to_string(), w.clone()), ("h_b".to_string(), b.clone())]) }
+        let mut opt = crate::slm_train::Adam::new(named, candle_nn::ParamsAdamW { lr, weight_decay: 0.0, ..Default::default() })?;
+        let lift = |x: Tensor| -> candle_core::Result<Tensor> {
+            match &layer { Some((w, b)) => x.matmul(w.as_tensor())?.broadcast_add(b.as_tensor())?.gelu_erf(), None => Ok(x) }
+        };
         let mut rng = crate::slm_train::Rng(seed | 1);
         let mut order: Vec<usize> = (0..examples.len()).collect();
         for epoch in 0..epochs {
@@ -158,15 +182,16 @@ impl EditTagger {
                     }
                 }
                 let (nd, ni) = (dy.len(), iy.len());
-                let dl = candle_nn::loss::cross_entropy(&Tensor::from_vec(dx, (nd, f), &dev)?.matmul(vars[0].1.as_tensor())?.broadcast_add(vars[1].1.as_tensor())?, &Tensor::from_vec(dy, nd, &dev)?)?;
-                let il = candle_nn::loss::cross_entropy(&Tensor::from_vec(ix, (ni, f), &dev)?.matmul(vars[2].1.as_tensor())?.broadcast_add(vars[3].1.as_tensor())?, &Tensor::from_vec(iy, ni, &dev)?)?;
+                let dl = candle_nn::loss::cross_entropy(&lift(Tensor::from_vec(dx, (nd, f), &dev)?)?.matmul(vars[0].1.as_tensor())?.broadcast_add(vars[1].1.as_tensor())?, &Tensor::from_vec(dy, nd, &dev)?)?;
+                let il = candle_nn::loss::cross_entropy(&lift(Tensor::from_vec(ix, (ni, f), &dev)?)?.matmul(vars[2].1.as_tensor())?.broadcast_add(vars[3].1.as_tensor())?, &Tensor::from_vec(iy, ni, &dev)?)?;
                 let loss = (dl + il)?;
                 total += loss.to_scalar::<f32>()? as f64 * chunk.len() as f64;
                 opt.step(&loss.backward()?)?;
             }
             eprintln!("  epoch {}: loss {:.4}", epoch + 1, total / examples.len().max(1) as f64);
         }
-        Ok(EditTagger { phrases, dim, del_w: vars[0].1.as_tensor().clone(), del_b: vars[1].1.as_tensor().clone(), ins_w: vars[2].1.as_tensor().clone(), ins_b: vars[3].1.as_tensor().clone() })
+        let hidden = layer.map(|(w, b)| (w.as_tensor().clone(), b.as_tensor().clone()));
+        Ok(EditTagger { phrases, dim, hidden, del_w: vars[0].1.as_tensor().clone(), del_b: vars[1].1.as_tensor().clone(), ins_w: vars[2].1.as_tensor().clone(), ins_b: vars[3].1.as_tensor().clone() })
     }
 
     /// Edits for one sentence's word vectors: a word is deleted when the
@@ -176,6 +201,7 @@ impl EditTagger {
         let n = vectors.len();
         let rows: Vec<f32> = (0..=n).flat_map(|i| features(vectors, i, self.dim)).collect();
         let x = Tensor::from_vec(rows, (n + 1, 3 * self.dim), &Device::Cpu)?;
+        let x = match &self.hidden { Some((w, b)) => x.matmul(w)?.broadcast_add(b)?.gelu_erf()?, None => x };
         let pd = candle_nn::ops::softmax(&x.narrow(0, 0, n)?.matmul(&self.del_w)?.broadcast_add(&self.del_b)?, D::Minus1)?.to_vec2::<f32>()?;
         let pi = candle_nn::ops::softmax(&x.matmul(&self.ins_w)?.broadcast_add(&self.ins_b)?, D::Minus1)?.to_vec2::<f32>()?;
         let keep = pd.iter().map(|p| p[1] < confidence).collect();
@@ -188,7 +214,8 @@ impl EditTagger {
 
     pub fn save(&self, dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
         std::fs::create_dir_all(dir)?;
-        let w: HashMap<String, Tensor> = [("del_w", &self.del_w), ("del_b", &self.del_b), ("ins_w", &self.ins_w), ("ins_b", &self.ins_b)].into_iter().map(|(n, t)| (n.to_string(), t.clone())).collect();
+        let mut w: HashMap<String, Tensor> = [("del_w", &self.del_w), ("del_b", &self.del_b), ("ins_w", &self.ins_w), ("ins_b", &self.ins_b)].into_iter().map(|(n, t)| (n.to_string(), t.clone())).collect();
+        if let Some((hw, hb)) = &self.hidden { w.insert("h_w".into(), hw.clone()); w.insert("h_b".into(), hb.clone()); }
         candle_core::safetensors::save(&w, dir.join("tagger.safetensors"))?;
         std::fs::write(dir.join("tagger.json"), serde_json::to_string(&serde_json::json!({ "dim": self.dim, "phrases": self.phrases }))?)?;
         Ok(())
@@ -197,8 +224,10 @@ impl EditTagger {
     pub fn load(dir: &Path) -> Result<EditTagger, Box<dyn std::error::Error>> {
         let meta: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(dir.join("tagger.json"))?)?;
         let mut w = candle_core::safetensors::load(dir.join("tagger.safetensors"), &Device::Cpu)?;
+        let hidden = match (w.remove("h_w"), w.remove("h_b")) { (Some(a), Some(b)) => Some((a, b)), _ => None };
         let mut take = |n: &str| w.remove(n).ok_or_else(|| format!("{n} missing"));
         Ok(EditTagger {
+            hidden,
             phrases: meta["phrases"].as_array().ok_or("no phrases")?.iter().filter_map(|p| p.as_str().map(String::from)).collect(),
             dim: meta["dim"].as_u64().ok_or("no dim")? as usize,
             del_w: take("del_w")?,
@@ -248,6 +277,14 @@ mod tests {
     }
 
     #[test]
+    fn rewording_excludes_name_and_number_edits() {
+        assert!(rewords(&t("we did use it"), &t("we used it")));
+        assert!(!rewords(&t("premier Gordon Campbell 's office"), &t("premier Campbell 's office")));
+        assert!(!rewords(&t("about 300 people"), &t("about 400 people")));
+        assert!(rewords(&t("The results is good"), &t("Results are good")), "the first word may be capitalized");
+    }
+
+    #[test]
     fn sari_rewards_the_editors_edit_over_copying() {
         let (src, refr) = (t("the results is very good"), t("the results are good"));
         let copy = sari(&src, &src, &refr);
@@ -267,10 +304,12 @@ mod tests {
             Example { keep: (0..4).map(|i| i != very_at).collect(), inserts: vec![0; 5], vectors }
         };
         let data: Vec<Example> = (0..40).map(|i| ex(i % 4)).collect();
-        let tagger = EditTagger::train(&data, vec!["really".into()], 2, 60, 0.05, 7).unwrap();
+        let tagger = EditTagger::train(&data, vec!["really".into()], 2, 0, 60, 0.05, 7).unwrap();
         let (keep, inserts) = tagger.tag(&data[1].vectors, 0.5).unwrap();
         assert_eq!(keep, data[1].keep);
         assert!(inserts.iter().all(Vec::is_empty));
+        let deep = EditTagger::train(&data, vec!["really".into()], 2, 8, 60, 0.05, 7).unwrap();
+        assert_eq!(deep.tag(&data[1].vectors, 0.5).unwrap().0, data[1].keep, "with a hidden layer too");
         let dir = std::env::temp_dir().join(format!("edit-tagger-{}", std::process::id()));
         tagger.save(&dir).unwrap();
         let back = EditTagger::load(&dir).unwrap();
