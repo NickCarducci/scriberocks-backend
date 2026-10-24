@@ -27,6 +27,11 @@ pub struct Token {
     /// The dictionary supports that sense (single sense, or definition overlap).
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub sense_supported: bool,
+    /// How far the sense head's score for the chosen sense is above its best
+    /// other sense (negative when first-listed was kept below the override
+    /// margin); None with one sense or without the head.
+    #[serde(skip)]
+    pub sense_gap: Option<f32>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -100,6 +105,9 @@ pub struct Engine {
     /// Optional pairing gate (`compose`): holds back swaps for a word whose
     /// picked meaning doesn't fit the words it's attached to. Off unless set.
     pub compose: Option<(crate::compose::Compose, crate::compose::Gate)>,
+    /// Optional confidence gate: swaps only for words whose sense head gap
+    /// (`Token::sense_gap`) is at least this. Off unless set.
+    pub swap_confidence: Option<f32>,
 }
 
 pub const CONTENT: &[&str] = &["NOUN", "VERB", "ADJ", "ADV"];
@@ -227,6 +235,7 @@ impl Engine {
             enhancer: None,
             judge: None,
             compose: None,
+            swap_confidence: None,
             style_judges: ProseStyle::ALL
                 .into_iter()
                 .filter_map(|st| {
@@ -314,6 +323,7 @@ impl Engine {
                     deprel: arcs[i].label.clone(),
                     sense: None,
                     sense_supported: false,
+                    sense_gap: None,
                 }
             })
             .collect();
@@ -338,9 +348,12 @@ impl Engine {
                     if let (Some(head), Some(v)) = (&self.head, v) {
                         let candidates: Vec<Candidate> =
                             senses.iter().enumerate().map(|(rank, &s)| Candidate { synset: s, category: self.lexicon.synsets[s as usize].category, rank }).collect();
-                        if let Some((sense, supported)) = head.scores(v, &candidates).ok().and_then(|sc| choose_by_head(senses, &sc, self.head_margin, |s| head.knows(s))) {
-                            t.sense = Some(sense);
-                            t.sense_supported = supported;
+                        if let Ok(sc) = head.scores(v, &candidates) {
+                            if let Some((sense, supported)) = choose_by_head(senses, &sc, self.head_margin, |s| head.knows(s)) {
+                                t.sense = Some(sense);
+                                t.sense_supported = supported;
+                                t.sense_gap = sense_gap(senses, &sc, sense);
+                            }
                         }
                         continue;
                     }
@@ -399,6 +412,14 @@ pub fn choose_by_head(senses: &[u32], scores: &[f32], margin: f32, knows: impl F
     Some((chosen, knows(chosen)))
 }
 
+/// The chosen sense's head score minus the best other sense's (None with one sense).
+pub fn sense_gap(senses: &[u32], scores: &[f32], chosen: u32) -> Option<f32> {
+    let n = senses.len().min(scores.len());
+    let c = (0..n).find(|&i| senses[i] == chosen)?;
+    let other = (0..n).filter(|&i| i != c).map(|i| scores[i]).fold(f32::NEG_INFINITY, f32::max);
+    other.is_finite().then(|| scores[c] - other)
+}
+
 fn clitic_lemma(w: &str) -> String {
     match w.to_lowercase().as_str() {
         "n't" => "not".into(),
@@ -416,6 +437,13 @@ fn clitic_lemma(w: &str) -> String {
 #[cfg(test)]
 mod sense_tests {
     use super::*;
+
+    #[test]
+    fn the_gap_is_the_chosen_sense_over_its_best_rival() {
+        assert_eq!(sense_gap(&[10, 11, 12], &[0.0, 4.0, 1.0], 11), Some(3.0));
+        assert_eq!(sense_gap(&[10, 11], &[0.0, 2.0], 10), Some(-2.0), "first-listed kept below the margin");
+        assert_eq!(sense_gap(&[10], &[5.0], 10), None);
+    }
 
     #[test]
     fn the_head_overrides_the_first_listed_sense_only_past_its_margin() {

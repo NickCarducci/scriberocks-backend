@@ -13,6 +13,7 @@ use std::path::Path;
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let limit: usize = std::env::args().nth(1).and_then(|v| v.parse().ok()).unwrap_or(6);
     let mut e = Engine::load(Path::new("models"))?;
+    if let Some(c) = std::env::var("SWAP_CONFIDENCE").ok().and_then(|v| v.parse().ok()) { e.swap_confidence = Some(c) }
     // COMPOSE=<pairs.bin> + GATE_TYPICAL / GATE_OUTCOMPETED: the pairing gate (src/compose.rs).
     if let Ok(path) = std::env::var("COMPOSE") {
         let f = |k: &str| std::env::var(k).ok().and_then(|v| v.parse::<f32>().ok());

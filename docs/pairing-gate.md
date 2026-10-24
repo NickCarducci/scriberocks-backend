@@ -47,3 +47,47 @@ meaning but a poor fit, which a meaning-pairing check can't see.
 `role_embedding_v1` tuples (meaning, relation one-hot, partner category) would
 change the kernel, not the sparsity. The October 18 postmortem found the
 representation, not the kernel, to be the limit.
+
+# Sense-confidence gate: results (October 23–24, 2026)
+
+**Idea.** Hold back a word's swaps when the sense head isn't sure of its
+meaning: the chosen sense's score minus the best other sense's score
+(`Token::sense_gap`) falls below a threshold (`Engine::swap_confidence`).
+
+**First sweep** (the first 150 rocks per style, top 20 suggestions per rock;
+wanted kept · forbidden shown):
+
+| Setting | Casual | Publishable |
+|---|---|---|
+| Today (cut-off 2.5) | 61 · 17 | 40 · 10 |
+| Cut-off 2.0 | 59 · 17 | 37 · 10 |
+| Cut-off 1.0 | 44 · 10 | 31 · 10 |
+| Confidence ≥ −1 | 58 · 17 | 37 · 7 |
+| Confidence ≥ 0 | 57 · 17 | 31 · 6 |
+
+On publishable this looked better than lowering the cut-off, but the
+differences were only 3–4 suggestions, and the thresholds came from these
+same rocks.
+
+**Confirmation** on rocks not used to pick the thresholds (all of SWORDS and
+ProLex past the first 150: 366 publishable rocks, 164 casual):
+
+| Setting | Casual (new) | Publishable (new) |
+|---|---|---|
+| Today (cut-off 2.5) | 36/173 · 16/103 | 49/252 · 28/742 |
+| Cut-off 2.0 | 33 · 14 | 44 · 23 |
+| Cut-off 1.5 | 28 · 13 | 37 · 23 |
+| Confidence ≥ −1 | 35 · 16 | 45 · 23 |
+| Confidence ≥ 0 | 35 · 16 | 43 · 22 |
+
+**Result.** Not adopted (`swap_confidence` stays None).
+- On publishable, the gate is level with lowering the cut-off at matched
+  wanted suggestions: 45 · 23 against 44 · 23. Its first-sweep edge was noise.
+- On casual it removes wanted suggestions and no forbidden ones.
+- On the user's paragraph it kept *define / set / limit*: the sense head was
+  confident in the wrong meaning of *fix*.
+
+**Takeaway.** Both gates tried here, pairing and confidence, do no better than
+the variety slider. Wrong-meaning swaps trace back to sense choice itself (the
+sense head: 61.0% on ALL against 55.6% for first-listed). Fewer of them needs
+a better sense head, not a filter after it.

@@ -159,6 +159,7 @@ mod tests {
                     deprel: d.to_string(),
                     sense: None,
                     sense_supported: false,
+                    sense_gap: None,
                 })
                 .collect(),
         }

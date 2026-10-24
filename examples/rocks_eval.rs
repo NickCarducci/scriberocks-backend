@@ -28,6 +28,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if let Some(v) = f("GATE_OUTCOMPETED") { gate.outcompeted = v }
         e.compose = Some((scribe::compose::Compose::load(Path::new(&path))?, gate));
     }
+    // SWAP_CONFIDENCE=<gap>: swaps only where the sense head's chosen meaning beats its rival by this.
+    if let Some(c) = std::env::var("SWAP_CONFIDENCE").ok().and_then(|v| v.parse().ok()) { e.swap_confidence = Some(c) }
     if let Ok(judge) = std::env::var("JUDGE_DIR") {
         e.judge = Some(Box::new(scribe::bert::Bert::load(Path::new(&judge), scribe::usage::model::Device::Cpu)?));
         println!("judge: {judge}");

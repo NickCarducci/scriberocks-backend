@@ -295,6 +295,9 @@ impl Engine {
                 continue;
             }
             let Some(sense) = t.sense.filter(|_| t.sense_supported) else { continue };
+            if self.swap_confidence.is_some_and(|c| t.sense_gap.is_some_and(|g| g < c)) {
+                continue; // the sense head isn't sure which meaning this is
+            }
             if let Some((c, gate)) = &self.compose {
                 if c.blocks(&self.lexicon, s, i, sense, *gate) { continue }
             }
