@@ -234,7 +234,7 @@ impl Bert {
     }
 
     /// Hidden states [b, t, dim] for padded id rows (padding masked out of attention).
-    fn hidden(&self, rows: &[Vec<u32>]) -> Result<Tensor> {
+    pub fn hidden(&self, rows: &[Vec<u32>]) -> Result<Tensor> {
         let (b, t) = (rows.len(), rows.iter().map(Vec::len).max().unwrap_or(1));
         let mut flat = Vec::with_capacity(b * t);
         let mut pad = Vec::with_capacity(b * t);

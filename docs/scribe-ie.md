@@ -61,3 +61,32 @@ on context?" → "Does it just similar words based on?").
 **Next.** Train on revision data whose "after" text is real writing: edits
 that insert or replace words (no pure deletions), checked by reading samples,
 or a different commercially usable revision source.
+
+## Third round: Simple English Wikipedia edits, fine-tuned encoder (October 24, 2026)
+
+**Data.** Simple English Wikipedia's revision history (CC BY-SA), extracted
+locally (`scripts/extract_simplewiki_edits.py`). Changed paragraphs are cleaned
+the same way on both sides, so no link-word artifacts. Vandalism (any reverted
+revision, by checksum) and reverts are dropped. Edits are small (1–6 words)
+and change no name or number. Result: 400,245 sentence edits from 400,692
+articles and 6.6M revisions, split by article (361,019 train, 19,100 dev,
+20,126 test). 48 min, 2.1 GB peak.
+
+**Model.** The edit tagger (1,000 phrases, 512-unit hidden layer) with its
+own encoder, fine-tuned from casual v2 (`examples/scribe_ie_finetune.rs`):
+200,000 edits (59% expressible), 2 epochs, 9 min on the GPU, 3.1 GB peak.
+
+**Score** (held-out articles, n = 4,999): SARI 40.1 (copying 29.6); it edits
+51% of sentences and matches the editor exactly 7.7% of the time (IteraTeR
+models: 0–3%).
+
+**Reading the output.** Insertions and punctuation are useful ("born as" →
+"born", "party, but", "i" → "I"). Deletions can still change meaning ("we
+didnt decide anything" → "we decide anything"; "AI winter" → "winter").
+
+**Ranking red edits.** On 1,000 real held-out edits against the same edits
+moved elsewhere in the sentence (`examples/edit_judge_eval.rs`, AUC): casual
+judge likelihood change 0.865; trigram fluency 0.779; counts 0.518; FidelityAI
+local fits 0.502 (cascade fallback, path B) and 0.491 (role embeddings on edit
+tuples, 52 qubits). The judge ranks ScribeIE's edits for now; no paid
+FidelityAI run.

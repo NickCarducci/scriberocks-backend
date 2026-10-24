@@ -61,6 +61,14 @@ pub fn rewords(before: &[String], after: &[String]) -> bool {
     !deleted && !added
 }
 
+/// Whether a revision writes something: it inserts or replaces at least one
+/// word. Pure deletions are left out: in IteraTeR's Wikipedia and Wikinews
+/// edits many are extraction artifacts (a linked word missing from the
+/// "after" text: "It is endemic to the island" → "It is to the island").
+pub fn writes(before: &[String], after: &[String]) -> bool {
+    align(before, after).1.iter().any(|ins| ins.iter().any(|w| w.chars().any(char::is_alphanumeric)))
+}
+
 /// `before` with the tags applied.
 pub fn apply(before: &[String], keep: &[bool], inserts: &[Vec<String>]) -> Vec<String> {
     let mut out = Vec::new();
@@ -194,6 +202,92 @@ impl EditTagger {
         Ok(EditTagger { phrases, dim, hidden, del_w: vars[0].1.as_tensor().clone(), del_b: vars[1].1.as_tensor().clone(), ins_w: vars[2].1.as_tensor().clone(), ins_b: vars[3].1.as_tensor().clone() })
     }
 
+    /// As `train`, but the encoder learns too: word vectors come from
+    /// `bert` (trainable, its weights in `bert_vars`) inside the gradient.
+    /// The encoder moves at `encoder_lr`, the heads at `head_lr`. Sentences
+    /// are (words, keep flags, insert ids for the n + 1 gaps); ones the
+    /// encoder would truncate are skipped. Save the encoder with
+    /// `bert_vars.save(...)`; the returned tagger holds the heads.
+    #[allow(clippy::too_many_arguments)]
+    pub fn train_finetuned(bert: &Bert, bert_vars: &candle_nn::VarMap, sentences: &[(Vec<String>, Vec<bool>, Vec<usize>)], phrases: Vec<String>,
+                           hidden: usize, epochs: usize, encoder_lr: f64, head_lr: f64, seed: u64, dev: &Device) -> candle_core::Result<EditTagger> {
+        let dim = bert.hidden(&[vec![0u32]])?.dim(2)?;
+        let f = 3 * dim;
+        let k = phrases.len() + 1;
+        let into = if hidden > 0 { hidden } else { f };
+        let heads = [
+            ("del_w", Var::zeros((into, 2), DType::F32, dev)?),
+            ("del_b", Var::zeros(2, DType::F32, dev)?),
+            ("ins_w", Var::zeros((into, k), DType::F32, dev)?),
+            ("ins_b", Var::zeros(k, DType::F32, dev)?),
+        ];
+        let layer = match hidden {
+            0 => None,
+            h => Some((Var::from_tensor(&(Tensor::randn(0f32, 1.0, (f, h), dev)? / (f as f64).sqrt())?)?, Var::zeros(h, DType::F32, dev)?)),
+        };
+        let mut named: Vec<(String, Var)> = heads.iter().map(|(n, v)| (n.to_string(), v.clone())).collect();
+        if let Some((w, b)) = &layer { named.extend([("h_w".to_string(), w.clone()), ("h_b".to_string(), b.clone())]) }
+        let mut head_opt = crate::slm_train::Adam::new(named, candle_nn::ParamsAdamW { lr: head_lr, weight_decay: 0.0, ..Default::default() })?;
+        let enc: Vec<(String, Var)> = bert_vars.data().lock().unwrap().iter().map(|(n, v)| (n.clone(), v.clone())).collect();
+        let mut enc_opt = crate::slm_train::Adam::new(enc, candle_nn::ParamsAdamW { lr: encoder_lr, weight_decay: 0.01, ..Default::default() })?;
+        let encoded: Vec<Option<(Vec<u32>, Vec<usize>)>> = sentences.iter().map(|(w, _, _)| {
+            let (ids, first) = bert.encode_words(w);
+            (first.len() == w.len() && first.iter().all(|&x| x + 1 < ids.len())).then_some((ids, first))
+        }).collect();
+        let usable: Vec<usize> = (0..sentences.len()).filter(|&i| encoded[i].is_some()).collect();
+        let mut rng = crate::slm_train::Rng(seed | 1);
+        let mut order = usable.clone();
+        for epoch in 0..epochs {
+            for i in (1..order.len()).rev() { order.swap(i, (rng.next() % (i as u64 + 1)) as usize) }
+            let (mut total, mut batches) = (0.0, 0);
+            for chunk in order.chunks(32) {
+                let rows: Vec<Vec<u32>> = chunk.iter().map(|&i| encoded[i].as_ref().unwrap().0.clone()).collect();
+                let h = bert.hidden(&rows)?;
+                let (b, t, _) = h.dims3()?;
+                let table = Tensor::cat(&[h.reshape((b * t, dim))?, Tensor::zeros((1, dim), DType::F32, dev)?], 0)?;
+                let zero = (b * t) as u32;
+                let (mut dsel, mut isel) = ([Vec::new(), Vec::new(), Vec::new()], [Vec::new(), Vec::new(), Vec::new()]);
+                let (mut dy, mut iy) = (Vec::new(), Vec::new());
+                for (row, &i) in chunk.iter().enumerate() {
+                    let first = &encoded[i].as_ref().unwrap().1;
+                    let at = |w: Option<usize>| w.and_then(|w| first.get(w)).map_or(zero, |&x| (row * t + x) as u32);
+                    let (_, keep, ins) = &sentences[i];
+                    for w in 0..first.len() {
+                        for (j, x) in [w.checked_sub(1), Some(w), Some(w + 1)].into_iter().enumerate() { dsel[j].push(at(x)) }
+                        dy.push(u32::from(!keep[w]));
+                    }
+                    for (g, &id) in ins.iter().enumerate() {
+                        for (j, x) in [g.checked_sub(1), Some(g), Some(g + 1)].into_iter().enumerate() { isel[j].push(at(x)) }
+                        iy.push(id as u32);
+                    }
+                }
+                let gather = |sel: &[Vec<u32>; 3]| -> candle_core::Result<Tensor> {
+                    let parts = sel.iter().map(|s| table.index_select(&Tensor::new(s.as_slice(), dev)?, 0)).collect::<candle_core::Result<Vec<_>>>()?;
+                    let x = Tensor::cat(&parts, 1)?;
+                    match &layer { Some((w, b)) => x.matmul(w.as_tensor())?.broadcast_add(b.as_tensor())?.gelu_erf(), None => Ok(x) }
+                };
+                let (nd, ni) = (dy.len(), iy.len());
+                let dl = candle_nn::loss::cross_entropy(&gather(&dsel)?.matmul(heads[0].1.as_tensor())?.broadcast_add(heads[1].1.as_tensor())?, &Tensor::from_vec(dy, nd, dev)?)?;
+                let il = candle_nn::loss::cross_entropy(&gather(&isel)?.matmul(heads[2].1.as_tensor())?.broadcast_add(heads[3].1.as_tensor())?, &Tensor::from_vec(iy, ni, dev)?)?;
+                let loss = (dl + il)?;
+                let grads = loss.backward()?;
+                head_opt.step(&grads)?;
+                enc_opt.step(&grads)?;
+                total += loss.to_scalar::<f32>()? as f64;
+                batches += 1;
+                if batches % 500 == 0 { eprintln!("  epoch {} batch {batches}: loss {:.4}", epoch + 1, total / batches as f64) }
+            }
+            eprintln!("  epoch {}: loss {:.4} ({} sentences)", epoch + 1, total / batches.max(1) as f64, order.len());
+        }
+        let cpu = |v: &Var| v.as_tensor().to_device(&Device::Cpu);
+        Ok(EditTagger {
+            phrases,
+            dim,
+            hidden: match &layer { Some((w, b)) => Some((cpu(w)?, cpu(b)?)), None => None },
+            del_w: cpu(&heads[0].1)?, del_b: cpu(&heads[1].1)?, ins_w: cpu(&heads[2].1)?, ins_b: cpu(&heads[3].1)?,
+        })
+    }
+
     /// Edits for one sentence's word vectors: a word is deleted when the
     /// delete head is at least `confidence` sure, and a phrase inserted when
     /// the insert head gives it at least `confidence`.
@@ -274,6 +368,46 @@ mod tests {
         let (keep, ins) = align(&t("we did use it"), &t("we used it"));
         assert_eq!(keep, vec![true, false, false, true]);
         assert_eq!(ins[1], t("used"));
+    }
+
+    #[test]
+    fn fine_tuning_learns_an_insertion_and_moves_the_encoder() {
+        // Toy task: insert "really" before "good"; nothing else changes.
+        let lines = ["the food is good .", "this film was good .", "her plan is good .", "the weather is bad .", "his car was bad ."];
+        let mut vocab: Vec<String> = crate::wordpiece::SPECIALS.iter().map(|s| s.to_string()).collect();
+        for w in lines.iter().flat_map(|l| l.split(' ')).chain(["really"]) { if !vocab.iter().any(|v| v == w) { vocab.push(w.to_string()) } }
+        let dir = std::env::temp_dir().join(format!("edit-tagger-ft-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("vocab.txt"), vocab.join("\n")).unwrap();
+        std::fs::write(dir.join("config.json"), serde_json::json!({"hidden_size": 16, "num_hidden_layers": 1, "num_attention_heads": 2,
+            "intermediate_size": 32, "max_position_embeddings": 32, "layer_norm_eps": 1e-12, "pre_layer_norm": true}).to_string()).unwrap();
+        let (bert, vars) = Bert::new_random(&dir, Device::Cpu).unwrap();
+        let before = vars.all_vars()[0].as_tensor().flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        let data: Vec<(Vec<String>, Vec<bool>, Vec<usize>)> = (0..8).flat_map(|_| lines.iter()).map(|l| {
+            let w = t(l);
+            let ins = (0..=w.len()).map(|g| usize::from(w.get(g).is_some_and(|x| x == "good"))).collect();
+            (w.clone(), vec![true; w.len()], ins)
+        }).collect();
+        let tagger = EditTagger::train_finetuned(&bert, &vars, &data, vec!["really".into()], 16, 30, 1e-3, 1e-2, 3, &Device::Cpu).unwrap();
+        let after = vars.all_vars()[0].as_tensor().flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        assert!(before.iter().zip(&after).any(|(a, b)| a != b), "the encoder trained");
+        let words = t("the food is good .");
+        let v = bert.contextual_batch(std::slice::from_ref(&words)).unwrap().remove(0);
+        let (keep, ins) = tagger.tag(&v, 0.5).unwrap();
+        assert_eq!(apply(&words, &keep, &ins), t("the food is really good ."));
+        let bad = t("the weather is bad .");
+        let v = bert.contextual_batch(std::slice::from_ref(&bad)).unwrap().remove(0);
+        let (keep, ins) = tagger.tag(&v, 0.5).unwrap();
+        assert_eq!(apply(&bad, &keep, &ins), bad, "no insertion where none belongs");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn writing_needs_an_inserted_or_replaced_word() {
+        assert!(!writes(&t("It is endemic to the island"), &t("It is to the island")), "pure deletion");
+        assert!(writes(&t("provide the information"), &t("provide details")), "replacement");
+        assert!(writes(&t("a civil rather criminal matter"), &t("a civil rather than criminal matter")), "insertion");
+        assert!(!writes(&t("a b ."), &t("a b , .")), "punctuation alone writes nothing");
     }
 
     #[test]

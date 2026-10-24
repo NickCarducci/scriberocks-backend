@@ -15,7 +15,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("{line}");
         for confidence in [0.3, 0.5, 0.7] {
             let e = TaggerEnhancer {
-                encoder: scribe::bert::Bert::load(&Path::new("models/judges").join(&style), scribe::usage::model::Device::Cpu)?,
+                // Its own fine-tuned encoder when it has one, else the style's judge.
+                encoder: match Path::new("models/scribe-ie").join(&folder).join("encoder") {
+                    enc if enc.exists() => scribe::bert::Bert::load(&enc, scribe::usage::model::Device::Cpu)?,
+                    _ => scribe::bert::Bert::load(&Path::new("models/judges").join(&style), scribe::usage::model::Device::Cpu)?,
+                },
                 tagger: EditTagger::load(&Path::new("models/scribe-ie").join(&folder))?,
                 confidence,
             };
