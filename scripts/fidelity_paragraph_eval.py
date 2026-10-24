@@ -7,9 +7,9 @@ in threes from training articles. Reports, per source: candidates scored,
 distinct scores, candidate frames whose values all fell outside the fitted
 dictionary (empty after mapping), and AUC (good scored more typical).
 
-usage: ~/.venvs/fidelityai/bin/python -I fidelity_paragraph_eval.py <core data dir> <engine dir> [n per class = 500]
+usage: [ENCODING='{"type": "role_embedding_v1", "dim": 16}'] ~/.venvs/fidelityai/bin/python -I fidelity_paragraph_eval.py <core data dir> <engine dir> [n per class = 500]
 """
-import collections, random, re, sys, types
+import collections, json, os, random, re, sys, types
 
 data, engine = sys.argv[1], sys.argv[2]
 n = int(sys.argv[3]) if len(sys.argv) > 3 else 500
@@ -48,7 +48,8 @@ def auc(scores, ys):
 
 for name, source in [("certified paragraphs", certified[:5000]), ("stable sentences in threes", rng.sample(stable_src, min(5000, len(stable_src))))]:
     res = abcd_fit_and_score(source_dataset=types.SimpleNamespace(episodes=source, label="good"),
-                             artifact_dataset=types.SimpleNamespace(episodes=cands, label="candidates"), max_qubits=20, seed=42)
+                             artifact_dataset=types.SimpleNamespace(episodes=cands, label="candidates"), max_qubits=20, seed=42,
+                             encoding=json.loads(os.environ["ENCODING"]) if os.environ.get("ENCODING") else None)
     mapped = res.get("mapped_artifacts") or []
     prov = res.get("artifact_provenance") or []
     empty = sum(1 for m in mapped if not m)
