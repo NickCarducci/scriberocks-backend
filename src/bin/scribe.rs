@@ -11,10 +11,11 @@
 //! scribe train-senses <data-dir> <models-dir> [steps]   sense modeling: continue models/usage with a supersense
 //!                                                       objective (dictionary-allowed sets + SemCor gold) → models/usage-sense;
 //!                                                       --control: same corpus and schedule, words only → models/usage-control
-//! scribe train-head <data-dir> <models-dir> [usage-dir-name] [--held-out]
+//! scribe train-head <data-dir> <models-dir> [usage-dir-name] [--held-out] [--wngc] [--out <dir>]
 //!                                                       sense head on SemCor's sense-tagged text (masked-word vectors from the
-//!                                                       usage model) → <usage-dir>/head, which the engine then uses to choose
-//!                                                       senses; --held-out trains on even documents only (as semcor_eval does)
+//!                                                       usage model) → <usage-dir>/head (or --out), which the engine then uses to
+//!                                                       choose senses; --held-out trains on even documents only (as semcor_eval
+//!                                                       does); --wngc adds the Princeton WordNet Gloss Corpus
 
 use scribe::{conllu, inflect::Inflector, lm::LanguageModel, parser::Parser, tagger::{Column, Tagger}, text, Engine, Lexicon};
 use std::io::Read;
@@ -125,7 +126,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         Some("train-head") => {
             let name = args.get(4).filter(|a| !a.starts_with("--")).map_or("usage", String::as_str);
-            train_head(Path::new(arg(2)?), Path::new(arg(3)?), name, args.iter().any(|a| a == "--held-out"))?
+            let out = args.iter().position(|a| a == "--out").and_then(|i| args.get(i + 1)).map(PathBuf::from);
+            train_head(Path::new(arg(2)?), Path::new(arg(3)?), name, args.iter().any(|a| a == "--held-out"), args.iter().any(|a| a == "--wngc"), out)?
         }
         Some("train-senses") => {
             let steps = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(20_000);
@@ -438,12 +440,22 @@ fn build_senses(model: &scribe::usage::model::UsageModel, lex: &Lexicon, out: &P
     Ok(())
 }
 
-/// Trains the sense head on SemCor: for every sense-tagged word with more than
-/// one dictionary sense, the usage model's vector at the masked word, its
-/// candidate senses in dictionary order, and the gold sense.
-fn train_head(data: &Path, models: &Path, usage_name: &str, held_out: bool) -> Result<(), Box<dyn std::error::Error>> {
-    use scribe::usage::{model::{Device, UsageModel}, sense_head::{self, Candidate, SenseHead}};
+/// The sense head's training sentences: SemCor (odd documents left out when
+/// `held_out`, for semcor_eval) and, when given, every WordNet Gloss Corpus
+/// sentence (glosses share no text with SemCor or the ALL test set).
+fn head_training_sentences<'a>(semcor: &'a [scribe::semcor::TaggedSentence], wngc: &'a [scribe::semcor::TaggedSentence], held_out: bool) -> Vec<&'a scribe::semcor::TaggedSentence> {
     use std::collections::BTreeSet;
+    let docs: Vec<&str> = semcor.iter().map(|s| s.document.as_str()).collect::<BTreeSet<_>>().into_iter().collect();
+    let held: BTreeSet<&str> = if held_out { docs.iter().skip(1).step_by(2).copied().collect() } else { BTreeSet::new() };
+    semcor.iter().filter(|s| !held.contains(s.document.as_str())).chain(wngc).collect()
+}
+
+/// Trains the sense head on SemCor (and with `wngc`, the WordNet Gloss
+/// Corpus): for every sense-tagged word with more than one dictionary sense,
+/// the usage model's vector at the masked word, its candidate senses in
+/// dictionary order, and the gold sense.
+fn train_head(data: &Path, models: &Path, usage_name: &str, held_out: bool, wngc: bool, out: Option<PathBuf>) -> Result<(), Box<dyn std::error::Error>> {
+    use scribe::usage::{model::{Device, UsageModel}, sense_head::{self, Candidate, SenseHead}};
 
     let t = Instant::now();
     let lex = Lexicon::load(&models.join("lexicon.bin"))?;
@@ -452,10 +464,12 @@ fn train_head(data: &Path, models: &Path, usage_name: &str, held_out: bool) -> R
     let wsd = data.join("semcor/wsdeval/WSD_Evaluation_Framework/Training_Corpora/SemCor");
     let semcor = scribe::semcor::parse(&std::fs::read_to_string(wsd.join("semcor.data.xml"))?, &std::fs::read_to_string(wsd.join("semcor.gold.key.txt"))?);
     let keys = scribe::semcor::sense_keys(&data.join("oewn"), &lex)?;
-    let docs: Vec<&str> = semcor.iter().map(|s| s.document.as_str()).collect::<BTreeSet<_>>().into_iter().collect();
-    let held: BTreeSet<&str> = if held_out { docs.iter().skip(1).step_by(2).copied().collect() } else { BTreeSet::new() };
+    let glosses = match wngc {
+        true => scribe::semcor::parse(&std::fs::read_to_string(data.join("wngc/wngc.data.xml"))?, &std::fs::read_to_string(data.join("wngc/wngc.gold.key.txt"))?),
+        false => Vec::new(),
+    };
     let mut examples = Vec::new();
-    let sentences: Vec<_> = semcor.iter().filter(|s| !held.contains(s.document.as_str())).collect();
+    let sentences = head_training_sentences(&semcor, &glosses, held_out);
     for (n, s) in sentences.iter().enumerate() {
         if n % 2000 == 0 { eprintln!("  {n}/{} sentences, {} examples", sentences.len(), examples.len()) }
         let lower: Vec<String> = s.words.iter().map(|w| w.to_lowercase()).collect();
@@ -470,11 +484,31 @@ fn train_head(data: &Path, models: &Path, usage_name: &str, held_out: bool) -> R
             examples.push(sense_head::Example { vector, candidates, gold, context: vec![] });
         }
     }
-    eprintln!("{} training examples from {} sentences{}", examples.len(), sentences.len(), if held_out { " (even documents)" } else { "" });
+    eprintln!("{} training examples from {} sentences{}{}", examples.len(), sentences.len(), if held_out { " (SemCor even documents)" } else { "" }, if wngc { " + WordNet Gloss Corpus" } else { "" });
     let head = SenseHead::train(&examples, lex.categories.len(), &sense_head::TrainOptions::default(), Device::Cpu)?;
-    let out = dir.join("head");
+    let out = out.unwrap_or_else(|| dir.join("head"));
     head.save(&out)?;
     let bytes: u64 = ["senses.safetensors", "senses.json"].iter().filter_map(|f| std::fs::metadata(out.join(f)).ok()).map(|m| m.len()).sum();
     eprintln!("sense head → {} ({:.1} MB) in {:.1?}", out.display(), bytes as f64 / 1e6, t.elapsed());
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use scribe::semcor::TaggedSentence;
+
+    fn sentence(doc: &str) -> TaggedSentence {
+        TaggedSentence { document: doc.into(), words: vec!["w".into()], instances: vec![] }
+    }
+
+    #[test]
+    fn head_trains_on_all_of_semcor_plus_glosses_unless_held_out() {
+        let semcor = [sentence("d000"), sentence("d001"), sentence("d002")];
+        let glosses = [sentence("g1"), sentence("g2")];
+        assert_eq!(head_training_sentences(&semcor, &[], false).len(), 3);
+        assert_eq!(head_training_sentences(&semcor, &glosses, false).len(), 5);
+        let held: Vec<&str> = head_training_sentences(&semcor, &glosses, true).iter().map(|s| s.document.as_str()).collect();
+        assert_eq!(held, ["d000", "d002", "g1", "g2"], "odd SemCor documents stay out; glosses all go in");
+    }
 }

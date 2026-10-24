@@ -9,6 +9,7 @@
 pub mod bert;
 pub mod compose;
 pub mod conllu;
+pub mod edit_tagger;
 pub mod engine;
 pub mod ffi;
 pub mod frames;

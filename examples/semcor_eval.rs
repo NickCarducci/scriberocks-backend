@@ -179,9 +179,10 @@ fn main() {
     let (all_cases, _) = cases(&e, &keys, &every(&load("ALL", "Evaluation_Datasets/ALL"), eval_cap));
 
     // SHIPPED_HEAD=1: score only the saved head (models/<usage>/head, from
-    // `scribe train-head`) on ALL, as the engine uses it, and stop.
+    // `scribe train-head`, or HEAD_DIR) on ALL, as the engine uses it, and stop.
     if std::env::var("SHIPPED_HEAD").is_ok() {
-        let head = SenseHead::load(&Path::new("models").join(&usage).join("head"), scribe::usage::model::Device::Cpu).unwrap();
+        let dir = std::env::var("HEAD_DIR").map(std::path::PathBuf::from).unwrap_or_else(|_| Path::new("models").join(&usage).join("head"));
+        let head = SenseHead::load(&dir, scribe::usage::model::Device::Cpu).unwrap();
         sweep("ALL, shipped head", &all_cases, &head_scores(&all_cases, &head, None, &e.lexicon));
         let first = all_cases.iter().filter(|c| c.gold.contains(&c.senses[0])).count();
         println!("ALL, first-listed: {:.1}% (n={})", 100.0 * first as f64 / all_cases.len().max(1) as f64, all_cases.len());
