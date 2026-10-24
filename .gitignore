@@ -9,3 +9,5 @@
 /.swiftpm
 /target-cpu
 /models-wngc
+
+.env

@@ -72,7 +72,7 @@ if covered:
 # right; words seen fewer than 3 times share one id) through path D, with
 # role embeddings (capacity independent of vocabulary) and the op one-hot.
 cols = ["op", "removed", "inserted", "left", "right"]
-seen = collections.Counter(r[c] for r in source[:5000] for c in cols)
+seen = collections.Counter(r[c] for r in source for c in cols)  # all 20,000: some ids are unseen by the 5,000 fitted
 ids = {"<rare>": 0}
 for w, c in seen.most_common():
     if c >= 3: ids.setdefault(w, len(ids))

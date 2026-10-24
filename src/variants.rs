@@ -181,12 +181,23 @@ impl Engine {
             }
         }
 
-        let mut picked = diversify(out, limit);
-        // Generate (ScribeIE, opt-in): an enhanced version rides alongside each
-        // proposal; ScribeSLM's text and order stay as they are.
-        if let (true, Some(enhancer)) = (options.generate, self.enhancer.as_ref()) {
+        // Generate (ScribeIE, opt-in): ScribeIE ranks ScribeSLM's proposals
+        // (blue) by how editor-like each edit is, and suggestions follow that
+        // rank; then it writes an enhanced version (red) of each, kept only
+        // where the style's judge finds the edited words no less likely.
+        let enhancer = if options.generate { self.enhancer_for(options) } else { None };
+        let ranked: Option<Vec<f64>> = enhancer.and_then(|e| {
+            let r: Vec<Option<f32>> = out.iter().map(|v| e.rank(&original_text, &v.text)).collect();
+            r.iter().any(Option::is_some).then(|| rank_keys(&r))
+        });
+        let keys: Vec<f64> = ranked.unwrap_or_else(|| out.iter().map(|v| v.fluency_delta).collect());
+        let mut picked = diversify(out, &keys, limit);
+        if let Some(enhancer) = enhancer {
             for v in &mut picked {
                 if let Some(e) = enhancer.enhance(&original_text, &v.text).filter(|e| *e != v.text) {
+                    if judge.is_some_and(|j| judged_gain(j, &v.text, &e).is_some_and(|g| g < 0.0)) {
+                        continue; // the judge finds ScribeIE's words less likely here
+                    }
                     v.enhanced_changed = crate::scribe_ie::added_words(&v.text, &e);
                     v.enhanced = Some(e);
                 }
@@ -677,7 +688,55 @@ fn changed_ranges(old: &[String], new: &[String], offsets: &[(usize, usize)]) ->
 
 /// Default ordering: best fluency first, then each next pick trades fluency
 /// against similarity to what's already been picked. (Product-tunable.)
-fn diversify(mut pool: Vec<Variant>, limit: usize) -> Vec<Variant> {
+/// Ranks as diversify keys on fluency's scale: best 2.0 down to 0 (proposals
+/// without a rank go last).
+fn rank_keys(ranks: &[Option<f32>]) -> Vec<f64> {
+    let mut order: Vec<usize> = (0..ranks.len()).collect();
+    order.sort_by(|&a, &b| ranks[b].unwrap_or(f32::NEG_INFINITY).total_cmp(&ranks[a].unwrap_or(f32::NEG_INFINITY)));
+    let mut keys = vec![0.0; ranks.len()];
+    for (pos, &i) in order.iter().enumerate() {
+        keys[i] = 2.0 * (1.0 - pos as f64 / ranks.len().max(1) as f64);
+    }
+    keys
+}
+
+/// How much more likely the judge finds `enhanced` than `proposal` around
+/// the words that differ: the mean log-probability of each word (each scored
+/// in place) within two words of a change, enhanced minus proposal.
+fn judged_gain(judge: &dyn crate::engine::SlotScorer, proposal: &str, enhanced: &str) -> Option<f32> {
+    let lower = |s: &str| -> Vec<String> { crate::text::tokenize(s).into_iter().map(|w| w.to_lowercase()).collect() };
+    let (p, e) = (lower(proposal), lower(enhanced));
+    let (keep, inserts) = crate::edit_tagger::align(&p, &e);
+    // Changed positions: deleted words in the proposal; inserted words in the enhanced text.
+    let mut in_p: Vec<usize> = keep.iter().enumerate().filter(|(_, k)| !**k).map(|(i, _)| i).collect();
+    let mut in_e = Vec::new();
+    let mut at = 0;
+    for (g, ins) in inserts.iter().enumerate() {
+        if !ins.is_empty() && in_p.is_empty() { in_p.push(g.min(p.len().saturating_sub(1))) }
+        in_e.extend(at..at + ins.len());
+        at += ins.len() + usize::from(g < keep.len() && keep[g]);
+    }
+    if in_e.is_empty() {
+        // Pure deletion: the words now beside the gap.
+        let first = in_p.first().copied().unwrap_or(0);
+        let kept_before = keep[..first].iter().filter(|&&k| k).count();
+        in_e.push(kept_before.min(e.len().saturating_sub(1)));
+    }
+    let window = |idx: &[usize], n: usize| -> Vec<usize> {
+        let mut w: Vec<usize> = idx.iter().flat_map(|&i| i.saturating_sub(2)..(i + 3).min(n)).collect();
+        w.sort_unstable();
+        w.dedup();
+        w
+    };
+    let mean = |words: &[String], idx: &[usize]| -> Option<f32> {
+        let s: Option<Vec<f32>> = idx.iter().map(|&i| judge.slot_scores(words, i, std::slice::from_ref(&words[i])).map(|v| v[0].max(-20.0))).collect();
+        let s = s?;
+        (!s.is_empty()).then(|| s.iter().sum::<f32>() / s.len() as f32)
+    };
+    Some(mean(&e, &window(&in_e, e.len()))? - mean(&p, &window(&in_p, p.len()))?)
+}
+
+fn diversify(mut pool: Vec<Variant>, keys: &[f64], limit: usize) -> Vec<Variant> {
     let words = |v: &Variant| -> HashSet<String> { v.text.to_lowercase().split_whitespace().map(String::from).collect() };
     let sets: Vec<HashSet<String>> = pool.iter().map(words).collect();
     let mut order: Vec<usize> = Vec::new();
@@ -689,7 +748,7 @@ fn diversify(mut pool: Vec<Variant>, limit: usize) -> Vec<Variant> {
             .max_by(|&a, &b| {
                 let score = |x: usize| {
                     let sim = order.iter().map(|&o| jaccard(&sets[x], &sets[o])).fold(0.0, f64::max);
-                    pool[x].fluency_delta - 1.5 * sim
+                    keys[x] - 1.5 * sim
                 };
                 score(a).total_cmp(&score(b))
             })

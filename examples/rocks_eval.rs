@@ -34,6 +34,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         e.judge = Some(Box::new(scribe::bert::Bert::load(Path::new(&judge), scribe::usage::model::Device::Cpu)?));
         println!("judge: {judge}");
     }
+    // STYLE=casual|publishable judges with that style's model; GENERATE=1 turns
+    // ScribeIE on (its ranks order the suggestions).
+    let options = scribe::scribe_ie::EditOptions {
+        style: std::env::var("STYLE").ok().and_then(|s| scribe::engine::ProseStyle::from_name(&s)),
+        generate: std::env::var_os("GENERATE").is_some(),
+        ..Default::default()
+    };
     let (mut offered, mut wanted, mut forbidden, mut banned) = (0, 0, 0, 0);
     let file = std::env::var("ROCKS").unwrap_or_else(|_| "tests/rocks.tsv".into());
     let lemmas = |t: &str| -> std::collections::HashSet<String> {
@@ -43,7 +50,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let cols: Vec<&str> = line.split('\t').collect();
         let rock = cols[0];
         let list = |i: usize| -> Vec<&str> { cols.get(i).map(|c| c.split('|').filter(|x| !x.is_empty()).collect()).unwrap_or_default() };
-        let texts: Vec<String> = e.variants(rock, limit).into_iter().map(|v| v.text.to_lowercase()).collect();
+        let texts: Vec<String> = e.variants_with(rock, limit, &options).into_iter().map(|v| v.text.to_lowercase()).collect();
         let rock_lemmas = lemmas(rock);
         let added: Vec<std::collections::HashSet<String>> = texts.iter().map(|t| lemmas(t).difference(&rock_lemmas).cloned().collect()).collect();
         let has = |x: &str| match x.strip_prefix("w:") {

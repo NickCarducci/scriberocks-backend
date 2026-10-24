@@ -90,3 +90,24 @@ judge likelihood change 0.865; trigram fluency 0.779; counts 0.518; FidelityAI
 local fits 0.502 (cascade fallback, path B) and 0.491 (role embeddings on edit
 tuples, 52 qubits). The judge ranks ScribeIE's edits for now; no paid
 FidelityAI run.
+
+## Shipped: Generate for casual (October 24, 2026, v0.1.6)
+
+- **Blue ranking.** With Generate on, ScribeIE ranks ScribeSLM's proposals by
+  the mean log-probability of each edit decision under its tagger, and
+  suggestions follow that rank (`Enhancer::rank`, `variants::rank_keys`). On
+  the human-judged casual rocks, top 5 per rock: wanted swaps shown 28 → 47
+  (first 150 rocks) and 18 → 26 (164 new rocks); forbidden 4 → 11 and 8 → 9.
+- **Red gate.** A ScribeIE version is kept only if the style's judge finds
+  the words around each change no less likely (`variants::judged_gain`).
+- **Protected words.** ScribeIE never deletes negations (including "didnt"),
+  numbers or names (`edit_tagger::protected`): the judge alone let "we didnt
+  decide anything" → "we decide anything" through, as the misspelling made
+  the deletion look likely.
+- **Size.** 22 MB: its own 8-bit encoder (18 MB) and the tagger's heads (3.6 MB).
+
+FidelityAI on whole rocks (one document per rock, the text after editing,
+path B; `scripts/fidelity_rock_docs.py`): on 724 held-out edits, the after
+version scored more typical than the before version 0.497 of the time. 72% of
+edits leave the grammar frames identical (the scores tie); where the frames
+differ, 0.490.

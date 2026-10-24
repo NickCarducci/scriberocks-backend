@@ -8,9 +8,10 @@
 //!
 //!   cargo run --release --example scribe_ie_train [style = publishable] [phrases = 500] [epochs = 4] [hidden = 0]
 //!   REWORDS=1 trains (and picks the threshold) on rewording edits only: no
-//!   name or number changed (`edit_tagger::rewords`). OUT names the model folder.
+//!   name or number changed (`edit_tagger::rewords`); WRITES=1 on edits that insert
+//!   or replace a word (`edit_tagger::writes`). OUT names the model folder.
 use scribe::bert::Bert;
-use scribe::edit_tagger::{align, apply, rewords, sari, EditTagger, Example};
+use scribe::edit_tagger::{align, apply, rewords, sari, writes, EditTagger, Example};
 use scribe::text::tokenize;
 use std::collections::HashMap;
 use std::path::Path;
@@ -43,7 +44,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let epochs: usize = std::env::args().nth(3).and_then(|v| v.parse().ok()).unwrap_or(4);
     let hidden: usize = std::env::args().nth(4).and_then(|v| v.parse().ok()).unwrap_or(0);
     let only_rewords = std::env::var_os("REWORDS").is_some();
-    let reworded = |v: Vec<Pair>| -> Vec<Pair> { if only_rewords { v.into_iter().filter(|p| rewords(&p.before, &p.after)).collect() } else { v } };
+    // WRITES=1: also only edits that insert or replace a word (no pure deletions).
+    let only_writes = std::env::var_os("WRITES").is_some();
+    let reworded = |v: Vec<Pair>| -> Vec<Pair> {
+        v.into_iter().filter(|p| (!only_rewords || rewords(&p.before, &p.after)) && (!only_writes || writes(&p.before, &p.after))).collect()
+    };
     let base = "data/iterater/IteraTeR";
     let bert = Bert::load(&Path::new("models/judges").join(&style), scribe::usage::model::Device::Cpu)?;
 

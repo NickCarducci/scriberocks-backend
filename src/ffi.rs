@@ -82,9 +82,14 @@ impl ScribeEngine {
         self.generate.store(enabled, std::sync::atomic::Ordering::Relaxed);
     }
 
-    /// Whether a ScribeIE model is loaded (the toggle does nothing without one).
+    /// Whether any ScribeIE model is loaded (the toggle does nothing without one).
     pub fn generate_available(&self) -> bool {
-        self.engine.enhancer.is_some()
+        self.engine.enhancer.is_some() || !self.engine.style_enhancers.is_empty()
+    }
+
+    /// Prose styles with their own ScribeIE ("casual"): Generate works in these.
+    pub fn generate_styles(&self) -> Vec<String> {
+        self.engine.generate_styles().into_iter().map(|s| s.name().to_string()).collect()
     }
 
     /// Sets the writer's prose style ("casual" or "publishable"); "" clears it.

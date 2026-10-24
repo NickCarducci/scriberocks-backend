@@ -593,9 +593,14 @@ public protocol ScribeEngineProtocol: AnyObject, Sendable {
     func frames(rock: String)  -> [RockFrame]
     
     /**
-     * Whether a ScribeIE model is loaded (the toggle does nothing without one).
+     * Whether any ScribeIE model is loaded (the toggle does nothing without one).
      */
     func generateAvailable()  -> Bool
+    
+    /**
+     * Prose styles with their own ScribeIE ("casual"): Generate works in these.
+     */
+    func generateStyles()  -> [String]
     
     /**
      * The Generate toggle: ScribeIE enhances every proposal. Off by default.
@@ -706,12 +711,24 @@ open func frames(rock: String) -> [RockFrame]  {
 }
     
     /**
-     * Whether a ScribeIE model is loaded (the toggle does nothing without one).
+     * Whether any ScribeIE model is loaded (the toggle does nothing without one).
      */
 open func generateAvailable() -> Bool  {
     return try!  FfiConverterBool.lift(try! rustCall() {
         uniffiCallStatus in
     uniffi_scribe_fn_method_scribeengine_generate_available(
+            self.uniffiCloneHandle(),uniffiCallStatus
+    )
+})
+}
+    
+    /**
+     * Prose styles with their own ScribeIE ("casual"): Generate works in these.
+     */
+open func generateStyles() -> [String]  {
+    return try!  FfiConverterSequenceString.lift(try! rustCall() {
+        uniffiCallStatus in
+    uniffi_scribe_fn_method_scribeengine_generate_styles(
             self.uniffiCloneHandle(),uniffiCallStatus
     )
 })
@@ -1272,7 +1289,10 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scribe_checksum_method_scribeengine_frames() != 13055) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scribe_checksum_method_scribeengine_generate_available() != 39986) {
+    if (uniffi_scribe_checksum_method_scribeengine_generate_available() != 34286) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scribe_checksum_method_scribeengine_generate_styles() != 51801) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scribe_checksum_method_scribeengine_set_generate() != 42950) {

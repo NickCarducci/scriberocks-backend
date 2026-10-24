@@ -97,6 +97,9 @@ pub struct Engine {
     /// ScribeIE's enhancer, if one is loaded (used only when a request turns
     /// Generate on; see scribe_ie.rs).
     pub enhancer: Option<Box<dyn crate::scribe_ie::Enhancer>>,
+    /// ScribeIE per prose style (`<models>/scribe-ie/<style>/`); used for that
+    /// style's requests, in place of `enhancer`.
+    pub style_enhancers: Vec<(ProseStyle, Box<dyn crate::scribe_ie::Enhancer>)>,
     /// Replaces the usage model as the judge of swaps when set (e.g. a
     /// BERT-format model, to compare judges on the same rocks).
     pub judge: Option<Box<dyn SlotScorer + Send + Sync>>,
@@ -233,6 +236,15 @@ impl Engine {
                 false => None,
             },
             enhancer: None,
+            style_enhancers: ProseStyle::ALL
+                .into_iter()
+                .filter_map(|st| {
+                    let d = dir.join("scribe-ie").join(st.name());
+                    d.join("encoder/config.json").exists().then(|| {
+                        crate::edit_tagger::TaggerEnhancer::load(&d).map(|e| (st, Box::new(e) as Box<dyn crate::scribe_ie::Enhancer>))
+                    })
+                })
+                .collect::<Result<_, _>>()?,
             judge: None,
             compose: None,
             swap_confidence: None,
@@ -259,6 +271,19 @@ impl Engine {
     /// The styles whose judges are loaded (what the app may offer).
     pub fn available_styles(&self) -> Vec<ProseStyle> {
         self.style_judges.iter().map(|(s, _)| *s).collect()
+    }
+
+    /// ScribeIE for a request: its style's if loaded, else the general one.
+    pub fn enhancer_for(&self, options: &crate::scribe_ie::EditOptions) -> Option<&dyn crate::scribe_ie::Enhancer> {
+        match options.style.and_then(|st| self.style_enhancers.iter().find(|(s, _)| *s == st)) {
+            Some((_, e)) => Some(e.as_ref()),
+            None => self.enhancer.as_deref(),
+        }
+    }
+
+    /// The styles with their own ScribeIE (Generate is offered for these).
+    pub fn generate_styles(&self) -> Vec<ProseStyle> {
+        self.style_enhancers.iter().map(|(s, _)| *s).collect()
     }
 
     /// The judge for a request: its style's model if loaded, else the default.

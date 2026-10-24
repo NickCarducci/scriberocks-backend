@@ -15,6 +15,12 @@ for st in casual publishable; do
   mkdir -p "$OUT/judges/$st"
   for f in config.json vocab.txt model.q8.safetensors; do cp "models/judges/$st/$f" "$OUT/judges/$st/"; done
 done
+# ScribeIE (Generate) per style: its own 8-bit encoder and the edit tagger's heads.
+for st in casual; do
+  mkdir -p "$OUT/scribe-ie/$st/encoder"
+  for f in config.json vocab.txt model.q8.safetensors; do cp "models/scribe-ie/$st-q8/encoder/$f" "$OUT/scribe-ie/$st/encoder/"; done
+  for f in tagger.json tagger.safetensors confidence.txt; do cp "models/scribe-ie/$st-q8/$f" "$OUT/scribe-ie/$st/"; done
+done
 cat > "$OUT/ATTRIBUTION.txt" <<'TXT'
 Scriberocks language models — built from:
 - Open English WordNet (CC BY 4.0; derived from Princeton WordNet, WordNet License) — https://en-word.net
@@ -22,6 +28,7 @@ Scriberocks language models — built from:
 - UD English EWT (CC BY-SA 4.0) — https://universaldependencies.org/treebanks/en_ewt/
 - Tatoeba sentences (CC BY 2.0 FR) — https://tatoeba.org (style judges)
 - Simple English Wikipedia (CC BY-SA 4.0) — https://simple.wikipedia.org (style judges)
+- Simple English Wikipedia revision history (CC BY-SA 4.0) — https://simple.wikipedia.org (ScribeIE: editors' sentence edits)
 - Open American National Corpus, written portion (public, no restrictions) — https://anc.org (publishable judge)
 - Princeton WordNet Gloss Corpus (WordNet License) — https://wordnetcode.princeton.edu/glosstag.shtml (style judges)
 - SemCor 3.0 (sense head, style judges), via the WSD Evaluation Framework (Raganato et al., 2017) — WordNet License:

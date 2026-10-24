@@ -292,18 +292,44 @@ impl EditTagger {
     /// delete head is at least `confidence` sure, and a phrase inserted when
     /// the insert head gives it at least `confidence`.
     pub fn tag(&self, vectors: &[Vec<f32>], confidence: f32) -> candle_core::Result<(Vec<bool>, Vec<Vec<String>>)> {
-        let n = vectors.len();
-        let rows: Vec<f32> = (0..=n).flat_map(|i| features(vectors, i, self.dim)).collect();
-        let x = Tensor::from_vec(rows, (n + 1, 3 * self.dim), &Device::Cpu)?;
-        let x = match &self.hidden { Some((w, b)) => x.matmul(w)?.broadcast_add(b)?.gelu_erf()?, None => x };
-        let pd = candle_nn::ops::softmax(&x.narrow(0, 0, n)?.matmul(&self.del_w)?.broadcast_add(&self.del_b)?, D::Minus1)?.to_vec2::<f32>()?;
-        let pi = candle_nn::ops::softmax(&x.matmul(&self.ins_w)?.broadcast_add(&self.ins_b)?, D::Minus1)?.to_vec2::<f32>()?;
+        let (pd, pi) = self.probabilities(vectors)?;
         let keep = pd.iter().map(|p| p[1] < confidence).collect();
         let inserts = pi.iter().map(|p| {
             let (best, &pb) = p.iter().enumerate().skip(1).max_by(|a, b| a.1.total_cmp(b.1)).unwrap();
             if pb >= confidence { self.phrases[best - 1].split(' ').map(String::from).collect() } else { vec![] }
         }).collect();
         Ok((keep, inserts))
+    }
+
+    /// Per word [keep, delete] and per gap [nothing, phrase 1, ...] probabilities.
+    pub fn probabilities(&self, vectors: &[Vec<f32>]) -> candle_core::Result<(Vec<Vec<f32>>, Vec<Vec<f32>>)> {
+        let n = vectors.len();
+        let rows: Vec<f32> = (0..=n).flat_map(|i| features(vectors, i, self.dim)).collect();
+        let x = Tensor::from_vec(rows, (n + 1, 3 * self.dim), &Device::Cpu)?;
+        let x = match &self.hidden { Some((w, b)) => x.matmul(w)?.broadcast_add(b)?.gelu_erf()?, None => x };
+        let pd = candle_nn::ops::softmax(&x.narrow(0, 0, n)?.matmul(&self.del_w)?.broadcast_add(&self.del_b)?, D::Minus1)?.to_vec2::<f32>()?;
+        let pi = candle_nn::ops::softmax(&x.matmul(&self.ins_w)?.broadcast_add(&self.ins_b)?, D::Minus1)?.to_vec2::<f32>()?;
+        Ok((pd, pi))
+    }
+
+    /// How editor-like turning `before` into `after` is: the mean log
+    /// probability of each keep/delete and insert decision the edit makes.
+    /// An insertion outside the phrase list counts as "some insertion" there.
+    pub fn edit_log_likelihood(&self, vectors: &[Vec<f32>], before: &[String], after: &[String]) -> candle_core::Result<f32> {
+        let (pd, pi) = self.probabilities(vectors)?;
+        let (keep, inserts) = align(before, after);
+        let index: HashMap<&str, usize> = self.phrases.iter().enumerate().map(|(i, p)| (p.as_str(), i + 1)).collect();
+        let ln = |p: f32| p.max(1e-6).ln();
+        let mut total = 0.0;
+        for (w, &k) in keep.iter().enumerate() { total += ln(pd[w][usize::from(!k)]) }
+        for (g, ins) in inserts.iter().enumerate() {
+            total += match (ins.is_empty(), index.get(ins.join(" ").as_str())) {
+                (true, _) => ln(pi[g][0]),
+                (false, Some(&i)) => ln(pi[g][i]),
+                (false, None) => ln(1.0 - pi[g][0]),
+            };
+        }
+        Ok(total / (keep.len() + inserts.len()) as f32)
     }
 
     pub fn save(&self, dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
@@ -332,11 +358,42 @@ impl EditTagger {
     }
 }
 
-/// ScribeIE as the engine's Enhancer: a style's judge supplies the word vectors.
+/// Words ScribeIE may never delete: negations (including "didnt"-style
+/// spellings), numbers, and names (capitalized past the first word).
+pub fn protected(i: usize, word: &str) -> bool {
+    let w = word.to_lowercase();
+    const NEGATIONS: [&str; 14] = ["not", "n't", "no", "never", "nor", "none", "nothing", "nobody", "neither", "nowhere", "cannot", "without", "hardly", "barely"];
+    NEGATIONS.contains(&w.as_str())
+        || (w.len() > 3 && w.ends_with("nt") && ["dont", "didnt", "doesnt", "cant", "wont", "isnt", "wasnt", "arent", "werent", "havent", "hasnt", "hadnt", "couldnt", "shouldnt", "wouldnt", "aint"].contains(&w.as_str()))
+        || word.chars().any(|c| c.is_ascii_digit())
+        || (i > 0 && word.chars().next().is_some_and(char::is_uppercase))
+}
+
+/// ScribeIE as the engine's Enhancer: its own encoder supplies the word vectors.
 pub struct TaggerEnhancer {
     pub encoder: Bert,
     pub tagger: EditTagger,
     pub confidence: f32,
+}
+
+impl TaggerEnhancer {
+    /// From a folder with `encoder/` (BERT-format, full or 8-bit), the
+    /// tagger's heads, and `confidence.txt` (default 0.5).
+    pub fn load(dir: &Path) -> Result<TaggerEnhancer, Box<dyn std::error::Error>> {
+        Ok(TaggerEnhancer {
+            encoder: Bert::load(&dir.join("encoder"), Device::Cpu)?,
+            tagger: EditTagger::load(dir)?,
+            confidence: std::fs::read_to_string(dir.join("confidence.txt")).ok().and_then(|c| c.trim().parse().ok()).unwrap_or(0.5),
+        })
+    }
+
+    /// ScribeIE's rank for a proposal: how editor-like its edit of `original` is.
+    pub fn rank(&self, original: &str, proposal: &str) -> Option<f32> {
+        let (before, after) = (crate::text::tokenize(original), crate::text::tokenize(proposal));
+        let vectors = self.encoder.contextual_batch(std::slice::from_ref(&before)).ok()?.into_iter().next()?;
+        if vectors.len() != before.len() { return None }
+        self.tagger.edit_log_likelihood(&vectors, &before, &after).ok()
+    }
 }
 
 impl crate::scribe_ie::Enhancer for TaggerEnhancer {
@@ -345,9 +402,17 @@ impl crate::scribe_ie::Enhancer for TaggerEnhancer {
         if words.is_empty() { return None }
         let vectors = self.encoder.contextual_batch(std::slice::from_ref(&words)).ok()?.into_iter().next()?;
         if vectors.len() != words.len() { return None }
-        let (keep, inserts) = self.tagger.tag(&vectors, self.confidence).ok()?;
+        let (mut keep, inserts) = self.tagger.tag(&vectors, self.confidence).ok()?;
+        // Never delete meaning: negations, numbers, names (as in its training data).
+        for (i, w) in words.iter().enumerate() {
+            if protected(i, w) { keep[i] = true }
+        }
         let out = apply(&words, &keep, &inserts);
         (out != words).then(|| crate::text::detokenize(&out))
+    }
+
+    fn rank(&self, rock: &str, proposal: &str) -> Option<f32> {
+        TaggerEnhancer::rank(self, rock, proposal)
     }
 }
 
@@ -400,6 +465,27 @@ mod tests {
         let (keep, ins) = tagger.tag(&v, 0.5).unwrap();
         assert_eq!(apply(&bad, &keep, &ins), bad, "no insertion where none belongs");
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn the_edit_the_tagger_would_make_ranks_above_others() {
+        let ex = |very_at: usize| {
+            let vectors: Vec<Vec<f32>> = (0..4).map(|i| if i == very_at { vec![1.0, 0.0] } else { vec![0.0, 1.0] }).collect();
+            Example { keep: (0..4).map(|i| i != very_at).collect(), inserts: vec![0; 5], vectors }
+        };
+        let data: Vec<Example> = (0..40).map(|i| ex(i % 4)).collect();
+        let tagger = EditTagger::train(&data, vec!["really".into()], 2, 0, 60, 0.05, 7).unwrap();
+        let before = t("a very b c");
+        let likely = tagger.edit_log_likelihood(&data[1].vectors, &before, &t("a b c")).unwrap();
+        let unlikely = tagger.edit_log_likelihood(&data[1].vectors, &before, &t("very b c")).unwrap();
+        let unchanged = tagger.edit_log_likelihood(&data[1].vectors, &before, &before).unwrap();
+        assert!(likely > unchanged && unchanged > unlikely, "{likely} > {unchanged} > {unlikely}");
+    }
+
+    #[test]
+    fn negations_numbers_and_names_are_protected() {
+        for (i, w) in [(3, "didnt"), (2, "not"), (1, "n't"), (4, "1986"), (5, "Romania")] { assert!(protected(i, w), "{w}") }
+        for (i, w) in [(0, "The"), (2, "meeting"), (3, "interest")] { assert!(!protected(i, w), "{w}") }
     }
 
     #[test]

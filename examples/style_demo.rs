@@ -3,7 +3,8 @@
 //!
 //!   echo "your rock" | cargo run --release --example style_demo [limit]
 //! Env: VARIETY=0..1 (the app's slider), STYLE=casual|publishable (just that one),
-//! COMPOSE=<pairs.bin> with GATE_TYPICAL / GATE_OUTCOMPETED (the pairing gate).
+//! COMPOSE=<pairs.bin> with GATE_TYPICAL / GATE_OUTCOMPETED (the pairing gate),
+//! GENERATE=1 (ScribeIE: ranks the suggestions and writes red versions).
 use scribe::engine::ProseStyle;
 use scribe::scribe_ie::EditOptions;
 use scribe::Engine;
@@ -30,8 +31,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     for style in styles {
         println!("== {}", style.map_or("default judge (live usage model)", |s| s.name()));
-        for v in e.variants_with(rock.trim(), limit, &EditOptions { style, variety, ..Default::default() }) {
+        for v in e.variants_with(rock.trim(), limit, &EditOptions { style, variety, generate: std::env::var_os("GENERATE").is_some() }) {
             println!("   {:<16} {}", v.ops.iter().map(|o| format!("{o:?}").to_lowercase()).collect::<Vec<_>>().join("+"), v.text);
+            if let Some(e) = &v.enhanced { println!("   {:<16} {}", "  ScribeIE →", e) }
         }
     }
     Ok(())

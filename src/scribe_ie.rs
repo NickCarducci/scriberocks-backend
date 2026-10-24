@@ -11,6 +11,12 @@
 /// ScribeIE's rewrite of one proposal of `rock`; None leaves it as is.
 pub trait Enhancer: Send + Sync {
     fn enhance(&self, rock: &str, proposal: &str) -> Option<String>;
+
+    /// ScribeIE's rank for one of ScribeSLM's proposals: how editor-like its
+    /// edit of `rock` is (higher = more). None = no opinion.
+    fn rank(&self, _rock: &str, _proposal: &str) -> Option<f32> {
+        None
+    }
 }
 
 /// Options for one request for suggestions. Default: Generate off, no style.

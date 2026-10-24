@@ -140,14 +140,31 @@ impl scribe::scribe_ie::Enhancer for Celebrate {
     }
 }
 
+/// A judge that scores every word the same: ScribeIE's words never lose.
+struct Indifferent;
+impl scribe::engine::SlotScorer for Indifferent {
+    fn slot_scores(&self, _: &[String], _: usize, candidates: &[String]) -> Option<Vec<f32>> {
+        Some(vec![-1.0; candidates.len()])
+    }
+}
+
+/// A judge that finds "celebration" unlikely anywhere.
+struct NoCelebrations;
+impl scribe::engine::SlotScorer for NoCelebrations {
+    fn slot_scores(&self, _: &[String], _: usize, candidates: &[String]) -> Option<Vec<f32>> {
+        Some(candidates.iter().map(|c| if c == "celebration" { -15.0 } else { -1.0 }).collect())
+    }
+}
+
 #[test]
 fn generate_enhances_every_proposal_without_reordering_them() {
     let Some(mut engine) = engine() else { return };
     let rock = "I want to come to the party but I have to work late.";
+    engine.judge = Some(Box::new(Indifferent));
     let base: Vec<String> = engine.variants(rock, 10).into_iter().map(|v| v.text).collect();
     engine.enhancer = Some(Box::new(Celebrate));
     let got = engine.variants_with(rock, 10, &scribe::scribe_ie::EditOptions { generate: true, ..Default::default() });
-    assert_eq!(got.iter().map(|v| v.text.clone()).collect::<Vec<_>>(), base, "ScribeSLM's proposals and order untouched");
+    assert_eq!(got.iter().map(|v| v.text.clone()).collect::<Vec<_>>(), base, "without ScribeIE ranks, ScribeSLM's order stays");
     for v in &got {
         match &v.enhanced {
             Some(e) => {
@@ -159,6 +176,39 @@ fn generate_enhances_every_proposal_without_reordering_them() {
         }
     }
     assert!(engine.variants(rock, 10).iter().all(|v| v.enhanced.is_none()), "still off by default");
+}
+
+#[test]
+fn the_judge_rejects_red_edits_it_finds_less_likely() {
+    let Some(mut engine) = engine() else { return };
+    let rock = "I want to come to the party but I have to work late.";
+    engine.judge = Some(Box::new(NoCelebrations));
+    engine.enhancer = Some(Box::new(Celebrate));
+    let got = engine.variants_with(rock, 10, &scribe::scribe_ie::EditOptions { generate: true, ..Default::default() });
+    assert!(got.iter().any(|v| v.text.contains("party")), "there were proposals to enhance");
+    assert!(got.iter().all(|v| v.enhanced.is_none()), "every red edit made the words less likely");
+}
+
+/// ScribeIE that prefers proposals with "because" (and writes nothing).
+struct PrefersBecause;
+impl scribe::scribe_ie::Enhancer for PrefersBecause {
+    fn enhance(&self, _: &str, _: &str) -> Option<String> {
+        None
+    }
+    fn rank(&self, _: &str, proposal: &str) -> Option<f32> {
+        Some(if proposal.contains("because") { 1.0 } else { 0.0 })
+    }
+}
+
+#[test]
+fn scribe_ie_ranks_order_the_blue_suggestions() {
+    let Some(mut engine) = engine() else { return };
+    let rock = "I want to come to the party but I have to work late.";
+    engine.enhancer = Some(Box::new(PrefersBecause));
+    let got = engine.variants_with(rock, 10, &scribe::scribe_ie::EditOptions { generate: true, ..Default::default() });
+    let first_other = got.iter().position(|v| !v.text.contains("because")).unwrap_or(got.len());
+    assert!(got.iter().any(|v| v.text.contains("because")), "a 'because' proposal exists");
+    assert!(got[..first_other].iter().all(|v| v.text.contains("because")) && first_other > 0, "ranked proposals lead");
 }
 
 /// Rejects every candidate but the original word.
