@@ -295,6 +295,9 @@ impl Engine {
                 continue;
             }
             let Some(sense) = t.sense.filter(|_| t.sense_supported) else { continue };
+            if let Some((c, gate)) = &self.compose {
+                if c.blocks(&self.lexicon, s, i, sense, *gate) { continue }
+            }
             let synset = &self.lexicon.synsets[sense as usize];
             // Adjectives: also the dictionary's cluster of similar adjectives.
             let similar = if t.upos == "ADJ" { synset.similar.as_slice() } else { &[] };

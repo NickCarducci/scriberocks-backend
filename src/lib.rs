@@ -7,6 +7,7 @@
 //! with `inflect` and a dictionary-trained fluency model (`lm`).
 
 pub mod bert;
+pub mod compose;
 pub mod conllu;
 pub mod engine;
 pub mod ffi;

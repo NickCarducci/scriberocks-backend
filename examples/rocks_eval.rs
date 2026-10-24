@@ -18,6 +18,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // SWAP_MARGIN / CLOSENESS override the swap filter's cut-off and closeness weight.
     if let Some(m) = std::env::var("SWAP_MARGIN").ok().and_then(|v| v.parse().ok()) { e.swap_margin = m }
     if let Some(w) = std::env::var("CLOSENESS").ok().and_then(|v| v.parse().ok()) { e.closeness_weight = w }
+    // COMPOSE=<pairs.bin> turns on the pairing gate (src/compose.rs); GATE_MIN,
+    // GATE_TYPICAL and GATE_OUTCOMPETED set it.
+    if let Ok(path) = std::env::var("COMPOSE") {
+        let f = |k: &str| std::env::var(k).ok().and_then(|v| v.parse::<f32>().ok());
+        let mut gate = scribe::compose::Gate::default();
+        if let Some(v) = f("GATE_MIN") { gate.min_seen = v as usize }
+        if let Some(v) = f("GATE_TYPICAL") { gate.typical = v }
+        if let Some(v) = f("GATE_OUTCOMPETED") { gate.outcompeted = v }
+        e.compose = Some((scribe::compose::Compose::load(Path::new(&path))?, gate));
+    }
     if let Ok(judge) = std::env::var("JUDGE_DIR") {
         e.judge = Some(Box::new(scribe::bert::Bert::load(Path::new(&judge), scribe::usage::model::Device::Cpu)?));
         println!("judge: {judge}");

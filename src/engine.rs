@@ -97,6 +97,9 @@ pub struct Engine {
     pub judge: Option<Box<dyn SlotScorer + Send + Sync>>,
     /// One judge per prose style the writer can choose (see `ProseStyle`).
     pub style_judges: Vec<(ProseStyle, Box<dyn SlotScorer + Send + Sync>)>,
+    /// Optional pairing gate (`compose`): holds back swaps for a word whose
+    /// picked meaning doesn't fit the words it's attached to. Off unless set.
+    pub compose: Option<(crate::compose::Compose, crate::compose::Gate)>,
 }
 
 pub const CONTENT: &[&str] = &["NOUN", "VERB", "ADJ", "ADV"];
@@ -223,6 +226,7 @@ impl Engine {
             },
             enhancer: None,
             judge: None,
+            compose: None,
             style_judges: ProseStyle::ALL
                 .into_iter()
                 .filter_map(|st| {
