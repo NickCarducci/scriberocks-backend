@@ -52,9 +52,28 @@ pub fn prepare(engine: &mut Engine) {
 pub fn grammar_frames(engine: &Engine, input: &str) -> Vec<GrammarFrame> {
     let mut frames = Vec::new();
     for sentence in text::sentences(input) {
-        let words = text::tokenize(&sentence);
+        frames.extend(sentence_frames(engine, &text::tokenize(&sentence)).into_iter().map(|(f, _)| f));
+    }
+    frames
+}
+
+/// The word (index into the sentence's tokens) filling each slot of a frame:
+/// the head of the subject, object and target phrases, and the action's verb
+/// (the copula for "be").
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct SlotWords {
+    pub subject: Option<usize>,
+    pub action: Option<usize>,
+    pub object: Option<usize>,
+    pub target: Option<usize>,
+}
+
+/// Frames for one tokenized sentence, each with the words filling its slots.
+pub fn sentence_frames(engine: &Engine, words: &[String]) -> Vec<(GrammarFrame, SlotWords)> {
+    let mut frames = Vec::new();
+    {
         if words.is_empty() {
-            continue;
+            return frames;
         }
         let refs: Vec<&str> = words.iter().map(String::as_str).collect();
         let tags = engine.upos.tag(&refs, Some(&engine.lexicon));
@@ -75,7 +94,7 @@ pub fn grammar_frames(engine: &Engine, input: &str) -> Vec<GrammarFrame> {
             parts.join(" ")
         };
         let has_kid = |j: usize, rel: &str, set: &[&str]| kids(j).into_iter().any(|c| base(c) == rel && set.contains(&lower(c).as_str()));
-        let clause = |h: usize| -> Option<GrammarFrame> {
+        let clause = |h: usize| -> Option<(GrammarFrame, SlotWords)> {
             let ks = kids(h);
             let cop = ks.iter().copied().find(|&k| base(k) == "cop");
             let action = if tags[h] == "VERB" {
@@ -122,7 +141,13 @@ pub fn grammar_frames(engine: &Engine, input: &str) -> Vec<GrammarFrame> {
                 "affirmative"
             }
             .to_string();
-            (f.action.is_some() || f.object.is_some()).then_some(f)
+            let slots = SlotWords {
+                subject: subj,
+                action: if tags[h] == "VERB" || tags[h] == "AUX" { Some(h) } else { cop },
+                object: obj,
+                target: obl,
+            };
+            (f.action.is_some() || f.object.is_some()).then_some((f, slots))
         };
         // The clause head: the root when it's a predicate; otherwise (the parser
         // rooted a noun) the first verb with a subject of its own, else the first verb.
@@ -132,7 +157,7 @@ pub fn grammar_frames(engine: &Engine, input: &str) -> Vec<GrammarFrame> {
             let verbs: Vec<usize> = (0..tags.len()).filter(|&j| tags[j] == "VERB").collect();
             root = verbs.iter().copied().find(|&j| kids(j).into_iter().any(|k| base(k) == "nsubj")).or(verbs.first().copied()).or(root);
         }
-        let Some(root) = root else { continue };
+        let Some(root) = root else { return frames };
         let mut heads = vec![root];
         heads.extend(kids(root).into_iter().filter(|&k| {
             (base(k) == "conj" || base(k) == "parataxis") && (tags[k] == "VERB" || kids(k).into_iter().any(|c| base(c) == "cop"))
