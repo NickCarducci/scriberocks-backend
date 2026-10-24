@@ -17,7 +17,7 @@ separately on the candidates file this writes).
 Reported: within each target, how often an accepted substitute scores more
 typical than a rejected one (0.5 chance).
 
-usage: ~/.venvs/fidelityai/bin/python -I fidelity_substitution_eval.py <swords_subs.jsonl> <engine dir> [variants] [per target = 4]
+usage: [CANDIDATES=<records jsonl>] ~/.venvs/fidelityai/bin/python -I fidelity_substitution_eval.py <swords_subs.jsonl> <engine dir> [variants] [per target = 4]
 """
 import collections, json, random, sys, time, types
 
@@ -30,9 +30,13 @@ from fidelityai.quantum import abcd_fit_and_score  # noqa: E402
 rows = [json.loads(l) for l in open(path)]
 source_rows = [r for r in rows if r["split"] == "dev" and r["y"] == 1]
 rng = random.Random(11)
+# CANDIDATES=<records jsonl>: score another set (e.g. ProLex, scored only,
+# never in a rulebook) against the SWORDS dev rulebooks.
+import os  # noqa: E402
+other = os.environ.get("CANDIDATES")
 by_target = collections.defaultdict(lambda: ([], []))
-for r in rows:
-    if r["split"] == "test":
+for r in ([json.loads(l) for l in open(other)] if other else rows):
+    if other or r["split"] == "test":
         by_target[r["tid"]][1 - r["y"]].append(r)
 cands = []
 for tid, (acc, rej) in sorted(by_target.items()):
@@ -41,7 +45,7 @@ for tid, (acc, rej) in sorted(by_target.items()):
         cands += acc[:per_target] + rej[:per_target]
 print(f"rulebook: {len(source_rows)} accepted dev substitutions; candidates: {len(cands)} test substitutions "
       f"({sum(r['y'] for r in cands)} accepted) for {len({r['tid'] for r in cands})} targets")
-with open(path.replace(".jsonl", ".candidates.tsv"), "w") as f:
+with open((other or path).replace(".jsonl", ".candidates.tsv"), "w") as f:
     for r in cands:
         f.write(f"{r['tid']}\t{r['y']}\t{r['text']}\n")
 
