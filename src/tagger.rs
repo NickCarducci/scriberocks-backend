@@ -42,6 +42,22 @@ struct Averager {
 }
 
 impl Tagger {
+    /// Drops weights smaller than `threshold` in magnitude, and features left
+    /// with none (for shipping a smaller model). Returns (features, weights) kept.
+    pub fn prune(&mut self, threshold: f32) -> (usize, usize) {
+        self.weights.retain(|_, w| {
+            for x in w.iter_mut() { if x.abs() < threshold { *x = 0.0 } }
+            w.iter().any(|&x| x != 0.0)
+        });
+        (self.weights.len(), self.weights.values().map(|w| w.iter().filter(|&&x| x != 0.0).count()).sum())
+    }
+
+    /// Tags, the single-tag word dictionary, and every feature's weights
+    /// (for exporting the tagger to other runtimes).
+    pub fn parts(&self) -> (&[String], &HashMap<String, u16>, &HashMap<String, Vec<f32>>) {
+        (&self.tags, &self.tagdict, &self.weights)
+    }
+
     pub fn load(path: &Path) -> Result<Tagger, Box<dyn std::error::Error>> {
         Ok(postcard::from_bytes(&std::fs::read(path)?)?)
     }
@@ -252,4 +268,18 @@ fn build_tagdict(sentences: &[Sentence], column: Column, tag_index: &dyn Fn(&str
             (total >= 20 && n as f64 / total as f64 >= 0.97).then_some((word, best as u16))
         })
         .collect()
+}
+
+#[cfg(test)]
+mod prune_tests {
+    use super::*;
+
+    #[test]
+    fn pruning_drops_small_weights_and_empty_features() {
+        let mut t = Tagger { tags: vec!["A".into(), "B".into()], ..Default::default() };
+        t.weights.insert("big".into(), vec![2.0, 0.1]);
+        t.weights.insert("small".into(), vec![0.2, -0.3]);
+        assert_eq!(t.prune(0.5), (1, 1));
+        assert_eq!(t.weights["big"], vec![2.0, 0.0]);
+    }
 }

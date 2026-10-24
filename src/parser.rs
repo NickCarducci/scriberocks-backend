@@ -151,6 +151,23 @@ impl<'a> State<'a> {
 }
 
 impl Parser {
+    /// Drops weights smaller than `threshold` in magnitude, and features left
+    /// with none (for shipping a smaller model). Returns (features, weights) kept.
+    pub fn prune(&mut self, threshold: f32) -> (usize, usize) {
+        self.weights.retain(|_, w| {
+            for x in w.iter_mut() { if x.abs() < threshold { *x = 0.0 } }
+            w.iter().any(|&x| x != 0.0)
+        });
+        (self.weights.len(), self.weights.values().map(|w| w.iter().filter(|&&x| x != 0.0).count()).sum())
+    }
+
+    /// Labels and every feature's weights over the 2 + 2·labels moves
+    /// (shift, reduce, left-arc per label, right-arc per label), for
+    /// exporting the parser to other runtimes.
+    pub fn parts(&self) -> (&[String], &HashMap<String, Vec<f32>>) {
+        (&self.labels, &self.weights)
+    }
+
     pub fn load(path: &Path) -> Result<Parser, Box<dyn std::error::Error>> {
         let stored: Stored = postcard::from_bytes(&std::fs::read(path)?)?;
         let classes = 2 + 2 * stored.labels.len();
