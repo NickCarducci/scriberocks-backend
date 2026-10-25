@@ -8,7 +8,7 @@
 //!               agreement, tense, number
 //!   function    one function word (a, the, in, of, is, ...) replaced,
 //!               inserted or deleted
-//! Each side is written with its fine part-of-speech tags (Penn Treebank,
+//! Each side is written with its tokens, fine part-of-speech tags (Penn Treebank,
 //! one sequence per sentence) and per-sentence shape (words, commas,
 //! joining words, verbs). Also writes a rulebook of stable sentences.
 //!
@@ -41,6 +41,7 @@ fn describe(e: &Engine, s: &str) -> Value {
             let upos = e.upos.tag(&refs, Some(&e.lexicon));
             let lower: Vec<String> = toks.iter().map(|w| w.to_lowercase()).collect();
             json!({
+                "tokens": toks,
                 "xpos": xpos,
                 "shape": {
                     "words": lower.iter().filter(|w| w.chars().any(char::is_alphanumeric)).count(),
