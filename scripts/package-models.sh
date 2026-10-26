@@ -1,6 +1,7 @@
 #!/bin/sh
 # Packages the models apps bundle into target/scribe-models.zip (+ .sha256).
 # Layout matches what Engine::load reads: *.bin at the root, usage/ beside.
+# This release package intentionally excludes experimental context-sized models.
 set -eu
 cd "$(dirname "$0")/.."
 OUT=target/scribe-models
