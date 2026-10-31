@@ -295,6 +295,48 @@ stable sentences. Does the corrected version score as more typical?
   FidelityAI's coarser whole-record scores, so they support no conclusion. This
   needs a cleaner source of human-marked run-ons.
 
+### Structure alone, with no vocabulary
+
+FidelityAI's intended strength is structure, and the grammar test above used
+errors that depend on specific words. So this test gave it only each sentence's
+dependency relations and punctuation marks, as sliding windows of 3 (role
+embeddings, k=3). Rulebook for edits: 5,000 stable sentences.
+
+| Editors' structural edits | FidelityAI, record | FidelityAI, worst tuple | Relation-trigram counts | Judge |
+|---|---|---|---|---|
+| Comma edits (400) | 0.520 | 0.526 | 0.632 | 0.675 |
+| Word reordering (400) | 0.455 | 0.504 | 0.561 | 0.677 |
+| Clause rewrites (400) | 0.501 | 0.520 | 0.502 | 0.609 |
+
+The judge sees words as well as structure, so it isn't a structure-only method.
+The relation counts are the fair comparison, and they beat FidelityAI on commas
+and reordering.
+
+**Splits and merges are unusable for FidelityAI.** Its merge score of 0.98 and
+split score of 0.05 are artifacts. On clean text, its worst tuple ranks one
+sentence above two every time (1.000), and its record score leans the other way
+(0.301). Plain counts are unbiased (0.500). Counts on a rulebook with sentence
+boundaries gave merges 0.713 and splits 0.565. The judge's 0.873 and 0.288 mirror
+each other too, but it had no such control, so they support no conclusion. Many
+merges also just fix stray punctuation (*board. .*).
+
+| Whole text, structure only | FidelityAI, record | FidelityAI, worst tuple | Relation-trigram counts |
+|---|---|---|---|
+| Certified against ordinary rocks (600 each) | 0.559 | 0.432 | 0.531 |
+| One writer against others, six writers | 0.498–0.621 | 0.488–0.712 | 0.479–0.780 |
+
+- **Rocks.** 0.559 beats structure counts by about 1.6 times the ±0.017
+  uncertainty, and is below word frequencies (0.607). It may also be affected by
+  the boundary bias if the two groups differ in sentence count; this wasn't checked.
+- **Writers.** Counts beat FidelityAI's record score on five of six writers. These
+  are single sentences, so the boundary bias doesn't apply.
+- **Not tested.** Bad paragraph-level structure has no real labeled data here.
+  Shuffling sentences to make some would be rule-made data, which is out of bounds.
+
+**Reading.** A structure-only representation doesn't change the conclusion. The
+one point in FidelityAI's favour is rock-level structure, by a margin too small to
+rely on.
+
 ### What limits the rulebook's size
 
 The fixed 5,000-record warning doesn't match what was measured. Memory grows
@@ -345,6 +387,8 @@ wide.
 - **The per-option check** above was tested in spirit on SWORDS and ProLex,
   with one rulebook rather than one model per option. It stayed well below the
   judge, though a true per-option fit hasn't been run.
+- **Structure** was tested directly and doesn't beat plain relation counts on
+  single-sentence edits or writers; its small lead on rocks isn't reliable.
 - **Style conformance** shows real but weaker signal than word frequencies, and
   prose reaches FidelityAI only as frames. Giving it more of each sentence is
   untested.
@@ -366,5 +410,6 @@ wide.
   `fidelity_slot_eval.py`, `fidelity_wordnet_eval.py`,
   `fidelity_certified_eval.py`, `fidelity_rock_quality_eval.py`,
   `fidelity_author_eval.py`, `fidelity_grammar_eval.py`,
-  `fidelity_grammar_introspect.py`, `fidelity_grammar_tuples.py`.
+  `fidelity_grammar_introspect.py`, `fidelity_grammar_tuples.py`,
+  `fidelity_structure_eval.py`.
   FidelityAI `engine/scripts/score_head_check.py`; patent change log A5–A9.
