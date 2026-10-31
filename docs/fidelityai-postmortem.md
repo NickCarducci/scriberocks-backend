@@ -522,6 +522,32 @@ overlap only slightly when the others agree. The tables are one hand-written
 attempt, and these corrections weren't selected for rule violations, so this doesn't
 rule out a different description or a test limited to one rule.
 
+### Meaning from upstream, and scale after the fixes
+
+Word positions took casual v2's learned piece vectors, reduced to 15 numbers, in place
+of embeddings learned from the rulebook. Records were real (governor, relation, word)
+pairings; candidates were human-judged substitutes.
+
+| SWORDS, OANC pairings | 5,000 | 10,000 | 20,000 | 40,000 |
+|---|---|---|---|---|
+| Usage vectors, all pairs | 0.523 | 0.510 | 0.515 | 0.499 |
+| Co-occurrence embeddings, all pairs | 0.568 | 0.599 | 0.625 | 0.633 |
+| Usage vectors, similar word frequency | 0.490 | 0.507 | 0.521 | 0.510 |
+| Co-occurrence embeddings, similar word frequency | 0.497 | 0.501 | 0.554 | 0.551 |
+
+Over the same 4,192 pairs, word frequency alone scores 0.652. Over the 713 pairs whose
+substitutes' frequencies are within a factor of 2, frequency scores 0.518, counts
+0.504–0.520, and the judge 0.649.
+
+- **First steady climb with more records.** With raw counts and the new score, FidelityAI
+  rises on SWORDS at every step, and leads on similar-frequency pairs from 20,000.
+  It stays under frequency on all pairs and under the judge. ProLex with Tatoeba
+  pairings shows less: 0.498, 0.495 at 20,000, 0.515 at 40,000 on similar frequency
+  (506 pairs). Rulebook sizes were read on the same candidates, so this is one test.
+- **Earlier word-fit scores near 0.59 were mostly frequency.** On similar-frequency
+  pairs at 5,000 records, they fall to chance.
+- **Piece vectors didn't help.** Vectors for words in context weren't tried.
+
 ### Fixes this round produced
 
 | Problem | Fix |
@@ -582,5 +608,5 @@ wide.
   `fidelity_grammar_introspect.py`, `fidelity_grammar_tuples.py`,
   `fidelity_structure_eval.py`, `fidelity_linked_eval.py`, `fidelity_linked_weights.py`,
   `fidelity_factor_search.py`, `fidelity_factor_confirm.py`,
-  `fidelity_description_eval.py`.
+  `fidelity_description_eval.py`, `fidelity_usage_vectors_eval.py`.
   FidelityAI `engine/scripts/score_head_check.py`; patent change log A5–A11.
