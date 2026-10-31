@@ -592,6 +592,23 @@ synonym sets, so they compare only approximately with these sequence rows. The
 inter-tuple tier is FidelityAI's best sentence-level result here. Its rulebook was held
 to 3,000 sentences by memory (about 20 GB).
 
+**With word frequency controlled.** SWORDS test and dev combined; inter-tuple tier, 3,000
+sentences; corpus frequency of the substitute. Standard errors treat pairs as independent,
+so they are optimistic.
+
+| Pairs | FidelityAI | Word frequency | Publishable judge |
+|---|---|---|---|
+| All, within 2x frequency (1,779; ±0.012) | 0.520 | 0.513 | 0.660 |
+| All, within 4x (3,393; ±0.009) | 0.523 | 0.531 | not run |
+| Synonyms, any frequency (214; ±0.034) | 0.605 | 0.629 | 0.664 |
+| Synonyms, within 4x (72; ±0.059) | 0.590 | 0.465 | 0.556 |
+| Synonyms, within 2x (34; ±0.086) | 0.691 | 0.368 | 0.588 |
+
+A logistic model on pair differences, held out by target, gained nothing from FidelityAI:
+AUC 0.681 → 0.682 on all pairs, and 0.685 → 0.670 on synonyms. The two small synonym rows
+are FidelityAI's only lead and are within noise. On this evidence a paid larger run on
+English word fit isn't justified.
+
 ### Fixes this round produced
 
 | Problem | Fix |
@@ -653,5 +670,5 @@ wide.
   `fidelity_structure_eval.py`, `fidelity_linked_eval.py`, `fidelity_linked_weights.py`,
   `fidelity_factor_search.py`, `fidelity_factor_confirm.py`,
   `fidelity_description_eval.py`, `fidelity_usage_vectors_eval.py`,
-  `fidelity_misnomer_eval.py`, `fidelity_sequence_eval.py`.
+  `fidelity_misnomer_eval.py`, `fidelity_sequence_eval.py`, `fidelity_frequency_check.py`.
   FidelityAI `engine/scripts/score_head_check.py`; patent change log A5–A11.
