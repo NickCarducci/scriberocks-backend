@@ -434,6 +434,25 @@ at 1,000 sentences (clause chains 0.538 against 0.462; both chains 0.540 against
 never showed this. It is the direction the sparsity argument predicts, but too
 weak to rely on.
 
+**Frequency flattening explained the decline with data.** Role-embedding learning
+passes co-occurrence counts through `log1p`, so common and uncommon pairings weigh
+nearly alike. With it turned off in a local test (the engine is unchanged):
+
+| Linked tuples, changed edits (FidelityAI, counts) | 1,000 | 5,000 | 20,000 | 40,000 |
+|---|---|---|---|---|
+| Clause chains, function words | 0.579, 0.462 | 0.569, 0.476 | 0.543, 0.492 | 0.567, 0.482 |
+| Clause chains, inflection | 0.546, 0.577 | 0.563, 0.567 | 0.535, 0.581 | 0.557, 0.578 |
+| Both chains, function words | 0.518, 0.519 | 0.524, 0.517 | 0.553, 0.524 | 0.527, 0.521 |
+| Both chains, inflection | 0.520, 0.560 | 0.574, 0.565 | 0.570, 0.567 | 0.540, 0.566 |
+| Pairs, inflection | 0.520, 0.622 | 0.565, 0.635 | 0.559, 0.652 | 0.559, 0.652 |
+
+At 20,000 sentences, with `log1p` on, these function-word cells were 0.453 and 0.459.
+Without it, FidelityAI no longer declines with data, and clause chains beat counts
+on function words at every size. It also stops improving after about 5,000, and the
+judge scores about 0.73. This setting was chosen after seeing these same edits, so
+the result still needs held-out corrections. A deduplication step exists in the engine
+but nothing calls it; candidates and the source keep their repeats.
+
 ### Fixes this round produced
 
 | Problem | Fix |
@@ -490,5 +509,5 @@ wide.
   `fidelity_certified_eval.py`, `fidelity_rock_quality_eval.py`,
   `fidelity_author_eval.py`, `fidelity_grammar_eval.py`,
   `fidelity_grammar_introspect.py`, `fidelity_grammar_tuples.py`,
-  `fidelity_structure_eval.py`, `fidelity_linked_eval.py`.
+  `fidelity_structure_eval.py`, `fidelity_linked_eval.py`, `fidelity_linked_weights.py`.
   FidelityAI `engine/scripts/score_head_check.py`; patent change log A5–A9.
