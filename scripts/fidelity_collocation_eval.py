@@ -12,7 +12,7 @@ governor and relation or relation and dependent.
 
 usage: ~/.venvs/fidelityai/bin/python -I fidelity_collocation_eval.py <prefix> <engine dir> [rulebook records = 5000]
 """
-import collections, json, math, random, sys, time, types
+import collections, json, math, os, random, sys, time, types
 
 prefix, engine = sys.argv[1], sys.argv[2]
 n_rulebook = int(sys.argv[3]) if len(sys.argv) > 3 else 5000
@@ -88,7 +88,8 @@ for i, c in enumerate(cands):
 print(f"FidelityAI rulebook: {len(source)} corpus triples ({per_key} per candidate key of {len(keys)}, by frequency); {len(records)} candidate triples")
 t0 = time.time()
 res = abcd_fit_and_score(source_dataset=types.SimpleNamespace(episodes=source, label="usage"),
-                         artifact_dataset=types.SimpleNamespace(episodes=records, label="prolex"), max_qubits=20, seed=42)
+                         artifact_dataset=types.SimpleNamespace(episodes=records, label="prolex"), max_qubits=20, seed=42,
+                         max_benign_refs=int(os.environ.get("REFS", 30)))
 sel, gr = res["selected"], res["pipe"].grammar
 scores = res["artifact_scores"]
 per = collections.defaultdict(list)

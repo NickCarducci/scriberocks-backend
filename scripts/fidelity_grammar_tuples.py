@@ -15,7 +15,7 @@ usage: ~/.venvs/fidelityai/bin/python -I fidelity_grammar_tuples.py <grammar dir
 unique: each tag window enters the rulebook once (its first occurrence), so
 common patterns don't outweigh rare ones in the fit; counts stay as they are.
 """
-import collections, json, random, sys, types
+import collections, json, os, random, sys, types
 
 import numpy as np
 
@@ -75,7 +75,8 @@ source = [s for s in map(rulebook_seq, rulebook) if s]
 print(f"rulebook: {len(source)} sentences, {sum(len(s) for s in source) // K} windows" + (" (each window once)" if UNIQUE else ""), flush=True)
 res = abcd_fit_and_score(source_dataset=types.SimpleNamespace(episodes=[[{"sequence": s}] for s in source], label="stable-tags"),
                          artifact_dataset=types.SimpleNamespace(episodes=[[{"sequence": as_seq(d)}] for d in texts], label="candidates"),
-                         max_qubits=20, seed=42, encoding={"type": "role_embedding_v1", "dim": DIM, "one_hot_roles": []}, k_values=[K])
+                         max_qubits=20, seed=42, encoding={"type": "role_embedding_v1", "dim": DIM, "one_hot_roles": []}, k_values=[K],
+                         max_benign_refs=int(os.environ.get("REFS", 30)))
 pipe = res["pipe"]
 assert int(pipe.grammar.tuple_size) == K and len(res["mapped_artifacts"]) == len(texts), (int(pipe.grammar.tuple_size), len(res["mapped_artifacts"]), len(texts))
 fid = pipe.tuple_scores(res["mapped_artifacts"])
