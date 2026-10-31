@@ -355,6 +355,41 @@ makes long context and exact words compete for the same statevector. An earlier
 edit-records run with 20,000 five-column records peaked at 47 GB on this 48 GB
 machine.
 
+### Does more data help? Learning curves past 5,000 records
+
+Hypothesis: open-ended English needs far more than 5,000 records. Tested with
+k=3 and the fixed score, on rulebooks of real text. The reference bank stays at
+30 unless stated. These rulebooks were drawn from word pairings that share a
+candidate's context, chosen without using its label.
+
+| Rulebook records | About 5,000 | 10,000 | 20,000 | 40,000 |
+|---|---|---|---|---|
+| ProLex word fit, Tatoeba pairings | 0.588 | 0.555 | 0.566 | 0.589 |
+| SWORDS word fit, OANC pairings | 0.553 | 0.578 | 0.532 | 0.586 |
+| Inflection, tag trigrams | 0.523 | 0.534 | 0.499 | 0.507 |
+| Function words, tag trigrams | 0.503 | 0.512 | 0.470 | 0.477 |
+
+For comparison: on word fit, the substitute's own frequency scores 0.647 (ProLex)
+and 0.644 (SWORDS), and the judge 0.654 and 0.680. On grammar at 40,000 records,
+tag-window counts score 0.561 (inflection) and 0.573 (function words), and the
+judge 0.743 and 0.737.
+
+More references didn't help (40,000 records):
+
+| References | 30 | 256 | 1,024 |
+|---|---|---|---|
+| ProLex word fit | 0.589 | 0.475 | 0.442 |
+| SWORDS word fit | 0.586 | 0.445 | 0.422 |
+| Inflection | 0.507 | 0.510 | 0.508 |
+| Function words | 0.477 | 0.481 | 0.481 |
+
+Neither curve shows a steady climb, and no FidelityAI setting reached the
+baselines. Why more references pushed word fit below chance wasn't investigated.
+Not tested: more than 40,000 records, k above 3 at this scale (about 130 GB
+estimated at k=4), or whole sentences of actual words.
+
+Word-pairing fits rose from about 0.53 before the scoring fix to about 0.59 after.
+
 ### Fixes this round produced
 
 | Problem | Fix |
