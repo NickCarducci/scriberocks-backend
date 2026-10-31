@@ -500,6 +500,28 @@ them, the judge and counts both lead.
 A 99% projection cutoff (rank 2 → 4–15) changed little, and 20,000 sentences didn't
 help: the second line's function-word score fell from 0.607 to 0.488.
 
+### Roles known by description alone
+
+Can never-seen combinations be judged when a value's embedding comes from its
+published description (Penn Treebank tag definitions, standard function-word
+features) instead of co-occurrence? Tables and factor sets were fixed before any
+scores. Fresh corrections, non-*be*/*have* edits where both sides hold a tuple the
+rulebook never had, so counts of the worst tuple tie at 0.5:
+
+| Factors, rulebook | Description | Learned | Attribute pairs (classical) | Judge |
+|---|---|---|---|---|
+| Subject, auxiliary, verb, object; 1,000 (556) | 0.498 | 0.513 | 0.531 | 0.763 |
+| Subject, auxiliary, verb, object; 5,000 (262) | 0.490 | 0.531 | 0.532 | not run |
+| Subject, auxiliary, verb; 1,000 (268) | 0.500 | 0.532 | 0.535 | 0.716 |
+| Auxiliary, verb, object; 1,000 (179) | 0.497 | 0.528 | 0.539 | 0.771 |
+
+Description embeddings gave higher rank (16–25 against 3–10) but stayed at chance,
+and worst-tuple location stayed at or near chance. *be*/*have* swaps were too few to
+read (12–85). One possible reason, not tested: a mismatch in one attribute lowers the
+overlap only slightly when the others agree. The tables are one hand-written
+attempt, and these corrections weren't selected for rule violations, so this doesn't
+rule out a different description or a test limited to one rule.
+
 ### Fixes this round produced
 
 | Problem | Fix |
@@ -559,5 +581,6 @@ wide.
   `fidelity_author_eval.py`, `fidelity_grammar_eval.py`,
   `fidelity_grammar_introspect.py`, `fidelity_grammar_tuples.py`,
   `fidelity_structure_eval.py`, `fidelity_linked_eval.py`, `fidelity_linked_weights.py`,
-  `fidelity_factor_search.py`, `fidelity_factor_confirm.py`.
+  `fidelity_factor_search.py`, `fidelity_factor_confirm.py`,
+  `fidelity_description_eval.py`.
   FidelityAI `engine/scripts/score_head_check.py`; patent change log A5–A11.
