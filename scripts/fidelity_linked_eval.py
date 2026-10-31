@@ -6,7 +6,8 @@ Wikipedia sentences. Local and free.
 Per edit: does the after's worst tuple score more typical than the before's
 (0.5 chance), over all edits and over those whose tuples actually change? Does
 the before's worst tuple read the edited word? Baseline: plain counts of the same
-tuples in the rulebook (rarest tuple is the worst). Also reports model size and
+tuples in the rulebook (rarest tuple is the worst). Also reported on the edits where those
+counts tie, the sparse case an overlap could still judge. Also reports model size and
 per-sentence scoring time. REFS=<n> sets the reference bank (default 30). Writes changed pairs for the judge (text_judge_eval).
 
 usage: ~/.venvs/fidelityai/bin/python -I fidelity_linked_eval.py <core dir> <grammar dir> <engine dir> <work dir> [rulebook = 20000] [per kind = 600]
@@ -84,6 +85,14 @@ for name, (fields, K, dim) in VARIANTS.items():
             s[method + " all"].append(win)
             if changed:
                 s[method + " changed"].append(win)
+                if method == "FidelityAI":
+                    cb, ca = [-counts[tuple(t["v"])] for t in tb], [-counts[tuple(t["v"])] for t in ta]
+                    # Where counts can't help: their worst tuples tie.
+                    if max(cb) == max(ca):
+                        s["FidelityAI tied"].append(win)
+                    # Where the rulebook never saw a worst tuple on either side.
+                    if max(cb) == 0 and max(ca) == 0:
+                        s["FidelityAI unseen"].append(win)
                 worst = [j for j, v in enumerate(b) if v == max(b)]
                 s[method + " locate"].append(sum(e in tb[j]["at"] for j in worst) / len(worst))
                 if method == "FidelityAI":
@@ -98,6 +107,8 @@ for name, (fields, K, dim) in VARIANTS.items():
               f"detect changed FidelityAI {avg(s['FidelityAI changed']):.3f}, counts {avg(s['counts changed']):.3f}; "
               f"all edits FidelityAI {avg(s['FidelityAI all']):.3f}, counts {avg(s['counts all']):.3f}; "
               f"locate FidelityAI {avg(s['FidelityAI locate']):.3f}, counts {avg(s['counts locate']):.3f}, chance {avg(s['chance']):.3f}", flush=True)
+        print(f"    where counts tie: FidelityAI {avg(s['FidelityAI tied']):.3f} ({len(s['FidelityAI tied'])}); "
+              f"both sides hold an unseen tuple: FidelityAI {avg(s['FidelityAI unseen']):.3f} ({len(s['FidelityAI unseen'])})", flush=True)
     if name == "clause+np":
         with open(f"{work}/judge_changed.tsv", "w") as f:
             for i in keep:

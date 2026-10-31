@@ -423,6 +423,17 @@ The judge on the both-chains edits: 0.734 (inflection), 0.731 (function words).
 - **Scoring is cheap.** About 0.2–0.8 ms per text in the engine, with a projection
   under 1 MB raw. The whole artifact wasn't sized and the phone wasn't measured.
 
+**Where counts run out.** An overlap can compare combinations it has never seen,
+so FidelityAI should do best where counts tie. At 1,000 and 20,000 rulebook
+sentences (30 references), the tie subsets scored 0.447–0.553. The largest, both
+chains on function words at 1,000, scored 0.541 of 283 edits (0.548 of 166 where
+each side holds an unseen tuple), within about 1.4 standard errors of chance
+across 16 comparisons. Over all changed function-word edits, FidelityAI beat counts
+at 1,000 sentences (clause chains 0.538 against 0.462; both chains 0.540 against
+0.519) and lost at 20,000 (0.453 against 0.492; 0.459 against 0.524). Inflection
+never showed this. It is the direction the sparsity argument predicts, but too
+weak to rely on.
+
 ### Fixes this round produced
 
 | Problem | Fix |
