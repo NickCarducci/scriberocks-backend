@@ -627,7 +627,10 @@ found); 67% keep the same synset. Within target, all pairs / synonym pairs:
 Held-out AUC adding FidelityAI (auto) to the judge's gain: 0.751 → 0.763, 0.778 → 0.784,
 0.719 → 0.721. Without the judge's value it stays near chance, and whole-path counts do
 no better. The plain meaning relation is the useful signal in this test. It needs no
-training beyond the sense head and WordNet.
+training beyond the sense head and WordNet. Adding it to the judge's gain, held out by
+target (AUC, judge → judge plus relation): SWORDS test 0.751 → 0.815, SWORDS dev 0.778 →
+0.837, ProLex 0.719 → 0.728; on synonym pairs 0.806 → 0.896 (129), 0.682 → 0.843 (87) and
+0.772 → 0.797 (163). This has not yet been tested on rocks in the product.
 
 ### Fixes this round produced
 
