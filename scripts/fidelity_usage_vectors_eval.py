@@ -7,9 +7,9 @@ text only; ProLex stays local. Within target: an accepted substitute beats a
 rejected one (0.5 chance), over all pairs, pairs where both substitutes' pairing is
 absent from the rulebook, and pairs of similar word frequency (within a factor of 2).
 
-usage: ~/.venvs/fidelityai/bin/python -I fidelity_usage_vectors_eval.py <colloc prefix> <model dir> <engine dir> [rulebook = 5000] [refs = 30]
+usage: [VECTORS=<words in context json>] ~/.venvs/fidelityai/bin/python -I fidelity_usage_vectors_eval.py <colloc prefix> <model dir> <engine dir> [rulebook = 5000] [refs = 30]
 """
-import collections, json, math, random, struct, sys
+import collections, json, math, os, random, struct, sys
 
 import numpy as np
 
@@ -51,7 +51,13 @@ def pieces(word):
     return out
 
 
+context = json.load(open(os.environ["VECTORS"])) if os.environ.get("VECTORS") else None  # examples/context_vectors.rs
+
+
 def word_vector(word):
+    if context is not None:
+        v = context.get(word.lower())
+        return np.asarray(v, dtype=float) if v else None
     p = pieces(word.lower())
     return table[p].mean(axis=0) if p else None
 

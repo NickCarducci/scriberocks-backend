@@ -548,6 +548,50 @@ substitutes' frequencies are within a factor of 2, frequency scores 0.518, count
   pairs at 5,000 records, they fall to chance.
 - **Piece vectors didn't help.** Vectors for words in context weren't tried.
 
+### Scale and confirmation on fresh targets, misnomers, and tuple sequences
+
+The climb above didn't hold. At 80,000 records, SWORDS test scored 0.622 on all pairs
+and 0.534 on similar-frequency pairs. On SWORDS dev, whose targets the test never
+used, similar-frequency pairs scored 0.473, 0.528, 0.509 and 0.481 from 5,000 to
+40,000 records (392 pairs; all pairs 0.532–0.580, word frequency 0.619). In-context
+vectors, averaged over real OANC sentences, scored 0.478–0.517 on similar-frequency
+pairs.
+
+**Judge correction.** SWORDS is published prose, so by the within-style rule the
+publishable judge is the right comparison; earlier SWORDS rows used casual. Publishable
+scores 0.692 on SWORDS test, 0.719 on dev and 0.658 on the similar-frequency pairs
+(casual: 0.680 on an earlier sample of test, 0.726, 0.649).
+
+**Misnomers.** Only targets whose accepted and rejected substitutes are both WordNet
+synonyms of the original word. Records hold a candidate's own pairs in both directions,
+from OANC or Tatoeba, for 5,000–40,000 records:
+
+| Set (synonym pairs) | FidelityAI, mean tuple | Counts | Word frequency | Judge |
+|---|---|---|---|---|
+| SWORDS test (128) | 0.590–0.617 | 0.578–0.625 | 0.648 | publishable 0.703 |
+| SWORDS dev (86) | 0.628–0.680 | 0.523–0.535 | 0.640 | publishable 0.605 |
+| ProLex (163) | 0.546–0.561 | 0.515–0.577 | 0.613 | casual 0.669 |
+
+These sets are small (about ±0.04–0.05), and 18–26 pairs per set have similar frequency,
+too few to read.
+
+**Word tuples in sequence.** Each sentence as all its parser-linked word tuples:
+
+| Tier | SWORDS test: all / synonyms | SWORDS dev: all / synonyms |
+|---|---|---|
+| Sentence record, 5,000 sentences | 0.552 / 0.590 | 0.560 / 0.581 |
+| Sentence record, 20,000 | 0.523 / 0.539 | 0.554 / 0.616 |
+| Worst tuple, 5,000 | 0.540 / 0.570 | 0.549 / 0.541 |
+| Worst tuple, 20,000 | 0.551 / 0.617 | 0.541 / 0.547 |
+| Inter-tuple tier, 3,000 | 0.565 / 0.586 | 0.590 / 0.634 |
+| Inter-tuple direct, 3,000 | 0.526 / 0.543 | 0.521 / 0.535 |
+| Publishable judge | 0.692 / 0.703 | 0.719 / 0.605 |
+
+The word frequency figures above cover candidates with a governor pairing or the
+synonym sets, so they compare only approximately with these sequence rows. The
+inter-tuple tier is FidelityAI's best sentence-level result here. Its rulebook was held
+to 3,000 sentences by memory (about 20 GB).
+
 ### Fixes this round produced
 
 | Problem | Fix |
@@ -608,5 +652,6 @@ wide.
   `fidelity_grammar_introspect.py`, `fidelity_grammar_tuples.py`,
   `fidelity_structure_eval.py`, `fidelity_linked_eval.py`, `fidelity_linked_weights.py`,
   `fidelity_factor_search.py`, `fidelity_factor_confirm.py`,
-  `fidelity_description_eval.py`, `fidelity_usage_vectors_eval.py`.
+  `fidelity_description_eval.py`, `fidelity_usage_vectors_eval.py`,
+  `fidelity_misnomer_eval.py`, `fidelity_sequence_eval.py`.
   FidelityAI `engine/scripts/score_head_check.py`; patent change log A5–A11.
