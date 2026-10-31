@@ -390,6 +390,39 @@ estimated at k=4), or whole sentences of actual words.
 
 Word-pairing fits rose from about 0.53 before the scoring fix to about 0.59 after.
 
+### Letting the parser pick the tuples
+
+Fixed windows mostly pair neighbours with no rule between them, so this test used
+tuples of words the dependency parser links at any distance, with closed features
+only (tags and function-word forms). The rulebook was 20,000 stable sentences.
+Scores cover edits whose tuples actually change; each cell is 30 / 256 references.
+
+| Inflection fixes | FidelityAI | Counts of the same tuples | Worst tuple reads the edit: FidelityAI / counts / chance |
+|---|---|---|---|
+| Pairs (k=2; 299 edits) | 0.543 / 0.569 | 0.652 | 0.380–0.382 / 0.592 / 0.333 |
+| Clause chains (k=4; 357) | 0.531 / 0.556 | 0.581 | 0.541–0.550 / 0.588 / 0.511 |
+| Noun-phrase chains (k=4; 357) | 0.515 / 0.499 | 0.569 | 0.166–0.168 / 0.286 / 0.196 |
+| Both chains (k=4; 503) | 0.529 / 0.526 | 0.567 | 0.373 / 0.392 / 0.205 |
+
+| Function-word fixes | FidelityAI | Counts of the same tuples |
+|---|---|---|
+| Pairs (368) | 0.428 / 0.461 | 0.495 |
+| Clause chains (247) | 0.453 / 0.508 | 0.492 |
+| Noun-phrase chains (297) | 0.478 / 0.471 | 0.519 |
+| Both chains (438) | 0.459 / 0.457 | 0.524 |
+
+The judge on the both-chains edits: 0.734 (inflection), 0.731 (function words).
+
+- **Linking helps counts more than FidelityAI.** Linked-pair counts reach 0.652 on
+  inflection, against 0.561 for tag-window counts over all inflection edits (a
+  different edit set), and find the edited word 0.592 of the time (chance 0.333).
+  That is a cheap, explainable agreement check, separate from FidelityAI.
+- **The fitted projection is very small.** It kept 2–7 dimensions at 30 references
+  and 2–10 at 256, on 256–4,096 features. More references raised it only for pairs
+  and clause chains.
+- **Scoring is cheap.** About 0.2–0.8 ms per text in the engine, with a projection
+  under 1 MB raw. The whole artifact wasn't sized and the phone wasn't measured.
+
 ### Fixes this round produced
 
 | Problem | Fix |
@@ -446,5 +479,5 @@ wide.
   `fidelity_certified_eval.py`, `fidelity_rock_quality_eval.py`,
   `fidelity_author_eval.py`, `fidelity_grammar_eval.py`,
   `fidelity_grammar_introspect.py`, `fidelity_grammar_tuples.py`,
-  `fidelity_structure_eval.py`.
+  `fidelity_structure_eval.py`, `fidelity_linked_eval.py`.
   FidelityAI `engine/scripts/score_head_check.py`; patent change log A5–A9.
