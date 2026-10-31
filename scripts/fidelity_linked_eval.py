@@ -36,10 +36,11 @@ for l in open(f"{gdir}/edits.jsonl"):
     if e["kind"] != "split":
         edits[e["kind"]].append((e["before"]["text"], e["after"]["text"]))
 rng = random.Random(9)
+offset = int(os.environ.get("OFFSET", 0))  # OFFSET=<n>: a held-out sample, past the first n per kind
 pairs = []
 for kind, es in sorted(edits.items()):
     rng.shuffle(es)
-    pairs += [(kind, b, a) for b, a in es[:per_kind]]
+    pairs += [(kind, b, a) for b, a in es[offset:offset + per_kind]]
 rule = parse(rule_text[:n_rule], "rule")
 sides = parse([t for _, b, a in pairs for t in (b, a)], "cands")
 print(f"rulebook {len(rule)} sentences; " + ", ".join(f"{k} {sum(p[0] == k for p in pairs)}" for k in sorted(edits)), flush=True)

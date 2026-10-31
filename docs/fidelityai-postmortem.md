@@ -453,6 +453,53 @@ judge scores about 0.73. This setting was chosen after seeing these same edits, 
 the result still needs held-out corrections. A deduplication step exists in the engine
 but nothing calls it; candidates and the source keep their repeats.
 
+**Held-out check and engine change.** On 600 fresh corrections per kind, raw counts
+held up at 20,000 sentences: clause chains on function words 0.443 → 0.565 (counts
+0.520), both chains 0.459 → 0.561 (counts 0.512). Local UR domains with role
+embeddings rose from 0.820 to 0.844 mean AUROC. Writer style fell on four of six
+writers (worst 0.662 → 0.600), and records against a foreign corpus fell 0.862 →
+0.842. The engine now uses raw counts for every consumer.
+
+**Length, not sentence boundaries.** The bias blamed on boundaries was mostly length.
+Long records looked more typical because summing tuples pulls them toward the centre
+(short against long sentences 0.299; one sentence against two of equal length 0.416).
+The record score now uses constants per length band: 0.531 and 0.488. The worst
+tuple's 0.995 at equal length came from sliding windows crossing sentences. Linked
+tuples stay inside a sentence, so they don't have that problem.
+
+### Which factors of English? A search
+
+Every combination of ten closed clause factors at k=2–4 (375), fit on 5,000 stable
+sentences. Corrections chose between factor sets but trained nothing: chosen on one
+sample, then scored on two others. Tuning and test scores correlated at 0.614 across
+combinations, so factor choice is a real effect. Clauses with the verb's tag did
+better (0.517 against 0.490 without), and those with the subject's tag did worse
+(0.485 against 0.511). FidelityAI beat counts on 117 of 306 eligible combinations.
+
+Winners on the third, untouched sample (FidelityAI, counts of the same tuples, judge):
+
+| Factors | Function words | Inflection |
+|---|---|---|
+| Auxiliary, object tag, negated | 0.657, 0.390, 0.648 (182) | 0.500, 0.488, 0.732 (127) |
+| Auxiliary, verb tag, object tag | 0.607, 0.476, 0.663 (205) | 0.606, 0.596, 0.740 (327) |
+
+Best for counts on tuning, same sample: verb tag and clause relation, 0.531 and 0.651.
+
+**The first line's match with the judge is mostly a confound.** Splitting its
+function-word edits:
+
+| Edit type | FidelityAI | Counts | Judge |
+|---|---|---|---|
+| *be*/*have* swaps (98; 60 are *is → was*, 8 *was → is*) | 0.735 | 0.224 | 0.541 |
+| Word inserted or deleted (78) | 0.558 | 0.596 | 0.769 |
+
+Always preferring *was* would score about 0.76 on those swaps, higher than FidelityAI.
+Some are real tense fixes; many reflect Wikipedia's style for past subjects. Excluding
+them, the judge and counts both lead.
+
+A 99% projection cutoff (rank 2 → 4–15) changed little, and 20,000 sentences didn't
+help: the second line's function-word score fell from 0.607 to 0.488.
+
 ### Fixes this round produced
 
 | Problem | Fix |
@@ -462,6 +509,8 @@ but nothing calls it; candidates and the source keep their repeats.
 | Records silently limited to the four highest-cardinality columns | All columns kept when they fit; any dropped column listed in the model with the source's SHA-256 |
 | Quote priced every source as exact index | Quote mirrors the engine's encoding choice and qubit count (checked on 189 combinations) |
 | No per-tuple introspection with role embeddings | Each tuple scored against the source's tuples |
+| Embedding learning flattened tuple frequency | Raw co-occurrence counts |
+| Long records looked more typical | Combined-fit constants per length band |
 
 Still open: the 5,000-record warning, and the quote's estimator, which has no
 runtime figure for role-embedding fits and quotes a k larger than the record is
@@ -509,5 +558,6 @@ wide.
   `fidelity_certified_eval.py`, `fidelity_rock_quality_eval.py`,
   `fidelity_author_eval.py`, `fidelity_grammar_eval.py`,
   `fidelity_grammar_introspect.py`, `fidelity_grammar_tuples.py`,
-  `fidelity_structure_eval.py`, `fidelity_linked_eval.py`, `fidelity_linked_weights.py`.
-  FidelityAI `engine/scripts/score_head_check.py`; patent change log A5–A9.
+  `fidelity_structure_eval.py`, `fidelity_linked_eval.py`, `fidelity_linked_weights.py`,
+  `fidelity_factor_search.py`, `fidelity_factor_confirm.py`.
+  FidelityAI `engine/scripts/score_head_check.py`; patent change log A5–A11.
