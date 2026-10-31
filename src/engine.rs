@@ -111,6 +111,9 @@ pub struct Engine {
     /// Optional confidence gate: swaps only for words whose sense head gap
     /// (`Token::sense_gap`) is at least this. Off unless set.
     pub swap_confidence: Option<f32>,
+    /// Re-read each accepted swap in place and drop it when the substitute's
+    /// meaning there is further from the original's than this. None: off.
+    pub swap_meaning: Option<crate::variants::MeaningRelation>,
 }
 
 pub const CONTENT: &[&str] = &["NOUN", "VERB", "ADJ", "ADV"];
@@ -248,6 +251,7 @@ impl Engine {
             judge: None,
             compose: None,
             swap_confidence: None,
+            swap_meaning: None,
             style_judges: ProseStyle::ALL
                 .into_iter()
                 .filter_map(|st| {

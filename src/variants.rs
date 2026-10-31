@@ -356,10 +356,46 @@ impl Engine {
                 let mut tokens = words(s, kept);
                 tokens.splice(pos..pos + 1, form.split(' ').map(String::from));
                 fix_article(&mut tokens, pos);
+                if let Some(least) = self.swap_meaning {
+                    // A one-word substitute's meaning, read in place. Unread
+                    // meanings (no sense found) stay: nothing says they moved.
+                    let read = (!form.contains(' '))
+                        .then(|| self.parse_tokens(&tokens).tokens.get(pos).and_then(|x| x.sense))
+                        .flatten();
+                    if read.is_some_and(|r| meaning_relation(&self.lexicon, sense, r) < least) {
+                        continue;
+                    }
+                }
                 out.push(tokens);
             }
         }
         out
+    }
+}
+
+/// How far a substitute's meaning, read in place, is from the original's.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum MeaningRelation {
+    Other,
+    Category,
+    Sibling,
+    Parent,
+    Same,
+}
+
+pub fn meaning_relation(lexicon: &crate::lexicon::Lexicon, a: u32, b: u32) -> MeaningRelation {
+    if a == b {
+        return MeaningRelation::Same;
+    }
+    let (x, y) = (&lexicon.synsets[a as usize], &lexicon.synsets[b as usize]);
+    if x.hypernyms.contains(&b) || y.hypernyms.contains(&a) {
+        MeaningRelation::Parent
+    } else if x.hypernyms.iter().any(|h| y.hypernyms.contains(h)) || x.similar.contains(&b) || y.similar.contains(&a) {
+        MeaningRelation::Sibling
+    } else if x.category == y.category {
+        MeaningRelation::Category
+    } else {
+        MeaningRelation::Other
     }
 }
 
@@ -768,6 +804,21 @@ fn jaccard(a: &HashSet<String>, b: &HashSet<String>) -> f64 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn meaning_relation_runs_from_same_synset_to_unrelated() {
+        use crate::lexicon::{Lexicon, Pos};
+        let Ok(lex) = Lexicon::load(std::path::Path::new("models/lexicon.bin")) else { return };
+        let car = lex.senses("car", Pos::Noun)[0];
+        assert_eq!(meaning_relation(&lex, car, lex.senses("automobile", Pos::Noun)[0]), MeaningRelation::Same);
+        let motor = lex.senses("motor vehicle", Pos::Noun)[0];
+        assert_eq!(meaning_relation(&lex, car, motor), MeaningRelation::Parent);
+        let truck = lex.senses("truck", Pos::Noun)[0];
+        assert_eq!(meaning_relation(&lex, car, truck), MeaningRelation::Sibling);
+        let run = lex.senses("run", Pos::Verb)[0];
+        assert_eq!(meaning_relation(&lex, car, run), MeaningRelation::Other);
+        assert!(MeaningRelation::Other < MeaningRelation::Category && MeaningRelation::Parent < MeaningRelation::Same);
+    }
+
     use super::*;
 
     fn toks(s: &str) -> Vec<String> {

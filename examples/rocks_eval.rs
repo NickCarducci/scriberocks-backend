@@ -18,6 +18,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // SWAP_MARGIN / CLOSENESS override the swap filter's cut-off and closeness weight.
     if let Some(m) = std::env::var("SWAP_MARGIN").ok().and_then(|v| v.parse().ok()) { e.swap_margin = m }
     if let Some(w) = std::env::var("CLOSENESS").ok().and_then(|v| v.parse().ok()) { e.closeness_weight = w }
+    // MEANING=category|sibling|parent|same: drop swaps whose meaning, re-read in place, moved further.
+    {
+        use scribe::variants::MeaningRelation as M;
+        e.swap_meaning = match std::env::var("MEANING").as_deref() {
+            Ok("category") => Some(M::Category),
+            Ok("sibling") => Some(M::Sibling),
+            Ok("parent") => Some(M::Parent),
+            Ok("same") => Some(M::Same),
+            _ => None,
+        };
+    }
     // COMPOSE=<pairs.bin> turns on the pairing gate (src/compose.rs); GATE_MIN,
     // GATE_TYPICAL and GATE_OUTCOMPETED set it.
     if let Ok(path) = std::env::var("COMPOSE") {

@@ -630,7 +630,20 @@ no better. The plain meaning relation is the useful signal in this test. It need
 training beyond the sense head and WordNet. Adding it to the judge's gain, held out by
 target (AUC, judge → judge plus relation): SWORDS test 0.751 → 0.815, SWORDS dev 0.778 →
 0.837, ProLex 0.719 → 0.728; on synonym pairs 0.806 → 0.896 (129), 0.682 → 0.843 (87) and
-0.772 → 0.797 (163). This has not yet been tested on rocks in the product.
+0.772 → 0.797 (163). Then tested as a swap gate in `variants.rs` (`swap_meaning`, off by default): re-read the
+sentence after a swap and drop it if the meaning moved too far. Acceptance rocks (7 rocks;
+wanted, forbidden): at sibling or closer, casual 9/11, 2/9 → 8/11, 1/9 and publishable
+10/11, 2/9 → 9/11, 1/9 (*hot roof* gone, *still in the morning* lost). Among human-judged
+substitutes the judge passes (margin 1.0):
+
+| Set (accepted share before) | Same category or closer: keeps accepted / rejected, precision | Sibling or closer: keeps accepted / rejected, precision |
+|---|---|---|
+| SWORDS test (0.60) | 0.59 / 0.42, 0.68 | 0.27 / 0.10, 0.81 |
+| SWORDS dev (0.67) | 0.58 / 0.35, 0.77 | 0.19 / 0.07, 0.85 |
+| ProLex (0.73) | 0.54 / 0.51, 0.74 | 0.24 / 0.17, 0.79 |
+
+These samples aren't the pipeline's own proposals. As a hard gate it costs too many good
+swaps, so ranking by the relation is the better use; that hasn't been built.
 
 ### Fixes this round produced
 
