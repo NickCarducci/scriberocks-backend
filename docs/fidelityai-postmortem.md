@@ -1,6 +1,9 @@
-# Postmortem: FidelityAI as Scriberocks' sense picker
+# Postmortem: FidelityAI in Scriberocks
 
-October 14–18, 2026. Scriberocks used FidelityAI's public API the way any
+Two rounds: the sense picker (October 14–18, 2026) and the wider writing
+pipeline (October 24–25, 2026, [second round](#second-round-can-fidelityai-help-the-writing-pipeline-at-all)).
+
+In the first round, Scriberocks used FidelityAI's public API the way any
 customer would, with no internal shortcuts. The goal was to see whether
 FidelityAI could choose a word's meaning (its *sense*) for the editor.
 
@@ -18,6 +21,10 @@ FidelityAI could choose a word's meaning (its *sense*) for the editor.
 - **What FidelityAI gained:** the effort fixed billing, job-status and
   data-retention bugs that affected every customer. It also added a new
   encoding and offline scorers that any customer can use.
+- **Second round:** on grammar, word fit, edit ranking, rock quality and style,
+  FidelityAI didn't beat the judge or plain counts by a reliable margin. Its best
+  grammar result was 0.54 against the judge's 0.74 (0.5 is chance). The round
+  also found and fixed a score that ranked unfamiliar records as typical.
 
 ## Terms
 
@@ -146,9 +153,203 @@ one-class design:
 2. **Abstention gate.** Low typicality is a reason for the editor to hold
    back a suggestion.
 
-Neither can be measured until we license a test set of human-judged
-substitutions. Run a free local comparison against first-listed (and against
+When this was written, neither could be measured without a test set of
+human-judged substitutions. The second round used SWORDS and ProLex for this.
+Run a free local comparison against first-listed (and against
 the editor view) before any paid FidelityAI training.
+
+## Second round: can FidelityAI help the writing pipeline at all?
+
+October 24–25, 2026. All runs were local and free, using the same cascade the
+hosted product runs. They answer one question: where, if anywhere, does
+FidelityAI belong in ScribeSLM and ScribeIE?
+
+**Answer: not in the text path, on current evidence.** The judge, or plain
+counts, beat or matched it on every text test. The work did find and fix a
+scoring bug that affected FidelityAI's customers generally.
+
+### Terms for this round
+
+- **SWORDS:** a benchmark of published prose in which people rated each substitute word in its sentence.
+- **ProLex:** learners' argumentative essays (TOEFL-11) with substitutes judged acceptable or not. The sentences are licensed by ETS (Educational Testing Service), so they stay out of anything shipped.
+- **Judge:** Scriberocks' casual model, scoring how likely each word is given the rest of the sentence.
+- **Rulebook:** FidelityAI's source: real examples of proper use.
+- **Target:** one word in one sentence that people judged substitutes for.
+- **Within target:** how often an accepted substitute beats a rejected one for the same target. Ties count half; 0.5 is chance.
+- **AUC (area under the ROC curve):** how often an item from one group ranks above an item from the other. 0.5 is chance.
+- **Frame:** the clause summary FidelityAI reads from prose: subject, modal, action, object and so on, as head words.
+- **k:** the tuple size. **Role embeddings:** each value in a tuple is a small learned vector.
+
+### Scoring bug found: unfamiliar records looked typical
+
+The chance-level results below led to a direct check. Fit a rulebook of 2,000
+SWORDS records, then compare its own entries and unseen entries from the same
+source against records from ProLex. A working score ranks the first two groups
+as more typical.
+
+| AUC against foreign records | Old score | Reconstruction residual | New score |
+|---|---|---|---|
+| Rulebook's own records | 0.305 (inverted) | 0.931 | 0.862 |
+| Held-out records | 0.373 (inverted) | 0.842 | 0.787 |
+
+Prose separated less well: 0.526 → 0.604 for the rulebook's own sentences, and
+0.425 → 0.450 for held-out ones, against Tatoeba sentences as the foreign set.
+
+- **Cause.** FidelityAI describes a record by its similarity to about 30
+  reference records. Rulebook records sat on a shell around zero (median size
+  0.62). 78% of foreign records resembled no reference and landed near zero
+  (5% of rulebook records did), which the one-class model's wide kernel treats
+  as the most typical place. The score also took the *absolute* distance from
+  the source median, so very typical records counted as far away.
+- **Fix.** The primary score is now `combined_fit`: the one-class score's excess
+  over its source median plus the reconstruction residual's excess over its
+  source median, each in units of source spread. Older models keep the old
+  score until retrained.
+- **Effect on real anomaly domains.** Mean AUROC (the same measure) rose from
+  0.805 to 0.830 on the five domains available locally: traffic, air quality,
+  BRCA1, TP53 and SKAB. It wasn't worse on any of them. The full validation
+  ladder has not been rerun, because its other datasets aren't on this machine.
+
+### Word fit: which substitute belongs in this sentence?
+
+Before the scoring fix, except where noted:
+
+| Rulebook → candidates | FidelityAI | Best alternative |
+|---|---|---|
+| SemCor and Gloss Corpus meaning frames → SWORDS | 0.465–0.491 | Judge 0.706 |
+| SWORDS accepted substitutions → SWORDS test | 0.496–0.536 | Judge 0.680; "keeps the same meaning" rule 0.594 |
+| Accepted against rejected rulebooks → SWORDS test | 0.487–0.530 | Plain counts on the same contrast 0.590–0.592 |
+| SWORDS → ProLex (across styles) | 0.485–0.512 | Judge 0.654 |
+| Tatoeba word pairings → ProLex | 0.529 | Pairing counts 0.646, but the substitute's own frequency alone gets 0.647 |
+| OANC word pairings → ProLex | 0.488 | Pairing counts 0.622; frequency alone 0.616 |
+| Casual v2's proposals → ProLex | 0.493–0.518 | The model's own ranking 0.565 |
+| Publishable v2's proposals → ProLex | 0.480–0.499 | The model's own ranking 0.557 |
+| SWORDS → ProLex substitutes SWORDS raters accepted elsewhere (55 pairs) | 0.455–0.518 | Judge 0.709; SWORDS verdict carried over 0.602 (167 pairs) |
+
+After the fix, with records reduced to (governor, relation, substitute) and
+casual v2's proposals as the rulebook:
+
+| Records | Candidates found in rulebook (of 2,740) | FidelityAI | Plain count |
+|---|---|---|---|
+| Words | 280 | 0.541 | 0.557 |
+| Synsets | 345 | 0.566 | 0.549 |
+| Hypernyms | 494 | 0.532 | 0.547 |
+| Synsets and hypernyms | 231 (4,000-record rulebook) | 0.558 | 0.537 |
+| Words, rulebook expanded with WordNet synonyms | 407 | 0.564 | 0.548 |
+
+- **Word fit is a contrast.** Even exact counting over accepted substitutions
+  alone scores 0.498. A rejected synonym builds an ordinary-looking record, so
+  a model that sees only proper use can't reject it.
+- **Context is the coverage problem.** A SWORDS rulebook contains 1–8 of the
+  candidates' pairings, because it has other sentences' governors. An earlier
+  "3–12% seen" figure was inflated by root words with no governor.
+- **Frequency confounds this test.** Acceptable ProLex substitutes tend to be
+  commoner words. The judge's 0.654 may partly reflect that; this wasn't tested.
+- **Rulebooks built from ProLex sentences** (the model's proposals) were local
+  evaluation inputs only, discarded afterwards.
+
+### Other possible insertion points
+
+| Insertion point | Test | FidelityAI | Alternatives |
+|---|---|---|---|
+| Ranking ScribeIE's red edits | Real edits against the same edit misplaced (fixed score) | 0.546 | Judge 0.865 (measured earlier); counts 0.491 |
+| Rock quality | 5,000 rock-sized certified passages (100–150 characters) as rulebook; 600 held-out certified against 600 ordinary, length-matched | 0.574 (frames), 0.524–0.568 (document) | Word frequencies 0.607; casual judge 0.557; publishable judge 0.547 |
+| A writer's own style | One Tatoeba contributor's 2,000 sentences; 300 of theirs against 300 others', six contributors | 0.426–0.712 | That writer's word frequencies 0.434–0.906, higher on all six |
+
+On rock quality, uncertainty is about ±0.017 per AUC, so FidelityAI's lead over
+the judges isn't reliable. The judge's earlier 0.46 on full paragraphs reflected
+a length difference (79 against 66 words).
+
+### Grammar and consistency
+
+Corrections from Simple English Wikipedia editors, with a rulebook of 5,000
+stable sentences. Does the corrected version score as more typical?
+
+| Method | Function words (600) | Inflection (600) |
+|---|---|---|
+| FidelityAI, frames | 0.503 | 0.499 |
+| FidelityAI, part-of-speech tags, whole record | 0.497 | 0.497 |
+| FidelityAI, sentence shape | 0.501 | 0.501 |
+| FidelityAI, worst tuple, k=3 | 0.522 | 0.537 |
+| FidelityAI, worst tuple, k=6, embedding size 4 | 0.503 | 0.542 |
+| FidelityAI, worst tuple, k=8, embedding size 4 | 0.489 | 0.534 |
+| Tag-trigram counts, whole sentence | 0.669 | 0.557 |
+| Rarest tag window, k=3 | 0.574 | 0.539 |
+| **Judge** | **0.737** | **0.743** |
+
+- **Finding the error.** Per-tuple scores for role-embedding models were built
+  for this test. The worst tuple covers the edited word 0.279 of the time for
+  inflection (chance 0.203) and 0.204 for function words (chance 0.196).
+  Before them, with exact-index contributions and only 20 features, the figures
+  were 0.215 (chance 0.212) and 0.258 (chance 0.204), measured with a window
+  assumption that didn't match FidelityAI's non-overlapping tuples.
+- **Excluding repeated windows from the rulebook doesn't help.** At k=3,
+  function-word detection falls to 0.499 and locating falls below chance (0.142);
+  at k=6, inflection stays about the same (0.538).
+- **Why tags fall short.** Tags lose distance and word identity. In *"one of the
+  metric unit of volume"*, the rule comes from *one of* four words earlier, and
+  `JJ NN IN` is an ordinary trigram. In *"each other and environment"*, whether
+  the noun needs *the* depends on the noun.
+- **Run-ons and stanza structure are untested.** Only 49 real splits turned up,
+  many half-finished. The results were inverted for every method except
+  FidelityAI's coarser whole-record scores, so they support no conclusion. This
+  needs a cleaner source of human-marked run-ons.
+
+### What limits the rulebook's size
+
+The fixed 5,000-record warning doesn't match what was measured. Memory grows
+with records × dim^k, where dim is the embedding size. Qubits are a separate
+count: k × log₂(dim) + 2.
+
+| Records | k | Features per record | Fit time | Peak memory |
+|---|---|---|---|---|
+| 5,000 | 3 | 4,096 | 4 s | 1.5 GB |
+| 20,000 | 3 | 4,096 | 22 s | 4.7 GB |
+| 40,000 | 3 | 4,096 | 70 s | 11.5 GB |
+| 6,000 | 4 | 65,536 | about 35 s | about 20 GB |
+
+Custom k is possible only by shrinking dim, which blurs words together. That
+makes long context and exact words compete for the same statevector. An earlier
+edit-records run with 20,000 five-column records peaked at 47 GB on this 48 GB
+machine.
+
+### Fixes this round produced
+
+| Problem | Fix |
+|---|---|
+| Score ranked unfamiliar records as typical | `combined_fit` primary score |
+| Unseen values mapped to a uniform vector near the average | A reserved embedding dimension, orthogonal to learned vectors |
+| Records silently limited to the four highest-cardinality columns | All columns kept when they fit; any dropped column listed in the model with the source's SHA-256 |
+| Quote priced every source as exact index | Quote mirrors the engine's encoding choice and qubit count (checked on 189 combinations) |
+| No per-tuple introspection with role embeddings | Each tuple scored against the source's tuples |
+
+Still open: the 5,000-record warning, and the quote's estimator, which has no
+runtime figure for role-embedding fits and quotes a k larger than the record is
+wide.
+
+### Lessons
+
+5. **Test the score before testing new inputs.** Many source changes ran against
+   an inverted score. A check of rulebook against foreign records takes minutes
+   and should come first.
+6. **Compare against plain counts.** They showed that the inputs held signal
+   FidelityAI wasn't recovering, and that a promising pairing result was only
+   word frequency.
+7. **Check whether a measured baseline hides a confound.** Length explained the
+   judge's 0.46; frequency explained the pairing counts.
+
+### Where FidelityAI fits now
+
+- **Grammar, word choice and edit ranking:** the judge. The earlier plan for
+  FidelityAI to rank ScribeIE's red edits is not supported by these results.
+- **The per-option check** above was tested in spirit on SWORDS and ProLex,
+  with one rulebook rather than one model per option. It stayed well below the
+  judge, though a true per-option fit hasn't been run.
+- **Style conformance** shows real but weaker signal than word frequencies, and
+  prose reaches FidelityAI only as frames. Giving it more of each sentence is
+  untested.
+- **Structured records** remain its demonstrated strength. Record-like data in
+  Scriberocks, such as Groups activity, is an untested candidate.
 
 ## Records
 
@@ -158,3 +359,12 @@ the editor view) before any paid FidelityAI training.
 - Patent change log: FidelityAI `patent/abrogations.md` (A1 pooling, A2 the
   embedding encoding, A3 client-side calibration). Counsel questions are in
   `patent/attorney_briefing.md`.
+- Second round, Scriberocks core `scripts/`: `fidelity_scorer_check.py`,
+  `fidelity_score_heads.py`, `fidelity_meaning_eval.py`,
+  `fidelity_substitution_eval.py`, `fidelity_control_eval.py`,
+  `fidelity_collocation_eval.py`, `fidelity_usage_source_eval.py`,
+  `fidelity_slot_eval.py`, `fidelity_wordnet_eval.py`,
+  `fidelity_certified_eval.py`, `fidelity_rock_quality_eval.py`,
+  `fidelity_author_eval.py`, `fidelity_grammar_eval.py`,
+  `fidelity_grammar_introspect.py`, `fidelity_grammar_tuples.py`.
+  FidelityAI `engine/scripts/score_head_check.py`; patent change log A5–A9.
