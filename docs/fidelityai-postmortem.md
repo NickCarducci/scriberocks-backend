@@ -609,6 +609,26 @@ AUC 0.681 → 0.682 on all pairs, and 0.685 → 0.670 on synonyms. The two small
 are FidelityAI's only lead and are within noise. On this evidence a paid larger run on
 English word fit isn't justified.
 
+### The tuple as the pipeline itself
+
+Each record is a suggestion's path through ScribeSLM as closed values: original meaning
+category and confidence, how the substitute's meaning relates to it, its category and
+confidence in place, part of speech, relation, and optionally the judge's gain. The
+rulebook is 6,000 real Simple English Wikipedia swaps between WordNet synonyms (14,975
+found); 67% keep the same synset. Within target, all pairs / synonym pairs:
+
+| Method | SWORDS test | SWORDS dev | ProLex |
+|---|---|---|---|
+| Judge's slot gain (publishable; casual on ProLex) | 0.694 / 0.713 | 0.718 / 0.598 | 0.676 / 0.693 |
+| Plain rule: the meaning relation | 0.615 / 0.686 | 0.634 / 0.684 | 0.541 / 0.598 |
+| FidelityAI, no judge value (best of three fits) | 0.528 / 0.570 | 0.523 / 0.529 | 0.502 / 0.494 |
+| FidelityAI auto, with judge value | 0.574 / 0.674 | 0.549 / 0.632 | 0.537 / 0.577 |
+
+Held-out AUC adding FidelityAI (auto) to the judge's gain: 0.751 → 0.763, 0.778 → 0.784,
+0.719 → 0.721. Without the judge's value it stays near chance, and whole-path counts do
+no better. The plain meaning relation is the useful signal in this test. It needs no
+training beyond the sense head and WordNet.
+
 ### Fixes this round produced
 
 | Problem | Fix |
@@ -670,5 +690,6 @@ wide.
   `fidelity_structure_eval.py`, `fidelity_linked_eval.py`, `fidelity_linked_weights.py`,
   `fidelity_factor_search.py`, `fidelity_factor_confirm.py`,
   `fidelity_description_eval.py`, `fidelity_usage_vectors_eval.py`,
-  `fidelity_misnomer_eval.py`, `fidelity_sequence_eval.py`, `fidelity_frequency_check.py`.
+  `fidelity_misnomer_eval.py`, `fidelity_sequence_eval.py`, `fidelity_frequency_check.py`,
+  `fidelity_pipeline_paths.py`.
   FidelityAI `engine/scripts/score_head_check.py`; patent change log A5–A11.
