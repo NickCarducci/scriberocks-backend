@@ -692,7 +692,7 @@ pairs, untouched by the tuning, across 200–3,000 rulebook passages:
 | Tense, person, contraction, voice | 0.629–0.635 | 0.599 | 0.557–0.579 | 0.531–0.535 |
 | Tense, person, voice | 0.628–0.638 | 0.594 | 0.554–0.566 | 0.512–0.513 |
 
-The tuning sample gave 0.631–0.639; without removing the first component, 0.519–0.539; with
+The publishable judge scored 0.413 on 300 of these pairs. The tuning sample gave 0.631–0.639; without removing the first component, 0.519–0.539; with
 one-hot, 0.578–0.591; on hedge, nominal, length and opener, chance (0.455–0.489). This is one
 spliced control, not yet real editors' fixes or real multi-author text, and the removal isn't
 in the engine.
