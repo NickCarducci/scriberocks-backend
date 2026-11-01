@@ -46,7 +46,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 None => "none",
             };
             let contraction = low.iter().any(|w| matches!(w.as_str(), "n't" | "'re" | "'ll" | "'ve" | "'d" | "'m"));
-            let passive = arcs.iter().any(|x| x.label.contains("pass"));
+            // A form of "be" on a past-participle root: the parser's labels don't mark passive.
+            let passive = xp[root] == "VBN" && aux.iter().any(|w| matches!(*w, "is" | "are" | "was" | "were" | "be" | "been" | "being" | "am"));
             let hedge = low.iter().any(|w| matches!(w.as_str(), "may" | "might" | "could" | "perhaps" | "maybe" | "possibly" | "probably" | "seems"));
             let words: Vec<&String> = low.iter().filter(|w| w.chars().any(char::is_alphanumeric)).collect();
             let nominal = words.iter().filter(|w| ["tion", "ment", "ness", "ity", "ance", "ence"].iter().any(|x| w.len() > x.len() + 2 && w.ends_with(x))).count();

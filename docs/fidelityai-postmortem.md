@@ -696,7 +696,39 @@ The publishable judge scored 0.413 on 300 of these pairs. The tuning sample gave
 one-hot, 0.578–0.591; on hedge, nominal, length and opener, chance (0.455–0.489). This is one
 spliced control, not yet real editors' fixes or real multi-author text, and the removal isn't
 in the engine.
-Real editors' consistency fixes and PAN style-change data weren't tested.
+
+**The lead did not hold on real multi-author text.** PAN 2025 Multi-Author Writing Style Analysis
+(Reddit comments combined into documents, each sentence boundary labelled author change or not;
+CC BY 4.0, local evaluation only). Validation split, 900 documents per level, with rulebook, variant
+choice and thresholds from 1,000 train documents. Lines found in three or more documents are
+excluded: they are moderator boilerplate (15% of lines on easy, 22% on medium, 3% on hard) and
+they inflated the first run (medium's lead over values agreeing, +0.061, fell to +0.007).
+AUC (area under the ROC curve) of "this boundary is an author change", 0.5 chance:
+
+| Level (topic control) | Self-fidelity, chosen on train | Values agreeing | Length difference | Function-word cosine | Character-trigram cosine |
+|---|---|---|---|---|---|
+| Easy (topics vary) | 0.583 (first component kept) | 0.567 | 0.788 | 0.670 | 0.746 |
+| Medium (little variety) | 0.556 (removed) | 0.549 | 0.532 | 0.523 | 0.518 |
+| Hard (one topic) | 0.508 (removed) | 0.488 | 0.393 | 0.378 | 0.244 |
+
+Macro F1, PAN's measure, for self-fidelity: 0.528, 0.523, 0.498. Windows of five real sentences with
+and without a change: 0.594, 0.551, 0.501. Differences from values agreeing, bootstrapped over
+documents: +0.016 (+0.003 to +0.029), +0.007 (−0.007 to +0.019), +0.019 (+0.007 to +0.031). So self-fidelity
+is about equal to a one-line count, and at chance when the topic is fixed. Removing the first component
+isn't a general gain: it hurt on easy and helped slightly on medium. The spliced control's lead
+was probably genre between corpora, not voice within a piece. On hard the word-level measures fall below
+chance, so sentences across a change are more alike than neighbours by the same author; how PAN
+assembled those documents shapes this test, and PAN is not editors' consistency fixes.
+
+Two defects in the earlier table: voice never fired (the parser's labels drop `:pass`; fixed in
+`consistency_features` for the PAN runs, the table above was not rerun), and two-valued roles
+collapse in `role_embedding_v1`. `min(m.shape) - 1` leaves one dimension, sign normalisation
+makes both values the same vector (overlap 1.000), so contraction and voice contributed nothing unless one-hot. The
+table's factor sets were tense and person alone. That second defect is in the engine and affects
+any customer's two-valued role that isn't declared one-hot. Fixed: a role now keeps every component
+its values have. On the PAN rulebook, contraction's values overlap 0.940 and voice's 0.831
+(both were 1.000), still high because their partners are similar; local UR domains with role embeddings
+0.844 → 0.847. The PAN conclusion is unchanged (best self-fidelity 0.583, 0.556, 0.508).
 
 ### Fixes this round produced
 
@@ -760,5 +792,5 @@ wide.
   `fidelity_factor_search.py`, `fidelity_factor_confirm.py`,
   `fidelity_description_eval.py`, `fidelity_usage_vectors_eval.py`,
   `fidelity_misnomer_eval.py`, `fidelity_sequence_eval.py`, `fidelity_frequency_check.py`,
-  `fidelity_pipeline_paths.py`, `fidelity_consistency_eval.py`.
+  `fidelity_pipeline_paths.py`, `fidelity_consistency_eval.py`, `fidelity_pan_eval.py`.
   FidelityAI `engine/scripts/score_head_check.py`; patent change log A5–A11.
