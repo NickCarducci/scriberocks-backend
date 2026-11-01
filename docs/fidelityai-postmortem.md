@@ -658,6 +658,24 @@ rocks don't change. It costs about 90 → 144 ms per rock on this Mac, because e
 parsed again. The earlier AUC gain doesn't carry over at this size: the judge already filters
 the pipeline's proposals, and few proposals match a judged word.
 
+### Consistency: does a piece agree with itself?
+
+Closed writing choices per sentence (tense, person, contraction, voice; or hedge, nominal
+density, length, opener). The rulebook is five consecutive OANC sentences at a time. In the
+control, a real held-out passage is paired with the same passage with one middle sentence
+replaced by a real Simple English Wikipedia or Tatoeba sentence of similar length whose tuple
+is common in the rulebook. 500 pairs; rulebooks of 200, 1,000 and 3,000 passages:
+
+| Factors | Record | Worst tuple | Inter-tuple | k-gram mean | Adjacent tuple pairs | Values mixed |
+|---|---|---|---|---|---|---|
+| Tense, person, contraction, voice | 0.458–0.497 | 0.500–0.501 | 0.382–0.432 | 0.532–0.534 | 0.538–0.546 | 0.597 |
+| Tense, person, voice | 0.455–0.488 | 0.495–0.502 | 0.381–0.472 | 0.552–0.554 | 0.553–0.564 | 0.590 |
+| Hedge, nominal, length, opener | 0.428–0.441 | 0.455–0.475 | 0.467–0.514 | 0.339–0.350 | 0.394–0.453 | 0.518 |
+
+The projection kept 2 dimensions in every fit. FidelityAI stayed at or below chance on all
+three, with no rise at small rulebooks. A plain count of how many values a passage mixes led.
+Real editors' consistency fixes and PAN style-change data weren't tested.
+
 ### Fixes this round produced
 
 | Problem | Fix |
@@ -720,5 +738,5 @@ wide.
   `fidelity_factor_search.py`, `fidelity_factor_confirm.py`,
   `fidelity_description_eval.py`, `fidelity_usage_vectors_eval.py`,
   `fidelity_misnomer_eval.py`, `fidelity_sequence_eval.py`, `fidelity_frequency_check.py`,
-  `fidelity_pipeline_paths.py`.
+  `fidelity_pipeline_paths.py`, `fidelity_consistency_eval.py`.
   FidelityAI `engine/scripts/score_head_check.py`; patent change log A5–A11.
