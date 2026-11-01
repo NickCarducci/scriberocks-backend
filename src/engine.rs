@@ -114,6 +114,10 @@ pub struct Engine {
     /// Re-read each accepted swap in place and drop it when the substitute's
     /// meaning there is further from the original's than this. None: off.
     pub swap_meaning: Option<crate::variants::MeaningRelation>,
+    /// How far a swap sinks in the suggestions when its meaning moved: a swap
+    /// to an unrelated meaning loses this much ranking key, nearer ones less.
+    /// 0: off.
+    pub swap_meaning_weight: f64,
 }
 
 pub const CONTENT: &[&str] = &["NOUN", "VERB", "ADJ", "ADV"];
@@ -252,6 +256,7 @@ impl Engine {
             compose: None,
             swap_confidence: None,
             swap_meaning: None,
+            swap_meaning_weight: 0.0,
             style_judges: ProseStyle::ALL
                 .into_iter()
                 .filter_map(|st| {

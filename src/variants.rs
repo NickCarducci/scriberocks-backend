@@ -190,7 +190,13 @@ impl Engine {
             let r: Vec<Option<f32>> = out.iter().map(|v| e.rank(&original_text, &v.text)).collect();
             r.iter().any(Option::is_some).then(|| rank_keys(&r))
         });
-        let keys: Vec<f64> = ranked.unwrap_or_else(|| out.iter().map(|v| v.fluency_delta).collect());
+        let mut keys: Vec<f64> =
+            ranked.unwrap_or_else(|| out.iter().map(|v| v.fluency_delta).collect());
+        if self.swap_meaning_weight > 0.0 {
+            for (key, v) in keys.iter_mut().zip(&out) {
+                *key -= self.swap_meaning_weight * self.meaning_moved(&sentences, v);
+            }
+        }
         let mut picked = diversify(out, &keys, limit);
         if let Some(enhancer) = enhancer {
             for v in &mut picked {
@@ -204,6 +210,39 @@ impl Engine {
             }
         }
         picked
+    }
+
+    /// How far a one-word swap moved the meaning, from 0 (same synset) to 1
+    /// (unrelated), re-reading the variant in place. 0 for anything else, or
+    /// when either meaning can't be read: nothing says it moved.
+    fn meaning_moved(&self, originals: &[Sentence], v: &Variant) -> f64 {
+        if v.ops != [Op::Swap] {
+            return 0.0;
+        }
+        let read = self.parse(&v.text);
+        if read.len() != originals.len() {
+            return 0.0;
+        }
+        let mut changed = originals.iter().zip(&read).flat_map(|(a, b)| {
+            let same_length = a.tokens.len() == b.tokens.len();
+            a.tokens
+                .iter()
+                .zip(&b.tokens)
+                .filter(move |(x, y)| same_length && !x.form.eq_ignore_ascii_case(&y.form))
+        });
+        let (Some((a, b)), None) = (changed.next(), changed.next()) else {
+            return 0.0;
+        };
+        match (a.sense, b.sense) {
+            (Some(x), Some(y)) => match meaning_relation(&self.lexicon, x, y) {
+                MeaningRelation::Same => 0.0,
+                MeaningRelation::Parent => 0.25,
+                MeaningRelation::Sibling => 0.5,
+                MeaningRelation::Category => 0.75,
+                MeaningRelation::Other => 1.0,
+            },
+            _ => 0.0,
+        }
     }
 
     /// The sentence with accepted marks inserted: gaps come from the parse

@@ -268,3 +268,20 @@ fn variety_slider_widens_swaps_monotonically() {
     assert!(low <= mid && mid <= high, "{low} {mid} {high}");
     assert!(low < high, "the ends differ: {low} vs {high}");
 }
+
+
+/// A swap whose meaning moved sinks in the suggestions but isn't removed.
+#[test]
+fn meaning_weight_reorders_without_removing() {
+    let Ok(mut e) = scribe::Engine::load(std::path::Path::new("models")) else { return };
+    let rock = "The hot roof made the workers tired in the afternoon.";
+    let words = |v: &[scribe::variants::Variant]| {
+        let mut t: Vec<String> = v.iter().map(|x| x.text.clone()).collect();
+        t.sort();
+        t
+    };
+    let before = e.variants(rock, 200);
+    e.swap_meaning_weight = 2.0;
+    let after = e.variants(rock, 200);
+    assert_eq!(words(&before), words(&after), "the same suggestions");
+}

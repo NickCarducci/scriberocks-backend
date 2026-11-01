@@ -29,6 +29,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             _ => None,
         };
     }
+    // MEANING_WEIGHT=<w>: swaps whose meaning moved sink in the suggestions by up to w.
+    if let Some(w) = std::env::var("MEANING_WEIGHT").ok().and_then(|v| v.parse().ok()) {
+        e.swap_meaning_weight = w
+    }
     // COMPOSE=<pairs.bin> turns on the pairing gate (src/compose.rs); GATE_MIN,
     // GATE_TYPICAL and GATE_OUTCOMPETED set it.
     if let Ok(path) = std::env::var("COMPOSE") {

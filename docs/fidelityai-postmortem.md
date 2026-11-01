@@ -642,8 +642,21 @@ substitutes the judge passes (margin 1.0):
 | SWORDS dev (0.67) | 0.58 / 0.35, 0.77 | 0.19 / 0.07, 0.85 |
 | ProLex (0.73) | 0.54 / 0.51, 0.74 | 0.24 / 0.17, 0.79 |
 
-These samples aren't the pipeline's own proposals. As a hard gate it costs too many good
-swaps, so ranking by the relation is the better use; that hasn't been built.
+These samples aren't the pipeline's own proposals. These samples aren't the pipeline's own proposals. As a hard gate it costs too many good
+swaps. So it was also built as ranking (`swap_meaning_weight`, off by default): a swap whose
+meaning moved sinks by up to the weight, and none is removed. On the pipeline's own
+suggestions that match a judged substitute, at weight 1 (chosen on SWORDS dev):
+
+| Set (matched suggestions) | Accepted share in top 5 | Accepted share in top 12 |
+|---|---|---|
+| SWORDS dev, publishable (56; used to choose) | 0.857 → 0.892 | 0.906 → 0.904 |
+| SWORDS test, publishable (142) | 0.840 → 0.861 | 0.851 → 0.848 |
+| ProLex, casual (241) | 0.813 → 0.842 | 0.784 → 0.770 |
+
+Counts are small (top 5, SWORDS test: 89 accepted and 17 rejected → 93 and 15). Acceptance
+rocks don't change. It costs about 90 → 144 ms per rock on this Mac, because each swap is
+parsed again. The earlier AUC gain doesn't carry over at this size: the judge already filters
+the pipeline's proposals, and few proposals match a judged word.
 
 ### Fixes this round produced
 
