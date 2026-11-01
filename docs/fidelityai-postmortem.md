@@ -673,7 +673,8 @@ is common in the rulebook. 500 pairs; rulebooks of 200, 1,000 and 3,000 passages
 | Hedge, nominal, length, opener | 0.428–0.441 | 0.455–0.475 | 0.467–0.514 | 0.339–0.350 | 0.394–0.453 | 0.518 |
 
 The projection kept 2 dimensions in every fit. FidelityAI stayed at or below chance on all
-three, with no rise at small rulebooks. A plain count of how many values a passage mixes led.
+three, with no rise at small rulebooks. A plain count of how many values a passage mixes led. The publishable judge scored 0.450 on the
+first set's pairs, so it doesn't see this either.
 Real editors' consistency fixes and PAN style-change data weren't tested.
 
 ### Fixes this round produced
