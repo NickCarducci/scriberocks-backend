@@ -6,13 +6,14 @@ Wikipedia or Tatoeba, of similar length, whose tuple is common in the rulebook, 
 it passes modularly and only the mix is off. Local and free.
 
 Scored: the original is more typical than its spliced version (0.5 chance), by
-FidelityAI's document record, worst tuple and inter-tuple tier, against k-gram counts
+self-fidelity (the mean overlap of the passage's own sentence states, and its least-fitting
+sentence), FidelityAI's document record, worst tuple and inter-tuple tier, against k-gram counts
 (whole tuples, worst and mean), adjacent tuple-pair counts, and how many distinct values
 the passage mixes. Writes pairs for the judge.
 
 usage: ~/.venvs/fidelityai/bin/python -I fidelity_consistency_eval.py <core> <engine> <work> <factors,...> <sizes> [pairs = 500]
 """
-import collections, json, math, random, re, subprocess, sys
+import collections, json, math, os, random, re, subprocess, sys
 
 core, engine, work, factor_sets, sizes = sys.argv[1:6]
 n_pairs = int(sys.argv[6]) if len(sys.argv) > 6 else 500
@@ -42,6 +43,8 @@ for line in open(f"{core}/data/corpus/oanc_written.txt"):
 passages = list(dict.fromkeys(passages))
 random.Random(1).shuffle(passages)
 held, rule_text = passages[:n_pairs * 3], passages[n_pairs * 3:n_pairs * 3 + max(map(int, sizes.split(",")))]
+if os.environ.get("FRESH"):  # FRESH=1: pairs from passages untouched by earlier runs
+    held = passages[-n_pairs * 3:]
 print(f"{len(passages)} passages; rulebook pool {len(rule_text)}", flush=True)
 others = [l.strip() for l in open(f"{core}/data/corpus/tatoeba.txt") if 6 <= len(l.split()) <= 30]
 r0 = random.Random(2)
@@ -59,7 +62,7 @@ for factors in factor_sets.split(","):
     for s, d in zip(others, other_f):
         if len(d) == 1 and full[tup(d[0])] >= common:
             pool[len(s.split()) // 4].append(s)
-    r = random.Random(3)
+    r = random.Random(int(os.environ.get("FRESH", 0)) + 3)
     origs, spliced = [], []
     for p in held:
         x = split(p)
@@ -95,6 +98,18 @@ for factors in factor_sets.split(","):
         hier = HierarchicalHandoffPipeline(g, max_benign_refs=30, classical_nu=0.1, seed=42, intra_pipe=sp).fit(groups)
         inter = -hier.score(docs)
         direct = -hier.direct_z_score(docs)
+        # Self-fidelity: how much the piece's sentence states overlap with each other,
+        # |<a|b>|^2 over its sentence pairs, in the embeddings learned from the rulebook.
+        from fidelityai.role_embedding import record_features
+        import numpy as np
+        states = lambda d: np.stack([record_features([tuple(t)], g.encoding) for t in d])
+        def self_fid(d):
+            x = states(d); o = (x @ x.T) ** 2
+            return float(o[np.triu_indices(len(x), 1)].mean()) if len(x) > 1 else 1.0
+        def self_min(d):
+            x = states(d); o = (x @ x.T) ** 2; np.fill_diagonal(o, np.nan)
+            return float(np.nanmin(np.nanmean(o, axis=1))) if len(x) > 1 else 1.0
+        fid_mean, fid_min = [self_fid(d) for d in docs], [self_min(d) for d in docs]
         counts = collections.Counter(tup(c) for d in rule_all[:n_rule] for c in d)
         adj = collections.Counter((tup(a), tup(b)) for d in rule_all[:n_rule] for a, b in zip(d, d[1:]))
         total = max(sum(counts.values()), 1)
@@ -108,4 +123,4 @@ for factors in factor_sets.split(","):
             return sum((v[2 * m] > v[2 * m + 1]) + 0.5 * (v[2 * m] == v[2 * m + 1]) for m in range(len(keep)) if v[2 * m] is not None and v[2 * m + 1] is not None) / max(len(keep), 1)
 
         print(f"  rulebook {len(rule)} (projection {pipe._T.shape[1]}): " + ", ".join(f"{k} {rate(v):.3f}" for k, v in (
-            ("record", record), ("worst tuple", worst), ("inter-tuple", inter), ("inter direct", direct), ("k-gram mean", mean_k), ("k-gram worst", worst_k), ("adjacent pairs", pair_k), ("mix", mix))), flush=True)
+            ("self-fidelity", fid_mean), ("least-fitting sentence", fid_min), ("record", record), ("worst tuple", worst), ("inter-tuple", inter), ("inter direct", direct), ("k-gram mean", mean_k), ("k-gram worst", worst_k), ("adjacent pairs", pair_k), ("mix", mix))), flush=True)

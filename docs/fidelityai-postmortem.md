@@ -675,6 +675,27 @@ is common in the rulebook. 500 pairs; rulebooks of 200, 1,000 and 3,000 passages
 The projection kept 2 dimensions in every fit. FidelityAI stayed at or below chance on all
 three, with no rise at small rulebooks. A plain count of how many values a passage mixes led. The publishable judge scored 0.450 on the
 first set's pairs, so it doesn't see this either.
+
+**Diagnosis.** Reference overlaps averaged 0.88–0.92 and one eigenvalue held 89–92% of the
+spectrum, because SVD's first component is a shared direction (0.95 of the role embeddings)
+and each role has few values. All-one-hot roles fixed the rank (up to 30) but not the score.
+The remaining problem is structural: a record sums its tuples, so mixing different sentences
+lands nearer the centre and reads as more typical. That also accounts for the length bias.
+
+**Self-fidelity.** Ask instead how much a piece's own sentences overlap: the mean |⟨a|b⟩|² over
+its sentence pairs, with SVD's first component removed from the embeddings. No score against the
+rulebook; the rulebook only supplies the embeddings. Computed classically here. On 1,000 fresh
+pairs, untouched by the tuning, across 200–3,000 rulebook passages:
+
+| Factors | Self-fidelity | Values mixed | Adjacent pairs | k-gram mean |
+|---|---|---|---|---|
+| Tense, person, contraction, voice | 0.629–0.635 | 0.599 | 0.557–0.579 | 0.531–0.535 |
+| Tense, person, voice | 0.628–0.638 | 0.594 | 0.554–0.566 | 0.512–0.513 |
+
+The tuning sample gave 0.631–0.639; without removing the first component, 0.519–0.539; with
+one-hot, 0.578–0.591; on hedge, nominal, length and opener, chance (0.455–0.489). This is one
+spliced control, not yet real editors' fixes or real multi-author text, and the removal isn't
+in the engine.
 Real editors' consistency fixes and PAN style-change data weren't tested.
 
 ### Fixes this round produced
